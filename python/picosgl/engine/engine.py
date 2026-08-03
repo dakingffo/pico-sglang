@@ -9,7 +9,7 @@ from picosgl.layers.attention_backend import create_attention_backend
 from picosgl.layers.moe_backend import create_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
 from picosgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from picosgl.plusplus.kvcache import make_mha_kvcache_pool
+from picosgl.kvcache import create_kvcache_pool
 from picosgl.layers import set_rope_device
 from picosgl.models import create_model, load_weight
 from picosgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
@@ -55,7 +55,7 @@ class Engine:
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = make_mha_kvcache_pool(
+        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
