@@ -84,6 +84,7 @@ class DetokenizeManager:
 
         incremental_strs: list[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+            output_str: str
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str):]
             # Streaming chunk: update the decode status
