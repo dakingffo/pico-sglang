@@ -22,23 +22,12 @@ class DistributedImpl(ABC):
 
 
 @dataclass
-class TorchDistributedImpl(DistributedImpl):
+class NoopDistributedImpl(DistributedImpl):
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = dist.get_world_size()
-        if tp_size != 1:
-            dist.all_reduce(x, op=dist.ReduceOp.SUM)
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = dist.get_world_size()
-        if tp_size == 1:
-            return x
-        else:
-            shape = list(x.shape)
-            shape[0] = shape[0] * tp_size
-            out = torch.empty(shape, dtype=x.dtype, device=x.device)
-            dist.all_gather_into_tensor(out, x)
-            return out
+        return x
 
 
 @dataclass
@@ -61,41 +50,31 @@ class PyNCCLDistributedImpl(DistributedImpl):
 
 
 class DistributedCommunicator:
-    plugins: list[DistributedImpl] = [TorchDistributedImpl()]
+    impl: DistributedImpl = NoopDistributedImpl()
 
     @classmethod
     def all_reduce(cls, x: torch.Tensor) -> torch.Tensor:
-        return cls.plugins[-1].all_reduce(x)
+        return cls.impl.all_reduce(x)
 
     @classmethod
     def all_gather(cls, x: torch.Tensor) -> torch.Tensor:
-        return cls.plugins[-1].all_gather(x)
+        return cls.impl.all_gather(x)
 
 
 def enable_pynccl_distributed(
     tp_info     : DistributedInfo, 
-    tp_cpu_group: torch.distributed.ProcessGroup, 
+    tp_cpu_group: dist.ProcessGroup,
     max_bytes   : int
 ) -> None:
-    """
-    Enable PyNCCL-based distributed communication for tensor parallelism.
-    """
-    if tp_info.size == 1:
-        return
     from picosgl.kernel import init_pynccl
 
-    comm = init_pynccl(
+    DistributedCommunicator.impl = init_pynccl(
         tp_rank=tp_info.rank,
         tp_size=tp_info.size,
         tp_cpu_group=tp_cpu_group,
         max_size_bytes=max_bytes,
     )
 
-    DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
-
 
 def destroy_distributed() -> None:
-    """
-    Destroy all the distributed communication plugins.
-    """
-    DistributedCommunicator.plugins = []
+    DistributedCommunicator.impl = NoopDistributedImpl()

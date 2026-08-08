@@ -8,6 +8,7 @@ import torch
 
 from picosgl.distributed import DistributedInfo
 from picosgl.utils import cached_load_hf_config
+from picosgl.models import ModelConfig
 
 if TYPE_CHECKING:
     from picosgl.models import ModelConfig
@@ -27,7 +28,6 @@ class EngineConfig:
     memory_ratio        : float            = 0.9
     distributed_timeout : float            = 60.0
     use_dummy_weight    : bool             = False
-    use_pynccl          : bool             = True
     max_seq_len_override: int | None       = None
     num_page_override   : int | None       = None  # if not None, will override the number of pages
 
@@ -37,8 +37,6 @@ class EngineConfig:
 
     @cached_property
     def model_config(self) -> ModelConfig:
-        from picosgl.models import ModelConfig
-
         return ModelConfig.from_hf(self.hf_config)
 
     @property

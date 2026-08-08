@@ -18,10 +18,10 @@ class DistributedInfo:  # should not export from here
 _TP_INFO: DistributedInfo | None = None
 
 
-def set_tp_info(rank: int, size: int) -> None:
+def set_tp_info(tp_info: DistributedInfo) -> None:
     global _TP_INFO
     assert _TP_INFO is None, "TP info has been set"
-    _TP_INFO = DistributedInfo(rank, size)
+    _TP_INFO = tp_info
 
 
 def get_tp_info() -> DistributedInfo:

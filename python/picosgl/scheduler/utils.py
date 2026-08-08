@@ -1,22 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from picosgl.core import SamplingParams
 
-    from .prefill import ChunkedReq
+    from .prefill import ChunkedRequest
 
 
 @dataclass
-class PendingReq:
-    uid: int
-    input_ids: torch.Tensor
+class PendingRequest:
+    uid            : int
+    input_ids      : torch.Tensor
     sampling_params: SamplingParams
-    chunked_req: ChunkedReq | None = None
+    chunked_req    : ChunkedRequest | None = None
 
     @property
     def input_len(self) -> int:
@@ -29,5 +29,5 @@ class PendingReq:
 
 @dataclass
 class ScheduleResult:
-    reqs: List[PendingReq]
-    output_indices: List[torch.Tensor]
+    reqs          : list[PendingRequest]
+    output_indices: list[torch.Tensor]

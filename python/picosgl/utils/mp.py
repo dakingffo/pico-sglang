@@ -6,9 +6,8 @@ import msgpack
 import zmq
 import zmq.asyncio
 
+
 T = TypeVar("T")
-
-
 class ZmqPushQueue(Generic[T]):
     def __init__(
         self,

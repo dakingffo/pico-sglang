@@ -12,7 +12,7 @@ from picosgl.distributed import get_tp_info
 from picosgl.utils import init_logger
 
 if TYPE_CHECKING:
-    from picosgl.attention import BaseAttnBackend
+    from picosgl.layers.attention_backend import BaseAttnBackend
     from picosgl.models import BaseLLMModel
 
 logger = init_logger(__name__)
@@ -51,7 +51,7 @@ def _determine_cuda_graph_bs(
         return cuda_graph_bs
     
     if cuda_graph_max_bs is None:
-        free_memory_gb = free_memory / (1 << 30)
+        free_memory_gb = free_memory / (1024**3)
         if free_memory_gb > 80:  # H200
             cuda_graph_max_bs = 256
         else:

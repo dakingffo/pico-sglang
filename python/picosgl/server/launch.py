@@ -6,35 +6,35 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import torch
+
+from picosgl.scheduler import Scheduler
 from picosgl.distributed import DistributedInfo
 from picosgl.utils import init_logger
+from picosgl.tokenizer import tokenize_worker, detokenize_worker
 
 if TYPE_CHECKING:
     from .args import ServerArgs
 
-
+@torch.inference_mode()
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
-    import torch
-    from picosgl.scheduler import Scheduler
+    scheduler = Scheduler(args)
+    scheduler.sync_all_ranks()
 
-    with torch.inference_mode():
-        scheduler = Scheduler(args)
-        scheduler.sync_all_ranks()
+    if args.tp_info.is_primary():
+        ack_queue.put("Scheduler is ready")
 
+    if args.silent_output:
+        logging.disable(logging.INFO)
+
+    try:
+        scheduler.run_forever()
+    except KeyboardInterrupt:
+        logger = init_logger(__name__)
         if args.tp_info.is_primary():
-            ack_queue.put("Scheduler is ready")
-
-        if args.silent_output:
-            logging.disable(logging.INFO)
-
-        try:
-            scheduler.run_forever()
-        except KeyboardInterrupt:
-            logger = init_logger(__name__)
-            if args.tp_info.is_primary():
-                print()  # for a clean newline after ^C
-                logger.info("Scheduler exiting gracefully...")
-            scheduler.shutdown()
+            print()  # for a clean newline after ^C
+            logger.info("Scheduler exiting gracefully...")
+        scheduler.shutdown()
 
 
 def launch_server(run_shell: bool = False) -> None:
@@ -45,15 +45,9 @@ def launch_server(run_shell: bool = False) -> None:
     logger = init_logger(__name__, "initializer")
 
     def start_subprocess() -> None:
-        import multiprocessing as mp
-
-        from picosgl.tokenizer import tokenize_worker
-
         mp.set_start_method("spawn", force=True)
 
         world_size = server_args.tp_info.size
-        # a multiprocessing queue to receive ack from subprocesses
-        # so that we can guarantee all subprocesses are ready
         ack_queue: mp.Queue[str] = mp.Queue()
 
         for i in range(world_size):
@@ -68,31 +62,13 @@ def launch_server(run_shell: bool = False) -> None:
                 name=f"picosgl-TP{i}-scheduler",
             ).start()
 
-        num_tokenizers = server_args.num_tokenizer
-        # DeTokenizer, only 1
-        mp.Process(
-            target=tokenize_worker,
-            kwargs={
-                "tokenizer_path": server_args.model_path,
-                "addr": server_args.zmq_detokenizer_addr,
-                "backend_addr": server_args.zmq_backend_addr,
-                "frontend_addr": server_args.zmq_frontend_addr,
-                "local_bs": 1,
-                "create": server_args.tokenizer_create_addr,
-                "tokenizer_id": num_tokenizers,
-                "ack_queue": ack_queue,
-            },
-            daemon=False,
-            name="picosgl-detokenizer-0",
-        ).start()
-        for i in range(num_tokenizers):
+        for i in range(server_args.num_tokenizer):
             mp.Process(
                 target=tokenize_worker,
                 kwargs={
                     "tokenizer_path": server_args.model_path,
                     "addr": server_args.zmq_tokenizer_addr,
                     "backend_addr": server_args.zmq_backend_addr,
-                    "frontend_addr": server_args.zmq_frontend_addr,
                     "local_bs": 1,
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
@@ -102,12 +78,23 @@ def launch_server(run_shell: bool = False) -> None:
                 name=f"picosgl-tokenizer-{i}",
             ).start()
 
-        # Wait for acknowledgments from all worker processes:
-        # - world_size schedulers (but only primary rank sends ack)
-        # - num_tokenizers tokenizers
-        # - 1 detokenizer
-        # Total acks expected: 1 + num_tokenizers + 1 = num_tokenizers + 2
-        for _ in range(num_tokenizers + 2):
+        mp.Process(
+            target=detokenize_worker,
+            kwargs={
+                "tokenizer_path": server_args.model_path,
+                "addr": server_args.zmq_detokenizer_addr,
+                "backend_addr": server_args.zmq_backend_addr,
+                "frontend_addr": server_args.zmq_frontend_addr,
+                "local_bs": 1,
+                "create": server_args.tokenizer_create_addr,
+                "detokenizer_id": 0,
+                "ack_queue": ack_queue,
+            },
+            daemon=False,
+            name="picosgl-detokenizer-0",
+        ).start()
+
+        for _ in range(server_args.num_tokenizer + 2):
             logger.info(ack_queue.get())
 
     run_api_server(server_args, start_subprocess, run_shell=run_shell)

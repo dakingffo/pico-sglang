@@ -43,6 +43,9 @@ class Request:
         self.max_device_len = self.device_len + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
+    def __lt__(self, other: Request) -> bool:
+        return self.uid < other.uid
+    
     @property
     def remain_len(self) -> int:
         return self.max_device_len - self.device_len
@@ -68,6 +71,14 @@ class Request:
             f"cached_len={self.cached_len}, device_len={self.device_len}, "
             f"max_device_len={self.max_device_len})"
         )
+
+class ChunkedRequest(Request):
+    def append_host(self, next_token: torch.Tensor) -> None:
+        raise NotImplementedError("ChunkedRequest should not be sampled")
+
+    @property
+    def can_decode(self) -> bool:
+        return False  # avoid being added to decode manager
 
 
 @dataclass

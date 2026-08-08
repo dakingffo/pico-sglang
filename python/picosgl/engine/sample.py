@@ -33,7 +33,7 @@ def sample_impl(
     top_p       : torch.Tensor | float | None,
 ) -> torch.Tensor:
     import flashinfer.sampling as sampling
-
+    
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     
     if top_k is None and top_p is None:

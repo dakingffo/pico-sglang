@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, TypeAlias
 
 import torch
-from picosgl.core import Batch, Request
+
+from picosgl.core import Batch, Request, ChunkedRequest
 from picosgl.env import ENV
 from picosgl.message import (
     AbortBackendMsg,
@@ -14,38 +15,35 @@ from picosgl.message import (
     UserMsg,
 )
 from picosgl.utils import init_logger, load_tokenizer
+from picosgl.engine import Engine, BatchSamplingArgs, ForwardOutput
 
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .prefill import ChunkedReq, PrefillManager
+from .prefill import PrefillAdder, PrefillManager
 from .table import TableManager
-
-if TYPE_CHECKING:
-    from picosgl.engine import BatchSamplingArgs, ForwardOutput
-
+    
 
 logger = init_logger(__name__)
 
-Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
+
+Indice2D: TypeAlias = tuple[torch.Tensor, torch.Tensor]
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
-    batch: Batch
+    batch      : Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
     write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
 
 
-ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
-        from picosgl.engine import Engine
-
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation
@@ -60,12 +58,10 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
         )
         self.decode_manager = DecodeManager(config.page_size)
-        self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
-        )
+        self.prefill_manager = PrefillManager()
 
         # some alias for easy access
-        self.finished_reqs: Set[Request] = set()
+        self.finished_reqs: set[Request] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
@@ -141,11 +137,11 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
-        reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Request] = set()
+        reply: list[DetokenizeMsg] = []
+        new_finished_reqs: set[Request] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
+                if isinstance(req, ChunkedRequest):
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
@@ -189,8 +185,8 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = self.prefill_manager.abort_req(msg.uid)
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            req_to_free = (self.prefill_manager.abort_req(msg.uid) 
+                            or self.decode_manager.abort_req(msg.uid))
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
         else:
@@ -219,8 +215,12 @@ class Scheduler(SchedulerIOMixin):
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
         batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
+            self.prefill_manager.schedule_next_batch(PrefillAdder(
+            token_budget=self.prefill_budget,
+            reserved_size=self.decode_manager.inflight_tokens,
+            cache_manager=self.cache_manager,
+            table_manager=self.table_manager,
+            )) or self.decode_manager.schedule_next_batch()
         )
         return self._prepare_batch(batch) if batch else None
 
@@ -243,7 +243,7 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             req.cached_len,
             req.device_len,
             dtype=torch.int32,
-            out=indices_host[offset : offset + length],
+            out=indices_host[offset: offset + length],
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
@@ -254,7 +254,7 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
-        mapping_host[offset : offset + length].fill_(req.table_idx)
+        mapping_host[offset: offset + length].fill_(req.table_idx)
         offset += length
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 

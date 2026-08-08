@@ -3,13 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from itertools import count
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Literal, Tuple
+from typing import Callable, Literal
 
+import psutil
 import uvicorn
-from fastapi import FastAPI, Request
+import fastapi
+import pydantic
 from fastapi.responses import StreamingResponse
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
+from starlette.background import BackgroundTask
+
 from picosgl.core import SamplingParams
 from picosgl.env import ENV
 from picosgl.message import (
@@ -21,11 +28,6 @@ from picosgl.message import (
     UserReply,
 )
 from picosgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
-from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
-
 from .args import ServerArgs
 
 logger = init_logger(__name__, "FrontendAPI")
@@ -39,76 +41,73 @@ def get_global_state() -> FrontendManager:
     return _GLOBAL_STATE
 
 
-def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
+def _unwrap_msg(msg: BaseFrontendMsg) -> list[UserReply]:
     if isinstance(msg, BatchFrontendMsg):
         result = []
         for reply in msg.data:
             assert isinstance(reply, UserReply)
             result.append(reply)
         return result
-    assert isinstance(msg, UserReply)
-    return [msg]
+    else:
+        assert isinstance(msg, UserReply)
+        return [msg]
 
 
-class GenerateRequest(BaseModel):
-    prompt: str
+class GenerateRequest(pydantic.BaseModel):
+    prompt    : str
     max_tokens: int
     ignore_eos: bool = False
 
 
-class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
+class Message(pydantic.BaseModel):
+    role   : Literal["system", "user", "assistant"]
     content: str
 
 
-class OpenAICompletionRequest(BaseModel):
+class OpenAICompletionRequest(pydantic.BaseModel):
     """Unified request model for OpenAI-style completions and chat-completions."""
 
-    model: str
+    model   : str
+    prompt  : str | None           = None
+    messages: list[Message] | None = None
 
-    prompt: str | None = None
-    messages: List[Message] | None = None
-
-    max_tokens: int = 16
-    temperature: float = 1.0
-
-    top_k: int = -1
-    top_p: float = 1.0
-    n: int = 1
-    stream: bool = False
-    stop: List[str] = []
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-
-    ignore_eos: bool = False
+    max_tokens       : int       = 16
+    temperature      : float     = 1.0
+    top_k            : int       = -1
+    top_p            : float     = 1.0
+    n                : int       = 1
+    stream           : bool      = False
+    stop             : list[str] = []
+    presence_penalty : float     = 0.0
+    frequency_penalty: float     = 0.0
+    ignore_eos       : bool      = False
 
 
-class ModelCard(BaseModel):
-    id: str
-    object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "mini-sglang"
-    root: str
+class ModelCard(pydantic.BaseModel):
+    id      : str
+    object  : str = "model"
+    created : int = pydantic.Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "pico-sglang"
+    root    : str
 
 
-class ModelList(BaseModel):
-    object: str = "list"
-    data: List[ModelCard] = Field(default_factory=list)
+class Modellist(pydantic.BaseModel):
+    object: str             = "list"
+    data  : list[ModelCard] = pydantic.Field(default_factory=list)
 
 
 @dataclass
 class FrontendManager:
-    config: ServerArgs
+    config        : ServerArgs
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
-    uid_counter: int = 0
-    initialized: bool = False
-    ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
-    event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    initialized   : bool                       = False
+    uid_counter   : count                      = field(default_factory=count)
+    ack_map       : dict[int, list[UserReply]] = field(default_factory=dict)
+    event_map     : dict[int, asyncio.Event]   = field(default_factory=dict)
 
     def new_user(self) -> int:
-        uid = self.uid_counter
-        self.uid_counter += 1
+        uid = next(self.uid_counter)
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         return uid
@@ -187,14 +186,15 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_with_cancellation(self, generator, request: Request, uid: int):
+    async def stream_with_cancellation(self, generator, request: fastapi.Request, uid: int):
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
                 if await request.is_disconnected():
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
-                yield chunk
+                else:
+                    yield chunk
         except asyncio.CancelledError:
             asyncio.create_task(self.abort_user(uid))
             raise
@@ -214,7 +214,7 @@ class FrontendManager:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(_: fastapi.FastAPI):
     yield
     # shutdown code here
     global _GLOBAL_STATE
@@ -222,11 +222,11 @@ async def lifespan(_: FastAPI):
         _GLOBAL_STATE.shutdown()
 
 
-app = FastAPI(title="picosgl API Server", version="0.0.1", lifespan=lifespan)
+app = fastapi.FastAPI(title="picosgl API Server", version="0.0.1", lifespan=lifespan)
 
 
 @app.post("/generate")
-async def generate(req: GenerateRequest, request: Request):
+async def generate(req: GenerateRequest, request: fastapi.Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
     uid = state.new_user()
@@ -253,7 +253,7 @@ async def v1_root():
 
 
 @app.post("/v1/chat/completions")
-async def v1_completions(req: OpenAICompletionRequest, request: Request):
+async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request):
     state = get_global_state()
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
@@ -282,38 +282,37 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
             media_type="text/event-stream",
         )
+    else:
+        full_content = ""
+        async for ack in state.wait_for_ack(uid):
+            full_content += ack.incremental_output
+            if ack.finished:
+                break
 
-    # Non-streaming: collect all chunks and return a single JSON response
-    full_content = ""
-    async for ack in state.wait_for_ack(uid):
-        full_content += ack.incremental_output
-        if ack.finished:
-            break
-
-    return {
-        "id": f"chatcmpl-{uid}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": full_content},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
-    }
+        return {
+            "id": f"chatcmpl-{uid}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": full_content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
 
 
 @app.get("/v1/models")
 async def available_models():
     state = get_global_state()
-    return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
+    return Modellist(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
 
 async def shell_completion(req: OpenAICompletionRequest):
@@ -349,12 +348,10 @@ async def shell_completion(req: OpenAICompletionRequest):
 
 
 async def shell():
-    commands = ["/exit", "/reset"]
-    completer = WordCompleter(commands)
-    session = PromptSession("$ ", completer=completer)
+    session = PromptSession("$ ", completer=WordCompleter(["/exit", "/reset"]))
 
     try:
-        history: List[Tuple[str, str]] = []
+        history: list[tuple[str, str]] = []
         while True:
             cmd = (await session.prompt_async()).strip()
             if cmd == "":
@@ -366,7 +363,7 @@ async def shell():
                     history = []
                     continue
                 raise ValueError(f"Unknown command: {cmd}")
-            history_messages: List[Message] = []
+            history_messages: list[Message] = []
             for user_msg, assistant_msg in history:
                 history_messages.append(Message(role="user", content=user_msg))
                 history_messages.append(Message(role="assistant", content=assistant_msg))
@@ -400,8 +397,6 @@ async def shell():
         print("Exiting shell...")
         await asyncio.sleep(0.1)
         get_global_state().shutdown()
-        # then kill all the subprocesses
-        import psutil
 
         parent = psutil.Process()
         for child in parent.children(recursive=True):

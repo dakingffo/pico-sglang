@@ -1,4 +1,4 @@
-from .server import launch_server
+from picosgl.server import launch_server
 
 assert __name__ == "__main__"
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, List
+from typing import TYPE_CHECKING, Final
 
 import torch
+
 from picosgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg
 from picosgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
 
@@ -44,13 +45,14 @@ class SchedulerIOMixin:
                 encoder=BaseTokenizerMsg.encoder,
             )
 
-        recv = self._recv_msg_single_rank
-        send = self._reply_tokenizer_rank0
         if tp_info.size > 1:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
+                send = self._reply_tokenizer_rank0
                 self._send_into_ranks: Final = ZmqPubQueue(
-                    config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder
+                    config.zmq_scheduler_broadcast_addr, 
+                    create=True, 
+                    encoder=BaseBackendMsg.encoder
                 )
             else:
                 recv = self._recv_msg_multi_rank1
@@ -60,6 +62,9 @@ class SchedulerIOMixin:
                     create=False,
                     decoder=BaseBackendMsg.decoder,
                 )
+        else:
+            recv = self._recv_msg_single_rank
+            send = self._reply_tokenizer_rank0
 
         self.receive_msg = recv
         self.send_result = send
@@ -67,17 +72,17 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
-    def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
+    def offline_receive_msg(self, blocking: bool = False) -> list[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
-    def offline_send_result(self, reply: List[DetokenizeMsg]) -> None:
+    def offline_send_result(self, reply: list[DetokenizeMsg]) -> None:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
-    def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
-        pending_msgs: List[BaseBackendMsg] = []
+    def _recv_msg_single_rank(self, blocking: bool = False) -> list[BaseBackendMsg]:
+        pending_msgs: list[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
             pending_msgs.append(self._recv_from_tokenizer.get())
@@ -85,15 +90,15 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_tokenizer.get())
         return pending_msgs
 
-    def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
-        pending_msgs: List[BaseBackendMsg] = []
+    def _recv_msg_multi_rank0(self, blocking: bool = False) -> list[BaseBackendMsg]:
+        pending_msgs: list[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
             raw = self._recv_from_tokenizer.get_raw()
             self._send_into_ranks.put_raw(raw)
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
 
-        pending_raw_msgs: List[bytes] = []
+        pending_raw_msgs: list[bytes] = []
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
@@ -106,8 +111,8 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
         return pending_msgs
 
-    def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
-        pending_msgs: List[BaseBackendMsg] = []
+    def _recv_msg_multi_rank1(self, blocking: bool = False) -> list[BaseBackendMsg]:
+        pending_msgs: list[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
             pending_msgs.append(self._recv_from_rank0.get())
@@ -121,7 +126,7 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_rank0.get())
         return pending_msgs
 
-    def _reply_tokenizer_rank0(self, reply: List[DetokenizeMsg]) -> None:
+    def _reply_tokenizer_rank0(self, reply: list[DetokenizeMsg]) -> None:
         num_reply = len(reply)
         logger.debug_rank0(f"Replying to tokenizer: {num_reply} messages")
         if num_reply == 1:
@@ -129,5 +134,5 @@ class SchedulerIOMixin:
         elif num_reply > 1:
             self._send_into_tokenizer.put(BatchTokenizerMsg(data=reply))  # type: ignore
 
-    def _reply_tokenizer_rank1(self, reply: List[DetokenizeMsg]) -> None:
-        _ = reply  # do nothing for non-primary ranks
+    def _reply_tokenizer_rank1(self, reply: list[DetokenizeMsg]) -> None:
+        pass

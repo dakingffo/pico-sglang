@@ -1,38 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Set
+from typing import Iterable
 
 from picosgl.core import Batch, Request
-
+from picosgl.utils import align_ceil
 
 @dataclass
 class DecodeManager:
-    page_size: int
-    running_reqs: Set[Request] = field(default_factory=set)
+    page_size   : int
+    running_reqs: dict[int, Request] = field(default_factory=dict)
 
     def filter_reqs(self, reqs: Iterable[Request]) -> None:
-        self.running_reqs = {req for req in self.running_reqs.union(reqs) if req.can_decode}
+        self.running_reqs |= {req.uid: req for req in reqs if req.can_decode}
 
     def remove_req(self, req: Request) -> None:
-        self.running_reqs.discard(req)
+        self.running_reqs.pop(req.uid, None)
 
     def abort_req(self, uid: int) -> Request | None:
-        for req in self.running_reqs:
-            if req.uid == uid:
-                self.running_reqs.remove(req)
-                return req
-        return None
+        return self.running_reqs.pop(uid, None)
 
     @property
     def inflight_tokens(self) -> int:
-        tokens_reserved = (self.page_size - 1) * len(self.running_reqs)  # 1 page reserved
-        return sum(req.remain_len for req in self.running_reqs) + tokens_reserved
+        return sum(align_ceil(req.remain_len, self.page_size) for req in self.running_reqs.values())
 
     def schedule_next_batch(self) -> Batch | None:
-        if not self.runnable:
-            return None
-        return Batch(reqs=sorted(self.running_reqs, key=lambda req: req.uid), phase="decode")
+        return Batch(reqs=sorted(self.running_reqs.values()), phase="decode") if self.runnable else None
 
     @property
     def runnable(self) -> bool:

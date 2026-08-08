@@ -12,7 +12,9 @@ from picosgl.distributed import destroy_distributed, enable_pynccl_distributed, 
 from picosgl.kvcache import create_kvcache_pool
 from picosgl.layers import set_rope_device
 from picosgl.models import create_model, load_weight
-from picosgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from picosgl.utils import (
+    align_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -30,7 +32,7 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        set_tp_info(config.tp_info)
         _adjust_config(config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -53,8 +55,7 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
-        num_tokens = self.num_pages * config.page_size
+        self.num_pages, num_tokens = self._determine_num_pages(init_free_memory, config)
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
@@ -66,7 +67,7 @@ class Engine:
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _align_up_32(self.max_seq_len)
+        aligned_max_seq_len = align_ceil(self.max_seq_len, 32)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -111,30 +112,20 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.group.WORLD
-            assert tp_cpu_group is not None
-            max_bytes = (
-                config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
-            )
+        torch.distributed.init_process_group(
+            backend="gloo",
+            rank=config.tp_info.rank,
+            world_size=config.tp_info.size,
+            timeout=timedelta(seconds=config.distributed_timeout),
+            init_method=config.distributed_addr,
+        )
+        tp_cpu_group = torch.distributed.group.WORLD
+        assert tp_cpu_group is not None
+        max_bytes = (
+            config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
+        )
+        if config.tp_info.size > 1:
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
-        else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=config.tp_info.rank,
-                world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
-            assert tp_cpu_group is not None
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> dict[str, torch.Tensor]:
@@ -149,7 +140,7 @@ class Engine:
                 for k, v in load_weight(config.model_path, self.device)
             }
 
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int]:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
@@ -167,9 +158,9 @@ class Engine:
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size
-        real_kv_size = num_pages * cache_per_page
-        logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
-        return num_pages
+        logger.info(f"Allocating {num_tokens} tokens for KV cache,\
+                     K + V = {mem_GB(num_pages * cache_per_page)}")
+        return num_pages, num_tokens
 
     def _sync_get_memory(self) -> tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
@@ -213,10 +204,6 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
-
-
-def _align_up_32(num: int) -> int:
-    return (num + 31) // 32 * 32
 
 
 def _adjust_config(config: EngineConfig):

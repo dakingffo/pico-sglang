@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
 
 import torch
+
 from picosgl.distributed import DistributedInfo
 from picosgl.scheduler import SchedulerConfig
 from picosgl.utils import init_logger
@@ -13,9 +13,9 @@ from picosgl.utils import init_logger
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
-    server_host: str = "127.0.0.1"
-    server_port: int = 1919
-    num_tokenizer: int = 0
+    server_host  : str  = "127.0.0.1"
+    server_port  : int  = 1919
+    num_tokenizer: int  = 1
     silent_output: bool = False
 
     @property
@@ -51,7 +51,7 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
-def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
+def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bool]:
     """
     Parse command line arguments and return an EngineConfig.
 
@@ -119,14 +119,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         action="store_true",
         dest="use_dummy_weight",
         help="Use dummy weights for testing.",
-    )
-
-    assert ServerArgs.use_pynccl == True
-    parser.add_argument(
-        "--disable-pynccl",
-        action="store_false",
-        dest="use_pynccl",
-        help="Disable PyNCCL for tensor parallelism.",
     )
 
     parser.add_argument(

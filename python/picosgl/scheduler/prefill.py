@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING
 
 import torch
-from picosgl.core import Batch, Request
+
+from picosgl.core import Batch, Request, ChunkedRequest
 from picosgl.utils import init_logger
 
-from .utils import PendingReq
+from .utils import PendingRequest
 
 if TYPE_CHECKING:
     from picosgl.kvcache import BaseCacheHandle
@@ -20,23 +21,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class ChunkedReq(Request):
-    def append_host(self, next_token: torch.Tensor) -> None:
-        raise NotImplementedError("ChunkedReq should not be sampled")
-
-    @property
-    def can_decode(self) -> bool:
-        return False  # avoid being added to decode manager
-
-
 @dataclass
 class PrefillAdder:
-    token_budget: int
+    token_budget : int
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
 
-    def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
+    def _try_allocate_one(self, req: PendingRequest) -> tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
@@ -64,21 +56,20 @@ class PrefillAdder:
 
     def _add_one_req(
         self,
-        pending_req: PendingReq,
+        pending_req : PendingRequest,
         cache_handle: BaseCacheHandle,
-        table_idx: int,
-        cached_len: int,
-    ) -> Request:
+        table_idx   : int,
+        cached_len  : int,
+    ) -> Request | ChunkedRequest:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         is_chunked = chunk_size < remain_len
-        CLS = ChunkedReq if is_chunked else Request
+        CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
-        _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.token_pool[table_idx, _slice]
-        device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
+        device_ids = self.table_manager.token_pool[table_idx, cached_len: cached_len + chunk_size]
+        device_ids.copy_(pending_req.input_ids[cached_len: cached_len + chunk_size].pin_memory(), non_blocking=True)
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -89,7 +80,7 @@ class PrefillAdder:
             sampling_params=pending_req.sampling_params,
         )
 
-    def try_add_one(self, pending_req: PendingReq) -> Request | None:
+    def try_add_one(self, pending_req: PendingRequest) -> Request | ChunkedRequest | None:
         if self.token_budget <= 0:
             return None
 
@@ -115,31 +106,21 @@ class PrefillAdder:
 
 @dataclass
 class PrefillManager:
-    cache_manager: CacheManager
-    table_manager: TableManager
-    decode_manager: DecodeManager
-    pending_list: List[PendingReq] = field(default_factory=list)
+    pending_list  : list[PendingRequest] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        self.pending_list.append(PendingRequest(req.uid, req.input_ids, req.sampling_params))
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def schedule_next_batch(self, adder: PrefillAdder) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
-        # estimated offset due to in-flight decode
-        adder = PrefillAdder(
-            token_budget=prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,
-            cache_manager=self.cache_manager,
-            table_manager=self.table_manager,
-        )
-        reqs: List[Request] = []
-        chunked_list: List[PendingReq] = []
+        reqs: list[Request] = []
+        chunked_list: list[PendingRequest] = []
         for pending_req in self.pending_list:
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
-                if isinstance(req, ChunkedReq):
+                if isinstance(req, ChunkedRequest):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
