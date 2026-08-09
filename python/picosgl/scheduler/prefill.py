@@ -11,7 +11,7 @@ from picosgl.utils import init_logger
 from .utils import PendingRequest
 
 if TYPE_CHECKING:
-    from picosgl.kvcache import BaseCacheHandle
+    from picosgl.cache import BaseCacheHandle
     from picosgl.message import UserMsg
 
     from .cache import CacheManager

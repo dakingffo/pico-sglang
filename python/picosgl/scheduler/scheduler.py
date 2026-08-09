@@ -196,7 +196,7 @@ class Scheduler(SchedulerIOMixin):
     def _free_req_resources(self, req: Request) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
-        if (pool := getattr(self.engine.ctx, "linear_state_pool", None)) is not None:
+        if (pool := getattr(self.engine.ctx, "linear_state", None)) is not None:
             pool.reset(req.table_idx)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:

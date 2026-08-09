@@ -34,7 +34,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         EngineConfig instance with parsed arguments
     """
     from picosgl.layers.attention_backend import validate_attn_backend
-    from picosgl.kvcache import SUPPORTED_CACHE_MANAGER
+    from picosgl.cache import SUPPORTED_CACHE_MANAGER
     from picosgl.layers.moe_backend import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="picosgl Server Arguments")
@@ -217,7 +217,15 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     if (dtype_str := kwargs["dtype"]) == "auto":
         from picosgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        # `dtype` is the transformers alias of `torch_dtype`. The raw-config fallback
+        # (unregistered architectures like Qwen3.5) mirrors only fields present in
+        # config.json, where torch_dtype may be null -> default to bf16.
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+        dtype_str = (
+            getattr(hf_config, "dtype", None)
+            or getattr(hf_config, "torch_dtype", None)
+            or "bfloat16"
+        )
 
     DTYPE_MAP = {
         "float16": torch.float16,

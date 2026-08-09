@@ -9,8 +9,8 @@ from picosgl.layers.attention_backend import create_attention_backend
 from picosgl.layers.moe_backend import create_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
 from picosgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from picosgl.kvcache import create_kvcache_pool
-from picosgl.layers import LinearStatePool, set_rope_device
+from picosgl.cache import create_kvcache_pool, create_linear_state_pool
+from picosgl.layers import set_rope_device
 from picosgl.models import create_model, load_weight
 from picosgl.utils import (
     align_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
@@ -66,22 +66,13 @@ class Engine:
 
         # ======================= Linear attention state pool ========================
         if config.model_config.is_hybrid:
-            mc = config.model_config
-            conv_dim = (
-                mc.linear_num_key_heads * mc.linear_key_head_dim * 2
-                + mc.linear_num_value_heads * mc.linear_value_head_dim
+            self.ctx.linear_state = create_linear_state_pool(
+                model_config=config.model_config,
+                max_req=config.max_running_req, 
+                device=self.device, 
+                dtype=self.dtype
             )
-            self.ctx.linear_state_pool = LinearStatePool(
-                num_linear_layers=mc.num_linear_layers,
-                max_req=config.max_running_req,
-                conv_dim=conv_dim,
-                kernel_size=mc.linear_conv_kernel_dim,
-                num_v_heads=mc.linear_num_value_heads,
-                head_k_dim=mc.linear_key_head_dim,
-                head_v_dim=mc.linear_value_head_dim,
-                device=self.device,
-                dtype=self.dtype,
-            )
+
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages

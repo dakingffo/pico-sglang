@@ -31,8 +31,7 @@ def main():
     del loaded
 
     from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-    from picosgl.kvcache import create_kvcache_pool
-    from picosgl.layers import LinearStatePool
+    from picosgl.cache import create_kvcache_pool, LinearStatePool
     from picosgl.layers.attention_backend import create_attention_backend
 
     conv_dim = (
@@ -45,7 +44,7 @@ def main():
         model_config=mcfg, num_pages=num_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
-    ctx.linear_state_pool = LinearStatePool(
+    ctx.linear_state = LinearStatePool(
         num_linear_layers=mcfg.num_linear_layers, max_req=4, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,

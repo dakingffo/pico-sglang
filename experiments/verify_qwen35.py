@@ -137,8 +137,8 @@ def test2_gated_delta_net_math(mcfg):
     print("=" * 60)
     print("Test 2: GatedDeltaNet prefill vs decode math (random weights)")
     from picosgl.core import Context, get_global_ctx, set_global_ctx
-    from picosgl.layers import LinearStatePool
-    from picosgl.models.qwen3_5 import Qwen3_5GatedDeltaNet
+    from picosgl.cache import LinearStatePool
+    from picosgl.layers.qwen3_5 import Qwen3_5GatedDeltaNet
 
     hidden = mcfg.hidden_size
     conv_dim = (
@@ -146,7 +146,7 @@ def test2_gated_delta_net_math(mcfg):
         + mcfg.linear_num_value_heads * mcfg.linear_value_head_dim
     )
     ctx = Context(page_size=1)
-    ctx.linear_state_pool = LinearStatePool(
+    ctx.linear_state = LinearStatePool(
         num_linear_layers=1, max_req=4, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,
@@ -207,8 +207,7 @@ def test3_full_model(mcfg, loaded=None):
     print("=" * 60)
     print("Test 3: full model prefill vs decode logits (paged flashinfer)")
     from picosgl.core import Context, get_global_ctx, set_global_ctx, Request
-    from picosgl.kvcache import create_kvcache_pool
-    from picosgl.layers import LinearStatePool
+    from picosgl.cache import create_kvcache_pool, LinearStatePool
     from picosgl.layers.attention_backend import create_attention_backend
 
     device = torch.device("cuda:0")
@@ -228,7 +227,7 @@ def test3_full_model(mcfg, loaded=None):
         model_config=mcfg, num_pages=num_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
-    ctx.linear_state_pool = LinearStatePool(
+    ctx.linear_state = LinearStatePool(
         num_linear_layers=mcfg.num_linear_layers, max_req=4, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,
@@ -286,7 +285,7 @@ def test3_full_model(mcfg, loaded=None):
     print("  full prefill last-token logits == incremental prefill  ✓")
 
     # (b) step-by-step decode
-    ctx.linear_state_pool.reset(3)
+    ctx.linear_state.reset(3)
     # prefill token 0 on req slot 3
     req = mk_req(3, 1, 0, uid=2)
     batch = make_batch([req], "prefill", id_t[:1], torch.zeros(1, device=device, dtype=torch.int64))

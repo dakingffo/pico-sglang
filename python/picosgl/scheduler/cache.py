@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from picosgl.core import Request
-from picosgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
+from picosgl.cache import BaseCacheHandle, MatchResult, create_prefix_cache
 from picosgl.utils import div_ceil
 
 if TYPE_CHECKING:
