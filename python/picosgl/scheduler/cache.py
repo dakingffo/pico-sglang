@@ -93,15 +93,12 @@ class CacheManager:
     @contextmanager
     def lazy_free_region(self):
         lazy_free_list: list[torch.Tensor] = []
-
-        def lazy_free(indices: torch.Tensor) -> None:
-            lazy_free_list.append(indices[:: self.page_size])
-        
+        self_free = self._free
         try:
-            self._free = lazy_free
+            self._free = lambda indices: lazy_free_list.append(indices[:: self.page_size])
             yield
         finally:
-            del self._free
+            self._free = self_free
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:

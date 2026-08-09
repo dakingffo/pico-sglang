@@ -33,8 +33,7 @@ def _unwrap_msg(msg: BaseTokenizerMsg) -> list[BaseTokenizerMsg]:
 def tokenize_worker(
     *,
     tokenizer_path: str,
-    addr          : str,
-    create        : bool,
+    tokenizer_addr: str,
     backend_addr  : str,
     local_bs      : int,
     tokenizer_id  : int                  = -1,
@@ -43,7 +42,7 @@ def tokenize_worker(
     assert local_bs > 0
 
     backend_sender = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
-    receiver = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
+    receiver = ZmqPullQueue(tokenizer_addr, create=False, decoder=BatchTokenizerMsg.decoder)
     tokenizer = load_tokenizer(tokenizer_path)
     tokenize_manager = TokenizeManager(tokenizer)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
@@ -93,20 +92,19 @@ def tokenize_worker(
 @torch.inference_mode()
 def detokenize_worker(
     *,
-    tokenizer_path: str,
-    addr          : str,
-    create        : bool,
-    backend_addr  : str,
-    frontend_addr : str,
-    local_bs      : int,
-    detokenizer_id: int                  = -1,
-    ack_queue     : mp.Queue[str] | None = None,
+    tokenizer_path  : str,
+    detokenizer_addr: str,
+    backend_addr    : str,
+    frontend_addr   : str,
+    local_bs        : int,
+    detokenizer_id  : int                  = -1,
+    ack_queue       : mp.Queue[str] | None = None,
 ) -> None:
     assert local_bs > 0
     
     backend_sender = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     frontend_sender = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
-    receiver = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
+    receiver = ZmqPullQueue(detokenizer_addr, create=False, decoder=BatchTokenizerMsg.decoder)
     tokenizer = load_tokenizer(tokenizer_path)
     detokenize_manager = DetokenizeManager(tokenizer)
     logger = init_logger(__name__, f"detokenizer_{detokenizer_id}")

@@ -10,7 +10,7 @@ from picosgl.layers.moe_backend import create_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
 from picosgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from picosgl.kvcache import create_kvcache_pool
-from picosgl.layers import set_rope_device
+from picosgl.layers import LinearStatePool, set_rope_device
 from picosgl.models import create_model, load_weight
 from picosgl.utils import (
     align_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
@@ -63,6 +63,25 @@ class Engine:
             device=self.device,
             dtype=self.dtype,
         )
+
+        # ======================= Linear attention state pool ========================
+        if config.model_config.is_hybrid:
+            mc = config.model_config
+            conv_dim = (
+                mc.linear_num_key_heads * mc.linear_key_head_dim * 2
+                + mc.linear_num_value_heads * mc.linear_value_head_dim
+            )
+            self.ctx.linear_state_pool = LinearStatePool(
+                num_linear_layers=mc.num_linear_layers,
+                max_req=config.max_running_req,
+                conv_dim=conv_dim,
+                kernel_size=mc.linear_conv_kernel_dim,
+                num_v_heads=mc.linear_num_value_heads,
+                head_k_dim=mc.linear_key_head_dim,
+                head_v_dim=mc.linear_value_head_dim,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -135,8 +154,11 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
+            # Cast each tensor to its parameter's dtype (not blanket self.dtype) so that
+            # fp32 params (e.g. GatedDeltaNet A_log / gated norm weight) stay fp32.
+            param_dtypes = {k: v.dtype for k, v in self.model.state_dict().items()}
             return {
-                k: v.to(self.dtype) 
+                k: v.to(param_dtypes.get(k, self.dtype))
                 for k, v in load_weight(config.model_path, self.device)
             }
 
@@ -148,7 +170,7 @@ class Engine:
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * config.model_config.num_attention_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
@@ -222,3 +244,13 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+    if config.model_config.is_hybrid:
+        # linear attention states cannot be recovered from a radix prefix cache; also the
+        # per-request state gather/scatter cannot be captured into a CUDA graph.
+        if getattr(config, "cache_type", "radix") == "radix":
+            override("cache_type", "naive")
+            logger.warning_rank0("Prefix cache disabled for hybrid (linear attention) model.")
+        if config.cuda_graph_max_bs is None:
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")

@@ -32,10 +32,38 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    # ---- Qwen3.5 hybrid (linear_attention + full_attention) ----
+    layer_types: list[str] | None = None
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 0
+    partial_rotary_factor: float = 1.0
+    attn_output_gate: bool = False
+    mtp_num_hidden_layers: int = 0
+    mamba_ssm_dtype: str = "float32"
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
+
+    @property
+    def is_hybrid(self) -> bool:
+        return bool(self.layer_types)
+
+    @property
+    def num_attention_layers(self) -> int:
+        """Number of full-attention layers (the only ones that use paged KV cache)."""
+        if self.is_hybrid:
+            return sum(1 for t in self.layer_types if t == "full_attention")
+        return self.num_layers
+
+    @property
+    def num_linear_layers(self) -> int:
+        if self.is_hybrid:
+            return sum(1 for t in self.layer_types if t == "linear_attention")
+        return 0
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
@@ -56,9 +84,35 @@ class ModelConfig:
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
-        # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
+        # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict;
+        # Qwen3.5: inside rope_parameters dict.
         rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        rope_theta = (
+            getattr(config, "rope_theta", None)
+            or rope_params.get("rope_theta")
+            or (rope_scaling["rope_theta"] if rope_scaling else None)
+        )
+
+        # ---- Qwen3.5 hybrid ----
+        # transformers populates ``layer_types`` for ALL Qwen3 configs (dense ones get an
+        # all-"full_attention" array), so "non-empty" is NOT hybrid. Only a real mix of
+        # linear_attention layers makes the model hybrid.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is not None and "linear_attention" not in layer_types:
+            layer_types = None
+        if layer_types is None:
+            interval = getattr(config, "full_attention_interval", None)
+            if interval is not None:
+                layer_types = [
+                    "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                    for i in range(config.num_hidden_layers)
+                ]
+        partial_rotary_factor = float(
+            rope_params.get(
+                "partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0)
+            )
+        )
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -73,7 +127,7 @@ class ModelConfig:
             tie_word_embeddings=tie_word_embeddings,
             rotary_config=RotaryConfig(
                 head_dim=head_dim,
-                rotary_dim=head_dim,
+                rotary_dim=int(head_dim * partial_rotary_factor),
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
@@ -84,4 +138,14 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            layer_types=layer_types,
+            linear_num_key_heads=getattr(config, "linear_num_key_heads", 0),
+            linear_num_value_heads=getattr(config, "linear_num_value_heads", 0),
+            linear_key_head_dim=getattr(config, "linear_key_head_dim", 0),
+            linear_value_head_dim=getattr(config, "linear_value_head_dim", 0),
+            linear_conv_kernel_dim=getattr(config, "linear_conv_kernel_dim", 0),
+            partial_rotary_factor=partial_rotary_factor,
+            attn_output_gate=getattr(config, "attn_output_gate", False),
+            mtp_num_hidden_layers=getattr(config, "mtp_num_hidden_layers", 0),
+            mamba_ssm_dtype=getattr(config, "mamba_ssm_dtype", "float32"),
         )

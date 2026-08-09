@@ -25,7 +25,7 @@ class EngineConfig:
     cuda_graph_bs       : list[int] | None = None
     cuda_graph_max_bs   : int | None       = None
     page_size           : int              = 1
-    memory_ratio        : float            = 0.9
+    memory_ratio        : float            = 0.85
     distributed_timeout : float            = 60.0
     use_dummy_weight    : bool             = False
     max_seq_len_override: int | None       = None

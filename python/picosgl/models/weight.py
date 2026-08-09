@@ -10,8 +10,13 @@ from picosgl.distributed import get_tp_info
 from picosgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
-_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
-_SPLIT_DIM_1 = [".o_proj", ".down_proj"]
+_SPLIT_DIM_0 = [
+    ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj",
+    # Qwen3.5 linear attention / MTP
+    ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
+    ".conv1d.weight",
+]
+_SPLIT_DIM_1 = [".o_proj", ".down_proj", ".out_proj", ".fc"]
 
 # Merge groups: individual projections -> fused projection
 _MERGE_GROUPS = {
@@ -89,15 +94,17 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                # Skip vision/projector weights (multimodal wrapper or Qwen3.5 vision tower)
+                if name.startswith(("vision_tower.", "multi_modal_projector.", "model.visual.")):
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
+                # Qwen3.5: text weights live under model.language_model.*, strip the middle prefix
+                name = name.replace("model.language_model.", "model.", 1)
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 
-                if (info := _get_merge_info(name)) is None:
+                if config.is_hybrid or (info := _get_merge_info(name)) is None:
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info

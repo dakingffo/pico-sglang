@@ -1,4 +1,4 @@
 from .config import SchedulerConfig
-from .scheduler import Scheduler
+from .server import schedule_worker
 
-__all__ = ["Scheduler", "SchedulerConfig"]
+__all__ = ["schedule_worker", "SchedulerConfig"]

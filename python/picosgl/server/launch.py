@@ -1,40 +1,13 @@
 from __future__ import annotations
 
-import logging
-import multiprocessing as mp
 import sys
+import multiprocessing as mp
 from dataclasses import replace
-from typing import TYPE_CHECKING
 
-import torch
-
-from picosgl.scheduler import Scheduler
 from picosgl.distributed import DistributedInfo
 from picosgl.utils import init_logger
+from picosgl.scheduler import schedule_worker
 from picosgl.tokenizer import tokenize_worker, detokenize_worker
-
-if TYPE_CHECKING:
-    from .args import ServerArgs
-
-@torch.inference_mode()
-def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
-    scheduler = Scheduler(args)
-    scheduler.sync_all_ranks()
-
-    if args.tp_info.is_primary():
-        ack_queue.put("Scheduler is ready")
-
-    if args.silent_output:
-        logging.disable(logging.INFO)
-
-    try:
-        scheduler.run_forever()
-    except KeyboardInterrupt:
-        logger = init_logger(__name__)
-        if args.tp_info.is_primary():
-            print()  # for a clean newline after ^C
-            logger.info("Scheduler exiting gracefully...")
-        scheduler.shutdown()
 
 
 def launch_server(run_shell: bool = False) -> None:
@@ -51,13 +24,16 @@ def launch_server(run_shell: bool = False) -> None:
         ack_queue: mp.Queue[str] = mp.Queue()
 
         for i in range(world_size):
-            new_args = replace(
+            args = replace(
                 server_args,
                 tp_info=DistributedInfo(i, world_size),
             )
             mp.Process(
-                target=_run_scheduler,
-                args=(new_args, ack_queue),
+                target=schedule_worker,
+                kwargs={
+                    "args": args,
+                    "ack_queue": ack_queue
+                },
                 daemon=False,
                 name=f"picosgl-TP{i}-scheduler",
             ).start()
@@ -67,10 +43,9 @@ def launch_server(run_shell: bool = False) -> None:
                 target=tokenize_worker,
                 kwargs={
                     "tokenizer_path": server_args.model_path,
-                    "addr": server_args.zmq_tokenizer_addr,
+                    "tokenizer_addr": server_args.zmq_tokenizer_addr,
                     "backend_addr": server_args.zmq_backend_addr,
                     "local_bs": 1,
-                    "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "ack_queue": ack_queue,
                 },
@@ -82,11 +57,10 @@ def launch_server(run_shell: bool = False) -> None:
             target=detokenize_worker,
             kwargs={
                 "tokenizer_path": server_args.model_path,
-                "addr": server_args.zmq_detokenizer_addr,
+                "detokenizer_addr": server_args.zmq_detokenizer_addr,
                 "backend_addr": server_args.zmq_backend_addr,
                 "frontend_addr": server_args.zmq_frontend_addr,
                 "local_bs": 1,
-                "create": server_args.tokenizer_create_addr,
                 "detokenizer_id": 0,
                 "ack_queue": ack_queue,
             },

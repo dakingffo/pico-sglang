@@ -32,9 +32,45 @@ def _load_hf_config(model_path: str) -> Any:
     return AutoConfig.from_pretrained(model_path)
 
 
+def _load_config_json(model_path: str) -> dict:
+    """Read config.json either from a local dir or via huggingface_hub."""
+    import json
+    import os
+
+    if os.path.isdir(model_path):
+        path = os.path.join(model_path, "config.json")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No config.json in {model_path}")
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(hf_hub_download(model_path, "config.json").read_text())
+
+
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
-    config = _load_hf_config(model_path)
-    return type(config)(**config.to_dict())
+    try:
+        config = _load_hf_config(model_path)
+        return type(config)(**config.to_dict())
+    except Exception:
+        # Fallback for architectures not yet registered in this transformers version
+        # (e.g. Qwen3.5). Builds a lightweight attribute object mirroring the HF config;
+        # picosgl only reads attributes off it, so this is sufficient.
+        from types import SimpleNamespace
+
+        logger = __import__("logging").getLogger("picosgl.hf")
+        logger.warning("AutoConfig failed for %s, falling back to raw config.json", model_path)
+        # Mirror HF PretrainedConfig: dicts become attribute-accessible namespaces, except
+        # rope_parameters / rope_scaling which picosgl reads as dicts.
+        _DICT_KEYS = ("rope_parameters", "rope_scaling")
+
+        def _ns(d: dict) -> Any:
+            return SimpleNamespace(
+                **{
+                    k: (_ns(v) if isinstance(v, dict) and k not in _DICT_KEYS else v)
+                    for k, v in d.items()
+                }
+            )
+
+        return _ns(_load_config_json(model_path))
 
 
 def download_hf_weight(model_path: str) -> str:

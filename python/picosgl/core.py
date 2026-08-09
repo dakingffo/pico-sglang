@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from picosgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
+    from picosgl.layers.linear_state_pool import LinearStatePool
     from picosgl.layers.moe_backend import BaseMoeBackend
 
 
@@ -118,6 +119,7 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend : BaseMoeBackend  = field(init=False)
     kv_cache    : BaseKVCachePool = field(init=False)
+    linear_state_pool: LinearStatePool = field(init=False)
     _batch      : Batch | None    = field(default=None, init=False)
 
     @property

@@ -42,8 +42,13 @@ class BaseOP:
             if isinstance(param, torch.Tensor):
                 item = state_dict.pop(_concat_prefix(prefix, name))
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
-                setattr(self, name, item)
+                assert param.shape == item.shape, (
+                    f"shape mismatch for {_concat_prefix(prefix, name)}: "
+                    f"{param.shape} vs {item.shape}"
+                )
+                # Cast to the parameter's dtype so mixed-dtype checkpoints (e.g. fp32
+                # GatedDeltaNet A_log / norm.weight) load without an exact-dtype match.
+                setattr(self, name, item.to(param.dtype))
             elif isinstance(param, BaseOP):
                 param.load_state_dict(
                     state_dict, prefix=_concat_prefix(prefix, name), _internal=True

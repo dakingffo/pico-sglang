@@ -432,7 +432,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         ),
         send_tokenizer=ZmqAsyncPushQueue(
             config.zmq_tokenizer_addr,
-            create=config.frontend_create_tokenizer_link,
+            create=True,
             encoder=BaseTokenizerMsg.encoder,
         ),
     )

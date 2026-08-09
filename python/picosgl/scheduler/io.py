@@ -14,17 +14,6 @@ logger = init_logger(__name__)
 
 
 class SchedulerIOMixin:
-    """
-    Mixin class for Scheduler I/O operations.
-
-    This class handles the communication between the scheduler and the tokenizer.
-
-    Public Utilities:
-        receive_msg: Function to receive messages from the tokenizer.
-        send_result: Function to send results back to the tokenizer.
-        sync_all_ranks: Function to synchronize all ranks on CPU side.
-    """
-
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
@@ -41,7 +30,7 @@ class SchedulerIOMixin:
             )
             self._send_into_tokenizer: Final = ZmqPushQueue(
                 config.zmq_detokenizer_addr,
-                create=config.backend_create_detokenizer_link,
+                create=True,
                 encoder=BaseTokenizerMsg.encoder,
             )
 

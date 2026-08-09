@@ -19,34 +19,6 @@ class ServerArgs(SchedulerConfig):
     silent_output: bool = False
 
     @property
-    def share_tokenizer(self) -> bool:
-        return self.num_tokenizer == 0
-
-    @property
-    def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/picosgl_3" + self._unique_suffix
-
-    @property
-    def zmq_tokenizer_addr(self) -> str:
-        if self.share_tokenizer:
-            return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/picosgl_4" + self._unique_suffix
-        assert result != self.zmq_detokenizer_addr
-        return result
-
-    @property
-    def tokenizer_create_addr(self) -> bool:
-        return self.share_tokenizer
-
-    @property
-    def backend_create_detokenizer_link(self) -> bool:
-        return not self.share_tokenizer
-
-    @property
-    def frontend_create_tokenizer_link(self) -> bool:
-        return not self.share_tokenizer
-
-    @property
     def distributed_addr(self) -> str:
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
@@ -150,7 +122,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         "--tokenizer-count",
         type=int,
         default=ServerArgs.num_tokenizer,
-        help="The number of tokenizer processes to launch. 0 means the tokenizer is shared with the detokenizer.",
+        help="The number of tokenizer processes to launch.",
     )
 
     parser.add_argument(
@@ -217,6 +189,8 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    assert kwargs["num_tokenizer"] >= 1, "--num-tokenizer must be >= 1"
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

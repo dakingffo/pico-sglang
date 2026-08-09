@@ -18,19 +18,23 @@ class SchedulerConfig(EngineConfig):
         return "ipc:///tmp/picosgl_0" + self._unique_suffix
 
     @property
-    def zmq_detokenizer_addr(self) -> str:
+    def zmq_tokenizer_addr(self) -> str:
         return "ipc:///tmp/picosgl_1" + self._unique_suffix
-
+    
     @property
-    def zmq_scheduler_broadcast_addr(self) -> str:
+    def zmq_detokenizer_addr(self) -> str:
         return "ipc:///tmp/picosgl_2" + self._unique_suffix
 
     @property
-    def max_forward_len(self) -> int:
-        return self.max_extend_tokens
+    def zmq_scheduler_broadcast_addr(self) -> str:
+        return "ipc:///tmp/picosgl_3" + self._unique_suffix
 
     @property
-    def backend_create_detokenizer_link(self) -> bool:
-        return True
+    def zmq_frontend_addr(self) -> str:
+        return "ipc:///tmp/picosgl_4" + self._unique_suffix
+    
+    @property
+    def max_forward_len(self) -> int:
+        return self.max_extend_tokens
 
 

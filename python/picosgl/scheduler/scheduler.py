@@ -196,13 +196,15 @@ class Scheduler(SchedulerIOMixin):
     def _free_req_resources(self, req: Request) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
+        if (pool := getattr(self.engine.ctx, "linear_state_pool", None)) is not None:
+            pool.reset(req.table_idx)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
+        batch.positions = self._make_positions(batch, self.device)
+        input_mapping = self._make_input_tuple(batch, self.device)
+        write_mapping = self._make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
@@ -232,36 +234,36 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
+    @staticmethod
+    def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+        needed_size = sum(r.extend_len for r in batch.padded_reqs)
+        indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            torch.arange(
+                req.cached_len,
+                req.device_len,
+                dtype=torch.int32,
+                out=indices_host[offset: offset + length],
+            )
+            offset += length
+        return indices_host.to(device, non_blocking=True)
 
-def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        torch.arange(
-            req.cached_len,
-            req.device_len,
-            dtype=torch.int32,
-            out=indices_host[offset: offset + length],
-        )
-        offset += length
-    return indices_host.to(device, non_blocking=True)
+    @staticmethod
+    def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+        mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            mapping_host[offset: offset + length].fill_(req.table_idx)
+            offset += length
+        return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 
-
-def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        mapping_host[offset: offset + length].fill_(req.table_idx)
-        offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
-
-
-def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+    @staticmethod   
+    def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+        mapping_list = [req.table_idx for req in batch.reqs]
+        mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+        write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
+        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
