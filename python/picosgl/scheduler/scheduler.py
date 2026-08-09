@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, NamedTuple, NoReturn, TypeAlias
 import torch
 
 from picosgl.core import Batch, Request, ChunkedRequest
-from picosgl.env import ENV
 from picosgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -101,30 +100,12 @@ class Scheduler(SchedulerIOMixin):
         self._process_last_data(last_data)
         return ongoing_data
 
-    def normal_loop(self) -> None:
-        blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
-        for msg in self.receive_msg(blocking=blocking):
-            self._process_one_msg(msg)
-
-        forward_input = self._schedule_next_batch()
-        ongoing_data = None
-        if forward_input is not None:
-            ongoing_data = (forward_input, self._forward(forward_input))
-
-        self._process_last_data(ongoing_data)
-
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
-            with self.engine_stream_ctx:
-                self.engine.stream.wait_stream(self.stream)
-                while True:
-                    self.normal_loop()
-        else:
-            assert torch.cuda.current_stream() == self.stream
-            data = None
-            while True:
-                data = self.overlap_loop(data)
+        assert torch.cuda.current_stream() == self.stream
+        data = None
+        while True:
+            data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)

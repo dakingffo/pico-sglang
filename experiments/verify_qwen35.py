@@ -17,7 +17,9 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
 import torch
 
-MODEL_PATH = "/home/daking/models/huggingface/Qwen3.5-2B"
+# Overridable so the same script verifies any Qwen3.5 size (e.g. 0.8B / 4B):
+#   QWEN35_MODEL=/path/to/Qwen3.5-0.8B python experiments/verify_qwen35.py
+MODEL_PATH = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
 
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
