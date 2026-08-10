@@ -250,6 +250,17 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 out[offset : offset + seq_len] = seg
                 offset += seq_len
             return out
+        elif batch.is_verify:
+            # mini-prefill over each req's [old_bonus, drafts]; snapshots are written to
+            # circular slots so rejection rollback is pure pointer arithmetic (no memcpy).
+            out = torch.empty_like(x)
+            offset = 0
+            for req in batch.reqs:
+                seq_len = req.extend_len
+                seg = self._forward_verify_one(x[offset : offset + seq_len], req, pool, L)
+                out[offset : offset + seq_len] = seg
+                offset += seq_len
+            return out
         else:
             return self._forward_decode(x, batch, pool, L)
 
@@ -259,6 +270,19 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         seq_len = x.shape[0]
         use_state = req.cached_len > 0
         table_idx = req.table_idx
+        # unified circular buffer: read the committed baseline from slot p, write the new
+        # committed state to slot (p+1). The pointer itself is advanced ONCE per model
+        # forward (pool.advance_batch in engine.forward_batch), NOT here -- every layer
+        # must read the same baseline slot p and write to the same slot (p+1), otherwise
+        # each layer's committed state lands in a different slot and decode/verify (which
+        # read slot p for all layers) observe the wrong baselines. depth==1 (non-MTP)
+        # short-circuits to slot 0 with no device access -> byte-identical to the
+        # single-depth pool.
+        if pool.depth == 1:
+            p = new_slot = 0
+        else:
+            p = int(pool.slots[table_idx])
+            new_slot = (p + 1) % pool.depth
 
         mixed_qkv = self.in_proj_qkv.forward(x).transpose(0, 1).unsqueeze(0)  # (1, conv_dim, seq)
         z = self.in_proj_z.forward(x).reshape(1, seq_len, -1, self.head_v_dim)
@@ -267,7 +291,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
         conv_in = mixed_qkv
         if use_state:
-            conv_in = torch.cat([pool.conv_state[L, table_idx].unsqueeze(0), conv_in], dim=-1)
+            conv_in = torch.cat([pool.conv_state[L, p, table_idx].unsqueeze(0), conv_in], dim=-1)
         total_len = conv_in.shape[-1]
         new_conv_state = F.pad(conv_in, (self.state_len - total_len, 0))
         conv_out = F.silu(
@@ -277,7 +301,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             )
         )
         mixed_qkv = conv_out[:, :, :total_len][:, :, -seq_len:]
-        pool.conv_state[L, table_idx].copy_(new_conv_state[0])
+        pool.conv_state[L, new_slot, table_idx].copy_(new_conv_state[0])
 
         query, key, value = torch.split(mixed_qkv.transpose(1, 2), [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = query.reshape(1, seq_len, -1, self.head_k_dim)
@@ -290,16 +314,90 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # recurrent_state[L, table_idx] is (num_v_heads, head_k_dim, head_v_dim); the rule
+        # recurrent_state[L, p, table_idx] is (num_v_heads, head_k_dim, head_v_dim); the rule
         # expects (batch_size, num_heads, k_head_dim, v_head_dim).
         initial_state = (
-            pool.recurrent_state[L, table_idx].unsqueeze(0) if use_state else None
+            pool.recurrent_state[L, p, table_idx].unsqueeze(0) if use_state else None
         )
         core_attn_out, last_state = _chunk_gated_delta_rule(
             query, key, value, g=g, beta=beta,
             initial_state=initial_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
         )
-        pool.recurrent_state[L, table_idx].copy_(last_state[0])
+        pool.recurrent_state[L, new_slot, table_idx].copy_(last_state[0])
+
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm.forward(core_attn_out, z).reshape(1, seq_len, -1)
+        return self.out_proj.forward(core_attn_out).reshape(seq_len, -1)
+
+    def _forward_verify_one(
+        self, x: torch.Tensor, req, pool, L: int
+    ) -> torch.Tensor:
+        """Spec-decode verify step: process a request's K_r+1 tokens
+        [old_bonus, draft_0..draft_{K_r-1}] as a mini-prefill, writing each token's
+        post-state to circular slots so the scheduler can roll back by pointer arithmetic.
+
+        Unlike prefill/decode this does NOT advance the committed slot pointer: the accept
+        boundary is set by VerifyManager via ``pool.rollback_to`` after rejection sampling.
+        The last snapshot may wrap onto the baseline slot p; that is safe because the
+        baseline is only read at round start. Math == K_r+1 decode rounds (per-token
+        recurrent rule), which test2 already equates to the chunked prefill rule.
+        """
+        seq_len = x.shape[0]  # K_r + 1
+        table_idx = req.table_idx
+        p = 0 if pool.depth == 1 else int(pool.slots[table_idx])
+
+        mixed_qkv = self.in_proj_qkv.forward(x).transpose(0, 1).unsqueeze(0)  # (1, conv_dim, seq)
+        z = self.in_proj_z.forward(x).reshape(1, seq_len, -1, self.head_v_dim)
+        b = self.in_proj_b.forward(x).unsqueeze(0)  # (1, seq, num_v_heads)
+        a = self.in_proj_a.forward(x).unsqueeze(0)
+
+        conv_in = torch.cat([pool.conv_state[L, p, table_idx].unsqueeze(0), mixed_qkv], dim=-1)
+        total_len = conv_in.shape[-1]
+        conv_out = F.silu(
+            F.conv1d(
+                conv_in, self.conv1d.weight, None,
+                padding=self.conv_kernel_size - 1, groups=self.conv_dim,
+            )
+        )
+        mixed_qkv = conv_out[:, :, :total_len][:, :, -seq_len:]
+        # conv_state after token j = the last state_len entries of [baseline | tokens 0..j]
+        # = conv_in[:, :, j+1 : state_len+j+1]  (direct slice, no sequential conv).
+        for j in range(seq_len):
+            pool.conv_state[L, (p + j + 1) % pool.depth, table_idx].copy_(
+                conv_in[0, :, j + 1 : self.state_len + j + 1]
+            )
+
+        query, key, value = torch.split(mixed_qkv.transpose(1, 2), [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.reshape(1, seq_len, -1, self.head_k_dim)
+        key = key.reshape(1, seq_len, -1, self.head_k_dim)
+        value = value.reshape(1, seq_len, -1, self.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        # Per-token recurrent rule (K_r+1 sequential steps, exactly like K_r+1 decode
+        # rounds). The rule never mutates its input, so the baseline can be passed as a
+        # view; each step's final state is snapshotted to its circular slot.
+        # per-token output is (num_v_heads, head_v_dim); flatten like the chunked rule
+        # (which yields (1, seq, num_v_heads, head_v_dim)) before norm/out_proj.
+        core_attn_out = torch.empty(
+            seq_len, self.num_v_heads, self.head_v_dim, device=x.device, dtype=x.dtype
+        )
+        state = pool.recurrent_state[L, p, table_idx]
+        for j in range(seq_len):
+            out_j, state_j = _recurrent_gated_delta_rule(
+                query[:, j : j + 1], key[:, j : j + 1], value[:, j : j + 1],
+                g=g[:, j : j + 1], beta=beta[:, j : j + 1],
+                initial_state=state.unsqueeze(0), output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            state = state_j[0]  # (num_v_heads, k_dim, v_dim)
+            core_attn_out[j] = out_j[0, 0]
+            pool.recurrent_state[L, (p + j + 1) % pool.depth, table_idx].copy_(state)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -309,8 +407,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def _forward_decode(self, x: torch.Tensor, batch, pool, L: int) -> torch.Tensor:
         bs = batch.size
         table_idxs = torch.tensor([r.table_idx for r in batch.reqs], device=x.device)
-        conv_state = pool.conv_state[L, table_idxs]  # (bs, conv_dim, state_len) [copy]
-        recurrent_state = pool.recurrent_state[L, table_idxs]
+        p_slots = pool.slots[table_idxs]  # (bs,) int32 [copy]
+        conv_state = pool.conv_state[L, p_slots, table_idxs]  # (bs, conv_dim, state_len) [copy]
+        recurrent_state = pool.recurrent_state[L, p_slots, table_idxs]
 
         mixed_qkv = self.in_proj_qkv.forward(x.unsqueeze(1)).transpose(1, 2)  # (bs, conv_dim, 1)
         z = self.in_proj_z.forward(x).reshape(bs, 1, -1, self.head_v_dim)
@@ -320,9 +419,16 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         mixed_qkv = _causal_conv1d_update(mixed_qkv, conv_state, self.conv1d.weight)
         # NOTE: pool[... , tensor_idx] is advanced indexing -> a COPY, so `.copy_()` on it
         # would never reach the pool. Write back per request with a scalar index (a view),
-        # exactly like the prefill path.
+        # exactly like the prefill path. As in prefill, the pointer is advanced once per
+        # model forward (pool.advance_batch in engine.forward_batch), not per layer: all
+        # layers write their state to the same slot (p+1) so slot p holds every layer's
+        # state at the committed position.
+        if pool.depth == 1:
+            new_slots_list = [0] * bs
+        else:
+            new_slots_list = ((p_slots + 1) % pool.depth).tolist()
         for b_i, tidx in enumerate(table_idxs.tolist()):
-            pool.conv_state[L, tidx].copy_(conv_state[b_i])
+            pool.conv_state[L, new_slots_list[b_i], tidx].copy_(conv_state[b_i])
 
         query, key, value = torch.split(mixed_qkv.transpose(1, 2), [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = query.reshape(bs, 1, -1, self.head_k_dim)
@@ -340,7 +446,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             initial_state=recurrent_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
         )
         for b_i, tidx in enumerate(table_idxs.tolist()):
-            pool.recurrent_state[L, tidx].copy_(last_state[b_i])
+            pool.recurrent_state[L, new_slots_list[b_i], tidx].copy_(last_state[b_i])
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

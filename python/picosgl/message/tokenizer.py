@@ -26,7 +26,7 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid       : int
-    next_token: int
+    next_token: int | list[int] # decode or verify 
     finished  : bool
 
 

@@ -70,8 +70,15 @@ class LLM(Scheduler):
     def offline_send_result(self, reply: list[DetokenizeMsg]) -> None:
         for msg in reply:
             status = self.status_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
-                status.output_ids.append(msg.next_token)
+            if isinstance(msg.next_token, int):
+                if not (msg.finished and msg.next_token == self.eos_token_id):
+                    status.output_ids.append(msg.next_token)
+            else:
+                assert isinstance(msg.next_token, list)
+                toks = msg.next_token
+                if msg.finished and toks and toks[-1] == self.eos_token_id:
+                    toks = toks[:-1]
+                status.output_ids.extend(toks)
 
     def generate(
         self,

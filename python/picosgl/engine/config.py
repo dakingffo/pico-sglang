@@ -30,6 +30,8 @@ class EngineConfig:
     use_dummy_weight    : bool             = False
     max_seq_len_override: int | None       = None
     num_page_override   : int | None       = None  # if not None, will override the number of pages
+    enable_mtp          : bool             = False  # MTP speculative decoding (VerifyManager replaces DecodeManager)
+    num_spec_tokens     : int              = 4      # draft length K per verify round
 
     @cached_property
     def hf_config(self):

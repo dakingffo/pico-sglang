@@ -72,25 +72,64 @@ class Qwen3_5Attention(BaseOP):
                 get_global_ctx().batch,
             )
         else:
-            o = self._eager_attention(query, key, value)
+            o, _, _ = self._eager_attention(query, key, value)
         o = o.reshape(-1, self.num_qo_heads, self.head_dim)
         o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o.reshape(-1, self.num_qo_heads * self.head_dim))
 
+    def forward_with_kv(
+        self, x: torch.Tensor, positions: torch.Tensor, past_kv=None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Same as ``forward`` but returns (output, (k, v)) for the MTP draft carry.
+
+        paged=False only (the MTP head's single decoder layer). ``past_kv`` is the
+        accumulated window KV from prior draft steps in (heads, L, head_dim) layout.
+        """
+        assert not self.paged
+        q_gate = self.q_proj.forward(x).view(-1, self.num_qo_heads, self.head_dim * 2)
+        query, gate = q_gate.chunk(2, dim=-1)
+        key = self.k_proj.forward(x).view(-1, self.num_kv_heads, self.head_dim)
+        value = self.v_proj.forward(x).view(-1, self.num_kv_heads, self.head_dim)
+
+        query = self.q_norm.forward(query)
+        key = self.k_norm.forward(key)
+        query, key = self.rotary.forward(positions, query, key)
+
+        past_k = past_v = None
+        if past_kv is not None:
+            past_k, past_v = past_kv
+        o, k, v = self._eager_attention(query, key, value, past_k, past_v)
+        o = o.reshape(-1, self.num_qo_heads, self.head_dim)
+        o = o * torch.sigmoid(gate)
+        o = self.o_proj.forward(o.reshape(-1, self.num_qo_heads * self.head_dim))
+        return o, (k, v)
+
     def _eager_attention(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        past_k: torch.Tensor | None = None,
+        past_v: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Eager causal attention. Returns (output, k, v) with k/v in (heads, L, head_dim)
+        layout (the accumulated sequence incl. ``past_k/v``, for MTP draft carry)."""
         # eager layout is (T, heads, head_dim): repeat kv heads along dim=1
         n_rep = self.num_qo_heads // self.num_kv_heads
         if n_rep > 1:
             key = key.repeat_interleave(n_rep, dim=1)
             value = value.repeat_interleave(n_rep, dim=1)
         seq_len = query.shape[0]
-        q, k, v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)  # (heads, T, hd)
-        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # (heads, T, T)
+        q = query.transpose(0, 1)  # (heads, T, hd)
+        k = key.transpose(0, 1) if past_k is None else torch.cat([past_k, key.transpose(0, 1)], dim=1)
+        v = value.transpose(0, 1) if past_v is None else torch.cat([past_v, value.transpose(0, 1)], dim=1)
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # (heads, T, L)
+        # query i attends to positions <= past_len + i; diagonal = L - T + 1 (== 1 when no past)
         mask = torch.triu(
-            torch.ones(1, seq_len, seq_len, dtype=torch.bool, device=query.device), diagonal=1
+            torch.ones(1, seq_len, k.shape[1], dtype=torch.bool, device=query.device),
+            diagonal=k.shape[1] - seq_len + 1,
         )
         attn = attn.masked_fill(mask, float("-inf"))
         attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query.dtype)
-        return torch.matmul(attn, v).transpose(0, 1)  # back to (T, heads, hd)
+        o = torch.matmul(attn, v).transpose(0, 1)  # back to (T, heads, hd)
+        return o, k, v

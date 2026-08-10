@@ -43,12 +43,21 @@ class DetokenizeManager:
     def detokenize(self, msgs: list[DetokenizeMsg]) -> list[str]:
         read_ids: list[list[int]] = []
         surr_ids: list[list[int]] = []
+
         for msg in msgs:
             if msg.uid not in self.decode_map:
                 self.decode_map[msg.uid] = DecodeStatus()
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
-                s.decoded_ids.append(msg.next_token)
+            if isinstance(msg.next_token, int):
+                if not (msg.finished and msg.next_token == self.eos_token_id):
+                    s.decoded_ids.append(msg.next_token)
+            else:  # verify: list of committed tokens. A trailing EOS is a stream
+                # terminator, never user-visible -- strip it (the scalar EOS filter
+                # above cannot catch a list).
+                toks = msg.next_token
+                if msg.finished and toks and toks[-1] == self.eos_token_id:
+                    toks = toks[:-1]
+                s.decoded_ids.extend(toks)
             read_ids.append(s.decoded_ids[s.prefix_begin:])
             surr_ids.append(s.decoded_ids[s.prefix_begin: s.prefix_end])
 

@@ -88,6 +88,36 @@ class Qwen3_5MultiTokenPredictor(BaseOP):
         module = self._lm_head.tied_embedding or self._lm_head
         return F.linear(hidden_states, module.weight, self._lm_head.bias)
 
+    def draft(self, input_ids, positions, hidden_states, past_kv=None):
+        """Single MTP draft step, returns (next_token, logits, hidden, kv).
+
+        Step-0 (past_kv=None): feed the carry window (last W accepted tokens + their target
+        hidden); the last row's logits predict the next token -> draft_0, and the window's
+        KV is returned for carry. Step-j (j>=1): feed [draft_{j-1}] + this predictor's own
+        hidden from step j-1, attending to the carried KV -> draft_j.
+
+        next_token is greedy (argmax); p_draft is recovered from ``logits`` by the caller.
+        """
+        emb = self._embed_tokens.forward(input_ids)
+        emb = self.pre_fc_norm_embedding.forward(emb)
+        h = self.pre_fc_norm_hidden.forward(hidden_states)
+        h = torch.cat([emb, h], dim=-1)
+        h = self.fc.forward(h)
+
+        layer = self.layers.op_list[0]
+        residual = h
+        h = layer.input_layernorm.forward(h)
+        h, kv = layer.self_attn.forward_with_kv(h, positions, past_kv)
+        h = residual + h
+        residual = h
+        h = layer.post_attention_layernorm.forward(h)
+        h = layer.mlp.forward(h)
+        h = residual + h
+        h = self.norm.forward(h)
+
+        logits = self.get_logits(h)
+        return logits.argmax(dim=-1), logits, h, kv
+
 
 class Qwen3_5ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig, paged: bool = True):
@@ -108,6 +138,17 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)
         return logits
+
+    def forward_verify(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward returning (full_hidden, logits).
+
+        Used for verify batches (full per-position logits, since is_prefill=False) and, in
+        MTP mode, for prefill batches too (last-token logits via the LMHead gather) so the
+        prefill->verify handoff can capture the full hidden states.
+        """
+        output = self.model.forward(get_global_ctx().batch.input_ids)
+        logits = self.lm_head.forward(output)
+        return output, logits
 
 
 __all__ = ["Qwen3_5ForCausalLM"]

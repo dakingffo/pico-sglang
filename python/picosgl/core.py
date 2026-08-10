@@ -58,6 +58,10 @@ class Request:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def complete_n(self, n: int) -> None:
+        self.device_len += n
+        self.cached_len = self.device_len - 1
+
     def append_host(self, next_token: torch.Tensor) -> None:
         self.input_ids = torch.cat([self.input_ids, next_token])
 
@@ -84,7 +88,7 @@ class ChunkedRequest(Request):
 @dataclass
 class Batch:
     reqs     : list[Request]
-    phase    : Literal["prefill", "decode"]
+    phase    : Literal["prefill", "decode", "verify"]
     # these fields should be set by scheduler
     input_ids  : torch.Tensor  = field(init=False)
     positions  : torch.Tensor  = field(init=False)
@@ -92,6 +96,15 @@ class Batch:
     padded_reqs: list[Request] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # spec-decode: drafts the MTP head produced for this verify batch. draft_tokens is
+    # (bs, K) int32; draft_probs is (bs, K, vocab) fp32 = the MTP head's softmax per draft
+    # step, used for the residual rejection sampling (needs the full distribution).
+    draft_tokens: torch.Tensor | None = field(init=False, default=None)
+    draft_probs : torch.Tensor | None = field(init=False, default=None)
+    # full-position hidden attached by engine.forward_batch for MTP prefill batches
+    # (prefill->verify carry handoff). Tied to THIS batch, unlike engine.last_full_hidden
+    # which a subsequent verify forward would overwrite before _process_last_data runs.
+    full_hidden: torch.Tensor | None = field(init=False, default=None)
 
     @property
     def is_prefill(self) -> bool:
@@ -100,6 +113,10 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_verify(self) -> bool:
+        return self.phase == "verify"
 
     @property
     def size(self) -> int:

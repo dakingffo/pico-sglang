@@ -1,6 +1,6 @@
 """Qwen3.5-2B verification for the pico-sglang qwen3_5 implementation.
 
-Run with: /home/daking/.conda/envs/daking/bin/python /tmp/verify_qwen35.py
+Run with: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_qwen35_model.py
 
 Tests:
   1. Weight loading: model.state_dict() keys vs checkpoint keys (no missing/unexpected).
@@ -18,7 +18,7 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 import torch
 
 # Overridable so the same script verifies any Qwen3.5 size (e.g. 0.8B / 4B):
-#   QWEN35_MODEL=/path/to/Qwen3.5-0.8B python experiments/verify_qwen35.py
+#   QWEN35_MODEL=/path/to/Qwen3.5-0.8B python tests/mtp/test_qwen35_model.py
 MODEL_PATH = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
 
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")

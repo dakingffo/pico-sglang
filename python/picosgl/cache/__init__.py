@@ -45,15 +45,18 @@ def create_kvcache_pool(
     )
 
 def create_linear_state_pool(
-    model_config: ModelConfig,
-    max_req     : int,
-    device      : torch.device,
-    dtype       : torch.dtype,
+    model_config   : ModelConfig,
+    max_req        : int,
+    device         : torch.device,
+    dtype          : torch.dtype,
+    enable_mtp     : bool = False,
+    num_spec_tokens: int = 4,
 ) -> LinearStatePool:
     conv_dim = (
         model_config.linear_num_key_heads * model_config.linear_key_head_dim * 2
         + model_config.linear_num_value_heads * model_config.linear_value_head_dim
     )
+    depth = num_spec_tokens + 1 if enable_mtp else 1
     return LinearStatePool(
         num_linear_layers=model_config.num_linear_layers,
         max_req=max_req,
@@ -64,6 +67,7 @@ def create_linear_state_pool(
         head_v_dim=model_config.linear_value_head_dim,
         device=device,
         dtype=dtype,
+        depth=depth,
     )
 
 

@@ -22,6 +22,7 @@ from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import PrefillAdder, PrefillManager
 from .table import TableManager
+from .verify import VerifyManager
     
 
 logger = init_logger(__name__)
@@ -52,20 +53,22 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.set_stream(self.stream)
 
         # initialize other managers
+        self.config = config
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
         )
-        self.decode_manager = DecodeManager(config.page_size)
+        if config.enable_mtp:
+            self.verify_manager = VerifyManager(self, config.num_spec_tokens, config.page_size)
+        else:
+            self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager()
-
         # some alias for easy access
         self.finished_reqs: set[Request] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
-        # self.config = config
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -85,7 +88,8 @@ class Scheduler(SchedulerIOMixin):
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
-            or self.decode_manager.runnable
+            or (self.decode_manager is not None and self.decode_manager.runnable)
+            or (self.verify_manager is not None and self.verify_manager.runnable)
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -116,8 +120,19 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch = last_data[0].batch
+        copy_done = last_data[1].copy_done_event
         copy_done.synchronize()
+
+        if batch.is_verify:
+            assert self.verify_manager is not None
+            with self.cache_manager.lazy_free_region():
+                reply, new_finished_reqs = self.verify_manager.process(batch, last_data[1])
+            self.finished_reqs = new_finished_reqs
+            self.send_result(reply)
+            return
+
+        next_tokens_cpu = last_data[1].next_tokens_cpu
         reply: list[DetokenizeMsg] = []
         new_finished_reqs: set[Request] = set()
         with self.cache_manager.lazy_free_region():
@@ -138,6 +153,15 @@ class Scheduler(SchedulerIOMixin):
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
+                    if self.config.enable_mtp:
+                        # prefill -> verify handoff: seed the MTP carry from THIS prefill
+                        # batch's full hidden (attached by engine.forward_batch; a global
+                        # last_full_hidden would already be clobbered by the next verify
+                        # forward) and start generating the first drafts.
+                        hidden = batch.full_hidden
+                        if hidden is not None:
+                            mapping = last_data[0].input_tuple[0]
+                            self.verify_manager.add_req(req, hidden[mapping == req.table_idx])
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
@@ -166,8 +190,11 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = (self.prefill_manager.abort_req(msg.uid) 
-                            or self.decode_manager.abort_req(msg.uid))
+            req_to_free = (
+                self.prefill_manager.abort_req(msg.uid)
+                or (self.decode_manager.abort_req(msg.uid) if self.decode_manager else None)
+                or (self.verify_manager.abort_req(msg.uid) if self.verify_manager else None)
+            )
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
         else:
@@ -196,6 +223,22 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        if self.config.enable_mtp:
+            # MTP mode: prefill has priority, then a verify round. The mode is FIXED by
+            # --enable-mtp -- a round with no verify reqs simply schedules nothing (the
+            # next prefill is what fills the gap), never a decode batch.
+            prefill_batch = self.prefill_manager.schedule_next_batch(
+                PrefillAdder(
+                    token_budget=self.prefill_budget,
+                    reserved_size=self.verify_manager.inflight_tokens,
+                    cache_manager=self.cache_manager,
+                    table_manager=self.table_manager,
+                )
+            )
+            if prefill_batch is not None:
+                return self._prepare_batch(prefill_batch)
+            return self.verify_manager.schedule_next_batch()
+
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(PrefillAdder(
@@ -211,8 +254,13 @@ class Scheduler(SchedulerIOMixin):
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if batch.is_verify:
+            assert self.verify_manager is not None
+            self.verify_manager.filter_reqs(batch.reqs)
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+            if not self.config.enable_mtp:
+                self.decode_manager.filter_reqs(batch.reqs)
         return forward_output
 
     @staticmethod

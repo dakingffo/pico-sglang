@@ -56,10 +56,9 @@ def _determine_cuda_graph_bs(
             cuda_graph_max_bs = 256
         else:
             cuda_graph_max_bs = 160
-        return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
-
-    if cuda_graph_max_bs < 1:
-        return []
+            
+    bs = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    return [b for b in bs if b <= cuda_graph_max_bs]
 
 
 def mem_GB(size: int) -> str:

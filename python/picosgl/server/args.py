@@ -187,6 +187,20 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        dest="enable_mtp",
+        help="Enable MTP speculative decoding (requires a model with an MTP head).",
+    )
+
+    parser.add_argument(
+        "--num-spec-tokens",
+        type=int,
+        default=ServerArgs.num_spec_tokens,
+        help="Number of speculative draft tokens (K) per verify round.",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 

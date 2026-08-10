@@ -29,11 +29,19 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+class VerifyOutput(NamedTuple):
+    next_tokens_gpu: torch.Tensor
+    next_tokens_cpu: torch.Tensor
+    copy_done_event: torch.cuda.Event
+    full_hidden    : torch.Tensor
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(config.tp_info)
         _adjust_config(config)
+        self.config = config
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -68,9 +76,11 @@ class Engine:
         if config.model_config.is_hybrid:
             self.ctx.linear_state = create_linear_state_pool(
                 model_config=config.model_config,
-                max_req=config.max_running_req, 
-                device=self.device, 
-                dtype=self.dtype
+                max_req=config.max_running_req,
+                device=self.device,
+                dtype=self.dtype,
+                enable_mtp=config.enable_mtp,
+                num_spec_tokens=config.num_spec_tokens,
             )
 
 
@@ -108,13 +118,15 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+       
+        mtp_skip_graphs = getattr(config, "enable_mtp", False)
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            cuda_graph_bs=[] if mtp_skip_graphs else config.cuda_graph_bs,
+            cuda_graph_max_bs=0 if mtp_skip_graphs else config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -196,22 +208,37 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+    def forward_batch(
+        self, batch: Batch, args: BatchSamplingArgs
+    ) -> ForwardOutput | VerifyOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if batch.is_verify or (self.config.enable_mtp and batch.is_prefill):
+                hidden, logits = self.model.forward_verify()
+                batch.full_hidden = hidden
+            elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
 
-        for req in batch.reqs:
-            req.complete_one()
+        if batch.is_verify:
+            next_tokens_gpu = self.sampler.reject_sample(logits, batch, args).to(torch.int32)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return VerifyOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, hidden)
+        else: # prefill / decode default path
+            for req in batch.reqs:  
+                req.complete_one()
 
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+            if (pool := getattr(self.ctx, "linear_state", None)) is not None:
+                pool.advance_batch(batch.reqs)
+
+            next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
@@ -245,3 +272,9 @@ def _adjust_config(config: EngineConfig):
         if config.cuda_graph_max_bs is None:
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")
+
+    if config.enable_mtp:
+        assert config.model_config.mtp_num_hidden_layers > 0, (
+            "--enable-mtp requires a model with an MTP head (mtp_num_hidden_layers > 0)."
+        )
+        assert config.num_spec_tokens >= 1, "--num-spec-tokens must be >= 1"
