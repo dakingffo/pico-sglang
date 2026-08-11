@@ -5,14 +5,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.core import Batch, Request
+from picosgl.engine import VerifyOutput, Sampler
+from picosgl.core import Batch, Request, Context
 from picosgl.message import DetokenizeMsg
 
 from .ar import ARManagerBase, ForwardInput
 
 if TYPE_CHECKING:
-    from picosgl.engine import VerifyOutput
-
     from .cache import CacheManager
     from .config import SchedulerConfig
     from .table import TableManager
@@ -59,6 +58,13 @@ class VerifyState:
     round_window_end: int | None = None
     # settle writes this at schedule time, process reads it at the same iteration's end.
     last_commit     : tuple[int, int, list[int], int] | None = None  # (C, num_sampled, committed, K_r)
+    # Carried MTP-layer window K/V in (heads, L, head_dim) layout, main-hidden-derived
+    # (only committed tokens with their real main hidden -- never draft-position rows).
+    # Entry r == K/V for carry_positions[r]; L == number of materialized leading positions,
+    # bounded at window_size. Set by _draft_loop's step-0 materialization; front-sliced by
+    # _update_carry when the window truncates. None until the first draft round (the first
+    # round materializes the whole window, exactly like the pre-optimization step-0).
+    mtp_kv          : tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class VerifyManager(ARManagerBase):
@@ -93,30 +99,26 @@ class VerifyManager(ARManagerBase):
     def __init__(
         self,
         config: SchedulerConfig,
-        engine,
+        device: torch.device,
+        sampler: Sampler,
+        mtp: torch.nn.Module,
         cache_manager: CacheManager,
         table_manager: TableManager,
         eos_token_id: int,
         num_spec_tokens: int,
         window_size: int = 128,
     ) -> None:
-        super().__init__(config, engine, cache_manager, table_manager, eos_token_id)
+        super().__init__(config, device, cache_manager, table_manager, eos_token_id)
         self.num_spec_tokens = num_spec_tokens
         self.window_size = window_size
 
-        self.sampler = engine.sampler
-        self.mtp = engine.model.mtp
+        self.sampler = sampler
+        self.mtp = mtp
         self.vocab_size = self.sampler.vocab_size
 
         self._state: dict[int, VerifyState] = {}
-        # the previous verify round's (forward_input, output), stashed by after_forward and
-        # consumed by settle at the NEXT schedule's start. Commit is thus deferred to
-        # schedule time, so drafting and process both read this round's product while the
-        # round's forward has long finished -- this is what makes overlapping rounds
-        # possible (no round_inflight bubble).
         self._pending: tuple[ForwardInput, VerifyOutput] | None = None
 
-    # ================================ manager interface ================================
 
     def remove_req(self, req: Request) -> None:
         self.running_reqs.pop(req.uid, None)
@@ -168,7 +170,7 @@ class VerifyManager(ARManagerBase):
 
     # ====================================== settle ======================================
 
-    def settle(self) -> None:
+    def settle(self, ctx: Context) -> None:
         """Commit the in-flight verify round (pure internal accounting, zero output).
 
         Called by the scheduler as the first line of ``_schedule_next_batch``. The round's
@@ -184,7 +186,7 @@ class VerifyManager(ARManagerBase):
 
         extend_token = output.next_tokens_gpu  # (bs, K+1) int32
         full_hidden = output.full_hidden       # (T, hidden)
-        pool = getattr(self.engine.ctx, "linear_state", None)
+        pool = getattr(ctx, "linear_state", None)
         offset = 0
 
         for i, req in enumerate(forward_input.batch.reqs):
@@ -331,7 +333,12 @@ class VerifyManager(ARManagerBase):
 
     # ====================================== commit ======================================
 
-    def process(self, forward_input: ForwardInput, output: VerifyOutput) -> list[DetokenizeMsg]:
+    def process(
+        self, 
+        ctx          : Context, 
+        forward_input: ForwardInput, 
+        output       : VerifyOutput
+    ) -> list[DetokenizeMsg]:
         """Emit a settled verify round's committed tokens and free the rejected pages.
 
         Runs at the iteration's end (same iteration as the settle that committed this round)
@@ -342,7 +349,7 @@ class VerifyManager(ARManagerBase):
         """
         batch = forward_input.batch
         if not batch.is_verify:
-            return super().process(forward_input, output)  # prefill commit
+            return super().process(ctx, forward_input, output)  # prefill commit
 
         reply: list[DetokenizeMsg] = []
         new_finished: set[Request] = set()
@@ -391,7 +398,7 @@ class VerifyManager(ARManagerBase):
                             self.page_table[req.table_idx, C + num_sampled : C + num_sampled + 1]
                         )
                     self.remove_req(req)
-                    self._free_req_resources(req)
+                    self._free_req_resources(ctx, req)
                     new_finished.add(req)
 
                 # ---- round over for this req. Clear round_window_end ONLY if it still
@@ -435,16 +442,31 @@ class VerifyManager(ARManagerBase):
         if excess > 0:
             st.carry_positions = st.carry_positions[excess:]
             st.carry_hidden = st.carry_hidden[excess:]
+            # Drop the same oldest positions from the carried KV. Safe because keys were
+            # RoPE-rotated at their absolute positions (relative angles preserved) and the
+            # causal mask is index-based (index order == position order after a front-drop).
+            # The guard is REQUIRED: on a K_r==0 finish round _update_carry runs after no
+            # materialization, so mtp_kv is still None. Must happen here (settle), not in
+            # _draft_loop -- deferring it would let dropped positions leak into the next
+            # round's attention (the causal mask attends to all of past_k).
+            if excess > 0 and st.mtp_kv is not None:
+                k, v = st.mtp_kv
+                st.mtp_kv = (k[:, excess:].contiguous(), v[:, excess:].contiguous())
 
     def _draft_loop(self, req: Request, st: VerifyState) -> None:
         """Generate the next round's K_r drafts from the current carry window.
 
-        Step-0 feeds the whole window (tokens + leading-token hidden) through
-        ``mtp.draft`` with past_kv=None; the last row's logits predict the token right after
-        the window -> draft_0, and the window's KV is returned. Step-j (j>=1) feeds
-        [draft_{j-1}] at position C'+j with the MTP output hidden from step j-1 and the
-        carried KV -> draft_j, where C' = the window's last position (the bonus). Drafts are
-        drawn via the request's sampler distribution (greedy = argmax).
+        Step-0 materializes only the window tail not yet covered by ``st.mtp_kv`` (the
+        carried main-hidden K/V from prior rounds) through ``mtp.draft`` with that KV as
+        past_kv; the last materialized row's logits predict the token right after the
+        window -> draft_0. Since a window position's MTP K/V depends only on (token, leading
+        main hidden) -- both fixed once committed -- the carried KV is bit-identical to a
+        whole-window recompute, so draft_0 (and hence all downstream verify results) is
+        unchanged by the incremental computation. Step-j (j>=1) feeds [draft_{j-1}] at
+        position C'+j with the MTP output hidden from step j-1 and the working KV (a local
+        copy extended with draft rows, discarded at round end) -> draft_j, where C' = the
+        window's last position (the bonus). Drafts are drawn via the request's sampler
+        distribution (greedy = argmax).
         """
         K = self.num_spec_tokens
         remain = req.remain_len
@@ -460,13 +482,22 @@ class VerifyManager(ARManagerBase):
             return
 
         params = req.sampling_params
-        carry_tokens = self.token_pool[req.table_idx, st.carry_positions]  # (W_eff,) int32
+        # Step-0 materializes only the window tail not already in the carried KV. The MTP
+        # layer's K/V for a window position depends only on (token, leading main hidden),
+        # both fixed once committed, so the carried KV is bit-identical to a whole-window
+        # recompute and only the num_sampled newly-committed positions need a forward.
+        start = 0 if st.mtp_kv is None else st.mtp_kv[0].shape[1]
+        assert start < len(st.carry_positions)  # settle appends >= 1 committed position
+        carry_tokens = self.token_pool[req.table_idx, st.carry_positions[start:]]
         carry_positions = torch.tensor(
-            st.carry_positions, dtype=torch.int64, device=self.device
+            st.carry_positions[start:], dtype=torch.int64, device=self.device
         )
         _, logits, h, kv = self.mtp.draft(
-            carry_tokens, carry_positions, st.carry_hidden, None
+            carry_tokens, carry_positions, st.carry_hidden[start:], st.mtp_kv
         )
+        # Keep ONLY the main-hidden window KV (incl. the just-materialized tail). Steps
+        # j>=1 below extend a LOCAL copy of kv and discard it -- never write it back here.
+        st.mtp_kv = kv
         draft = self.sampler.draft_token(logits[-1], params)
         st.draft_tokens.append(draft)
         if sampling:

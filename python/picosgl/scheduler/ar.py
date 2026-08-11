@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.core import Batch, Request, ChunkedRequest
-from picosgl.engine import BatchSamplingArgs, ForwardOutput
+from picosgl.core import Request, ChunkedRequest, Context
+from picosgl.engine import ForwardInput, ForwardOutput
 from picosgl.message import DetokenizeMsg
 from picosgl.utils import align_ceil
 
@@ -13,20 +13,6 @@ if TYPE_CHECKING:
     from .cache import CacheManager
     from .config import SchedulerConfig
     from .table import TableManager
-
-
-Indice2D: TypeAlias = tuple[torch.Tensor, torch.Tensor]
-
-
-# For overlap scheduling, we also need to cache some other data to avoid IMA
-class ForwardInput(NamedTuple):
-    batch      : Batch
-    sample_args: BatchSamplingArgs
-    input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
-
-
-ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 
 class ARManagerBase:
@@ -42,26 +28,21 @@ class ARManagerBase:
 
     def __init__(
         self,
-        config: SchedulerConfig,
-        engine,
+        config       : SchedulerConfig,
+        device       : torch.device,
         cache_manager: CacheManager,
         table_manager: TableManager,
-        eos_token_id: int,
+        eos_token_id : int,
     ) -> None:
-        # dependency injection: engine (-> model/sampler/attn_backend/graph_runner/ctx/device),
-        # cache_manager, table_manager (-> token_pool), eos_token_id.
         self.config = config
-        self.engine = engine
         self.cache_manager = cache_manager
         self.table_manager = table_manager
         self.token_pool = table_manager.token_pool
-        self.page_table = engine.page_table
+        self.page_table = table_manager.page_table
         self.eos_token_id = eos_token_id
-        self.device = engine.device
+        self.device = device
         self.running_reqs: dict[int, Request] = {}
         self.finished_reqs: set[Request] = set()
-
-    # ================================ manager interface ================================
 
     @property
     def page_size(self) -> int:
@@ -87,15 +68,13 @@ class ARManagerBase:
     def abort_req(self, uid: int) -> Request | None:
         return self.running_reqs.pop(uid, None)
 
-    def _free_req_resources(self, req: Request) -> None:
+    def _free_req_resources(self, ctx: Context, req: Request) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
-        if (pool := getattr(self.engine.ctx, "linear_state", None)) is not None:
+        if (pool := getattr(ctx, "linear_state", None)) is not None:
             pool.reset(req.table_idx)
 
-    # ==================================== hooks ====================================
-
-    def settle(self) -> None:
+    def settle(self, ctx: Context) -> None:
         """Commit in-flight bookkeeping at the next schedule's start. decode: no-op.
 
         Called as the first line of ``_schedule_next_batch`` every iteration. Must be pure
@@ -118,34 +97,12 @@ class ARManagerBase:
         """
         return None
 
-    # ==================================== scheduling ====================================
-
-    def prepare_batch(self, batch: Batch) -> ForwardInput:
-        """Uniform prep for decode / prefill / verify batches -> ForwardInput.
-
-        Order matches the old scheduler._prepare_batch exactly: pad -> page allocation
-        (verify skips: its schedule already allocated exactly the missing region) ->
-        positions -> input tuple -> write tuple (empty for verify) -> out_loc -> metadata
-        -> sampler.prepare.
-        """
-        self.engine.graph_runner.pad_batch(batch)
-        if not batch.is_verify:
-            self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = self._make_positions(batch, self.device)
-        input_mapping = self._make_input_tuple(batch, self.device)
-        write_mapping = self._make_write_tuple(batch, self.device)
-        batch.out_loc = self.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
-        return ForwardInput(
-            batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
-            input_tuple=input_mapping,
-            write_tuple=write_mapping,
-        )
-
-    # ====================================== commit ======================================
-
-    def process(self, forward_input: ForwardInput, output: ForwardOutput) -> list[DetokenizeMsg]:
+    def process(
+        self, 
+        ctx          : Context, 
+        forward_input: ForwardInput, 
+        output       : ForwardOutput
+    ) -> list[DetokenizeMsg]:
         """Non-verify user output (single-token emit / prefill commit), matching today's
         ``_process_last_data`` else-branch token for token. Runs inside the scheduler's
         lazy_free_region (page frees are batched).
@@ -166,60 +123,14 @@ class ARManagerBase:
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     self.remove_req(req)
-                    self._free_req_resources(req)
+                    self._free_req_resources(ctx, req)
                     new_finished.add(req)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    # prefill -> AR handoff (MTP: seed the verify carry from THIS prefill
-                    # batch's full hidden, attached by engine.forward_batch; the next verify
-                    # forward would clobber a global last_full_hidden).
+                elif batch.is_prefill:
                     if batch.full_hidden is not None:
                         self.on_prefill_done(req, batch.full_hidden, forward_input.input_tuple[0])
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished
         return reply
-
-    # =================================== batch helper ===================================
-
-    @staticmethod
-    def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-        needed_size = sum(r.extend_len for r in batch.padded_reqs)
-        indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-        offset = 0
-        for req in batch.padded_reqs:
-            length = req.extend_len
-            torch.arange(
-                req.cached_len,
-                req.device_len,
-                dtype=torch.int32,
-                out=indices_host[offset: offset + length],
-            )
-            offset += length
-        return indices_host.to(device, non_blocking=True)
-
-    @staticmethod
-    def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-        mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-        offset = 0
-        for req in batch.padded_reqs:
-            length = req.extend_len
-            mapping_host[offset: offset + length].fill_(req.table_idx)
-            offset += length
-        return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
-
-    @staticmethod
-    def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-        # verify writes committed tokens itself (settle/process); the write tuple is unused.
-        if batch.is_verify:
-            return (
-                torch.tensor([], dtype=torch.int64, device=device),
-                torch.tensor([], dtype=torch.int64, device=device),
-            )
-        mapping_list = [req.table_idx for req in batch.reqs]
-        mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-        write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeAlias
 
 import torch
 
@@ -23,6 +23,14 @@ from .sample import BatchSamplingArgs, Sampler
 logger = init_logger(__name__)
 
 
+Indice2D : TypeAlias = tuple[torch.Tensor, torch.Tensor]
+
+class ForwardInput(NamedTuple):
+    batch      : Batch
+    sample_args: BatchSamplingArgs
+    input_tuple: Indice2D  # (token_mapping, positions)
+    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -35,6 +43,7 @@ class VerifyOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
     full_hidden    : torch.Tensor
 
+ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 class Engine:
     def __init__(self, config: EngineConfig):
@@ -208,6 +217,29 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
+    def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:
+        """Uniform prep for decode / prefill / verify batches -> ForwardInput.
+
+        Order matches the old scheduler._prepare_batch exactly: pad -> page allocation
+        (verify skips: its schedule already allocated exactly the missing region) ->
+        positions -> input tuple -> write tuple (empty for verify) -> out_loc -> metadata
+        -> sampler.prepare.
+        """
+        self.graph_runner.pad_batch(batch)
+        if not batch.is_verify:
+            cache_manager.allocate_paged(batch.reqs)
+        batch.positions = self._make_positions(batch, self.device)
+        input_mapping = self._make_input_tuple(batch, self.device)
+        write_mapping = self._make_write_tuple(batch, self.device)
+        batch.out_loc = self.page_table[input_mapping]
+        self.attn_backend.prepare_metadata(batch)
+        return ForwardInput(
+            batch=batch,
+            sample_args=self.sampler.prepare(batch),
+            input_tuple=input_mapping,
+            write_tuple=write_mapping,
+        )
+    
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs
     ) -> ForwardOutput | VerifyOutput:
@@ -245,6 +277,45 @@ class Engine:
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
+    @staticmethod
+    def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+        needed_size = sum(r.extend_len for r in batch.padded_reqs)
+        indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            torch.arange(
+                req.cached_len,
+                req.device_len,
+                dtype=torch.int32,
+                out=indices_host[offset: offset + length],
+            )
+            offset += length
+        return indices_host.to(device, non_blocking=True)
+
+    @staticmethod
+    def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+        mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+        offset = 0
+        for req in batch.padded_reqs:
+            length = req.extend_len
+            mapping_host[offset: offset + length].fill_(req.table_idx)
+            offset += length
+        return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+
+    @staticmethod
+    def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+        # verify writes committed tokens itself (settle/process); the write tuple is unused.
+        if batch.is_verify:
+            return (
+                torch.tensor([], dtype=torch.int64, device=device),
+                torch.tensor([], dtype=torch.int64, device=device),
+            )
+        mapping_list = [req.table_idx for req in batch.reqs]
+        mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+        write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
+        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
 
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution

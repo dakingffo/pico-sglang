@@ -130,13 +130,13 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
     if enable_mtp:
         orig_process = sched.verify_manager.process
 
-        def rec_process(batch, output):
+        def rec_process(ctx, batch, output):
             commit_len = {}
             for r in batch.batch.reqs:
                 st = sched.verify_manager._state.get(r.table_idx)
                 if st is not None and st.last_commit is not None:
                     commit_len[r.uid] = st.last_commit[1]
-            reply = orig_process(batch, output)
+            reply = orig_process(ctx, batch, output)
             for uid, n in commit_len.items():
                 if n > 0:
                     hist.append((uid, n))
