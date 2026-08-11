@@ -22,7 +22,7 @@ sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
 import torch
 
-from picosgl.core import SamplingParams
+from picosgl.core import Batch, SamplingParams
 from picosgl.distributed import DistributedInfo
 from picosgl.message import UserMsg
 from picosgl.scheduler.config import SchedulerConfig
@@ -123,19 +123,24 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
     verify_margins: dict[tuple[int, int], float] = {}
 
     # record each verify round's committed length (acceptance histogram) without
-    # touching production code: cached_len grew by exactly num_sampled this round.
+    # touching production code. The commit happens in settle at this iteration's schedule
+    # start; num_sampled is stored in each req's last_commit and read here before process
+    # clears it.
     hist: list[tuple[int, int]] = []
     if enable_mtp:
         orig_process = sched.verify_manager.process
 
         def rec_process(batch, output):
-            before = {r.uid: r.cached_len for r in batch.reqs}
-            reply, fin = orig_process(batch, output)
-            for r in batch.reqs:
-                n = r.cached_len - before[r.uid]
+            commit_len = {}
+            for r in batch.batch.reqs:
+                st = sched.verify_manager._state.get(r.table_idx)
+                if st is not None and st.last_commit is not None:
+                    commit_len[r.uid] = st.last_commit[1]
+            reply = orig_process(batch, output)
+            for uid, n in commit_len.items():
                 if n > 0:
-                    hist.append((r.uid, n))
-            return reply, fin
+                    hist.append((uid, n))
+            return reply
 
         sched.verify_manager.process = rec_process
 

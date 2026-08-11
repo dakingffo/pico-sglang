@@ -1,32 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterable
+from typing import TYPE_CHECKING
 
-from picosgl.core import Batch, Request
-from picosgl.utils import align_ceil
+from picosgl.core import Batch
 
-@dataclass
-class DecodeManager:
-    page_size   : int
-    running_reqs: dict[int, Request] = field(default_factory=dict)
+from .ar import ARManagerBase
 
-    def filter_reqs(self, reqs: Iterable[Request]) -> None:
-        self.running_reqs |= {req.uid: req for req in reqs if req.can_decode}
+if TYPE_CHECKING:
+    from .ar import ForwardInput
 
-    def remove_req(self, req: Request) -> None:
-        self.running_reqs.pop(req.uid, None)
 
-    def abort_req(self, uid: int) -> Request | None:
-        return self.running_reqs.pop(uid, None)
-
-    @property
-    def inflight_tokens(self) -> int:
-        return sum(align_ceil(req.remain_len, self.page_size) for req in self.running_reqs.values())
+class DecodeManager(ARManagerBase):
+    """One-token-per-step AR manager (the non-MTP path). Pure local scheduling: a decode
+    batch is just all running reqs sorted by uid; the engine's ``complete_one`` advances
+    each req a single position per forward."""
 
     def schedule_next_batch(self) -> Batch | None:
         return Batch(reqs=sorted(self.running_reqs.values()), phase="decode") if self.runnable else None
 
-    @property
-    def runnable(self) -> bool:
-        return len(self.running_reqs) > 0
+    def after_forward(self, forward_input: ForwardInput, output) -> None:
+        # Non-MTP prefill -> decode handoff happens here too: filter_reqs on every non-verify
+        # batch adds the freshly-prefilled reqs to the decode loop.
+        self.filter_reqs(forward_input.batch.reqs)
+
+    # settle / on_prefill_done inherit the base no-ops; process inherits the non-verify emit.

@@ -57,6 +57,10 @@ def main() -> None:
     sched = OfflineScheduler(make_config(bool(args.mtp)), msgs)
     if args.eos_token is not None:
         sched.eos_token_id = args.eos_token  # override: deterministic EOS trigger
+        # the AR manager caches eos_token_id at construction (dependency injection), so
+        # the override must reach the manager the process() path actually reads.
+        sched.verify_manager.eos_token_id = args.eos_token
+        sched.decode_manager.eos_token_id = args.eos_token
 
     data = None
     idle = 0

@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, TypeAlias
+from typing import NoReturn
 
 import torch
 
-from picosgl.core import Batch, Request, ChunkedRequest
 from picosgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
-    DetokenizeMsg,
     ExitMsg,
     UserMsg,
 )
 from picosgl.utils import init_logger, load_tokenizer
-from picosgl.engine import Engine, BatchSamplingArgs, ForwardOutput
+from picosgl.engine import Engine, ForwardOutput
 
+from .ar import ForwardData, ForwardInput
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
@@ -23,23 +22,8 @@ from .io import SchedulerIOMixin
 from .prefill import PrefillAdder, PrefillManager
 from .table import TableManager
 from .verify import VerifyManager
-    
 
 logger = init_logger(__name__)
-
-
-Indice2D: TypeAlias = tuple[torch.Tensor, torch.Tensor]
-
-
-# For overlap scheduling, we also need to cache some other data to avoid IMA
-class ForwardInput(NamedTuple):
-    batch      : Batch
-    sample_args: BatchSamplingArgs
-    input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
-
-
-ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 
 class Scheduler(SchedulerIOMixin):
@@ -58,16 +42,24 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
         )
-        if config.enable_mtp:
-            self.verify_manager = VerifyManager(self, config.num_spec_tokens, config.page_size)
-        else:
-            self.decode_manager = DecodeManager(config.page_size)
-        self.prefill_manager = PrefillManager()
-        # some alias for easy access
-        self.finished_reqs: set[Request] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
+        # The single dispatch point: exactly one AR manager is instantiated by config and
+        # the loop never branches on decode vs verify again.
+        if config.enable_mtp:
+            self.ar_manager = VerifyManager(
+                config, self.engine, self.cache_manager, self.table_manager,
+                self.eos_token_id, config.num_spec_tokens,
+            )
+        else:
+            self.ar_manager = DecodeManager(
+                config, self.engine, self.cache_manager, self.table_manager, self.eos_token_id
+            )
+        # test-compat aliases: both point at the single AR manager.
+        self.decode_manager = self.ar_manager
+        self.verify_manager = self.ar_manager
+        self.prefill_manager = PrefillManager()
         self.prefill_budget = config.max_extend_tokens
 
         # Initialize the I/O mixin
@@ -84,12 +76,16 @@ class Scheduler(SchedulerIOMixin):
 
         It will overlap the execution of current batch and processing of last batch's results,
         which can effectively hide CPU latency and improve GPU utilization.
+
+        The AR manager's ``settle`` runs at the start of every schedule (its first line in
+        ``_schedule_next_batch``), committing the previous round's verify forward -- pure
+        internal accounting. ``process`` still runs at the end of the iteration in
+        ``_process_last_data`` and is the only place user-facing DetokenizeMsgs are emitted.
         """
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
-            or (self.decode_manager is not None and self.decode_manager.runnable)
-            or (self.verify_manager is not None and self.verify_manager.runnable)
+            or self.ar_manager.runnable
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -117,54 +113,13 @@ class Scheduler(SchedulerIOMixin):
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        """User-facing emit stays here, in position, for every phase. The AR manager's
+        ``process`` handles verify (reads the settle-stored commit) and non-verify
+        (single-token emit / prefill commit) alike."""
         if last_data is None:
             return
-
-        batch = last_data[0].batch
-        copy_done = last_data[1].copy_done_event
-        copy_done.synchronize()
-
-        if batch.is_verify:
-            assert self.verify_manager is not None
-            with self.cache_manager.lazy_free_region():
-                reply, new_finished_reqs = self.verify_manager.process(batch, last_data[1])
-            self.finished_reqs = new_finished_reqs
-            self.send_result(reply)
-            return
-
-        next_tokens_cpu = last_data[1].next_tokens_cpu
-        reply: list[DetokenizeMsg] = []
-        new_finished_reqs: set[Request] = set()
-        with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedRequest):
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
-
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    if self.config.enable_mtp:
-                        # prefill -> verify handoff: seed the MTP carry from THIS prefill
-                        # batch's full hidden (attached by engine.forward_batch; a global
-                        # last_full_hidden would already be clobbered by the next verify
-                        # forward) and start generating the first drafts.
-                        hidden = batch.full_hidden
-                        if hidden is not None:
-                            mapping = last_data[0].input_tuple[0]
-                            self.verify_manager.add_req(req, hidden[mapping == req.table_idx])
-                    self.cache_manager.cache_req(req, finished=False)
-
-        self.finished_reqs = new_finished_reqs
+        last_data[1].copy_done_event.synchronize()  # verify: same event settle already synced
+        reply = self.ar_manager.process(last_data[0], last_data[1])
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -192,107 +147,46 @@ class Scheduler(SchedulerIOMixin):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = (
                 self.prefill_manager.abort_req(msg.uid)
-                or (self.decode_manager.abort_req(msg.uid) if self.decode_manager else None)
-                or (self.verify_manager.abort_req(msg.uid) if self.verify_manager else None)
+                or self.ar_manager.abort_req(msg.uid)  # verify: also frees mid-round window pages
             )
             if req_to_free is not None:
-                self._free_req_resources(req_to_free)
+                self.ar_manager._free_req_resources(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
 
-    def _free_req_resources(self, req: Request) -> None:
-        self.table_manager.free(req.table_idx)
-        self.cache_manager.cache_req(req, finished=True)
-        if (pool := getattr(self.engine.ctx, "linear_state", None)) is not None:
-            pool.reset(req.table_idx)
-
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = self._make_positions(batch, self.device)
-        input_mapping = self._make_input_tuple(batch, self.device)
-        write_mapping = self._make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
-        return ForwardInput(
-            batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
-            input_tuple=input_mapping,
-            write_tuple=write_mapping,
-        )
-
     def _schedule_next_batch(self) -> ForwardInput | None:
-        if self.config.enable_mtp:
-            # MTP mode: prefill has priority, then a verify round. The mode is FIXED by
-            # --enable-mtp -- a round with no verify reqs simply schedules nothing (the
-            # next prefill is what fills the gap), never a decode batch.
-            prefill_batch = self.prefill_manager.schedule_next_batch(
-                PrefillAdder(
-                    token_budget=self.prefill_budget,
-                    reserved_size=self.verify_manager.inflight_tokens,
-                    cache_manager=self.cache_manager,
-                    table_manager=self.table_manager,
-                )
-            )
-            if prefill_batch is not None:
-                return self._prepare_batch(prefill_batch)
-            return self.verify_manager.schedule_next_batch()
-
-        # TODO: support other policies: e.g. DECODE first
+        # 1) First settle the previous verify round's in-flight accounting (decode: no-op).
+        #    Must precede drafting: the next round's drafts and page allocation both derive
+        #    from this commit. Pure internal -- no user-facing output here.
+        self.ar_manager.settle()
+        # 2) Prefill has priority, then the AR manager's own batch; reserved leaves room for
+        #    the AR manager's in-flight tokens.
         batch = (
             self.prefill_manager.schedule_next_batch(PrefillAdder(
-            token_budget=self.prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,
-            cache_manager=self.cache_manager,
-            table_manager=self.table_manager,
-            )) or self.decode_manager.schedule_next_batch()
+                token_budget=self.prefill_budget,
+                reserved_size=self.ar_manager.inflight_tokens,
+                cache_manager=self.cache_manager,
+                table_manager=self.table_manager,
+            ))
+            or self.ar_manager.schedule_next_batch()
         )
-        return self._prepare_batch(batch) if batch else None
+        # 3) Uniform prep: pad -> page allocation (verify skips: it allocated in schedule) ->
+        #    positions -> input tuple -> write tuple (empty for verify) -> metadata -> sampler.
+        return self.ar_manager.prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
-        if batch.is_verify:
-            assert self.verify_manager is not None
-            self.verify_manager.filter_reqs(batch.reqs)
-        else:
+        # The next round's input write, explicit here (same as before): decode -> token_pool
+        # at each req's committed slot; MTP prefill -> the sampled bonus at token_pool[C].
+        # Verify writes committed tokens itself (settle/process), so it is skipped. Writing
+        # here -- not in a base after_forward -- means there is no super() chain and no path
+        # that calls an empty method and drops the prefill bonus.
+        if not batch.is_verify:
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-            if not self.config.enable_mtp:
-                self.decode_manager.filter_reqs(batch.reqs)
+        # Pure manager hook: decode -> filter_reqs (incl. the non-MTP prefill->decode
+        # handoff); verify -> filter + stash the round's output for the next settle.
+        self.ar_manager.after_forward(forward_input, forward_output)
         return forward_output
-
-    @staticmethod
-    def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-        needed_size = sum(r.extend_len for r in batch.padded_reqs)
-        indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-        offset = 0
-        for req in batch.padded_reqs:
-            length = req.extend_len
-            torch.arange(
-                req.cached_len,
-                req.device_len,
-                dtype=torch.int32,
-                out=indices_host[offset: offset + length],
-            )
-            offset += length
-        return indices_host.to(device, non_blocking=True)
-
-    @staticmethod
-    def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-        mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-        offset = 0
-        for req in batch.padded_reqs:
-            length = req.extend_len
-            mapping_host[offset: offset + length].fill_(req.table_idx)
-            offset += length
-        return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
-
-    @staticmethod   
-    def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-        mapping_list = [req.table_idx for req in batch.reqs]
-        mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-        write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

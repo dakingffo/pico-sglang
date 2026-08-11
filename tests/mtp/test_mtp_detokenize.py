@@ -37,7 +37,7 @@ TEXTS = [
 ]
 
 
-def token_stream(tok, text: str, chunk: int, eos_at_end: bool) -> list[DetokenizeMsg]:
+def token_stream(tok, text: str, chunk: int, eos_at_end: bool, uid: int = 0) -> list[DetokenizeMsg]:
     """One uid's DetokenizeMsg sequence for `text`.
 
     chunk == 1 -> the non-MTP shape: one scalar int msg per token, the final token
@@ -55,14 +55,14 @@ def token_stream(tok, text: str, chunk: int, eos_at_end: bool) -> list[Detokeniz
         pos += len(round_ids)
         last = pos >= len(ids)
         if chunk == 1:
-            msgs.append(
-                DetokenizeMsg(
-                    uid=0, next_token=int(EOS if last else round_ids[0]), finished=last
-                )
-            )
+            msgs.append(DetokenizeMsg(uid=uid, next_token=int(round_ids[0]), finished=last))
+            # a trailing EOS is a separate follow-up msg (the real non-MTP flow emits the
+            # last real token, and the finish is signalled by the sampled EOS, if any)
+            if last and eos_at_end:
+                msgs.append(DetokenizeMsg(uid=uid, next_token=int(EOS), finished=True))
         else:
             tok_val: int | list[int] = round_ids + ([EOS] if last and eos_at_end else [])
-            msgs.append(DetokenizeMsg(uid=0, next_token=tok_val, finished=last))
+            msgs.append(DetokenizeMsg(uid=uid, next_token=tok_val, finished=last))
     return msgs
 
 
@@ -112,7 +112,7 @@ def main() -> None:
                     print(f"    ref : {reference!r}")
                     print(f"    got : {joined!r}")
         # multi-uid interleaved batch: two uids share detokenize calls
-        two = {0: token_stream(tok, text, 3, True), 1: token_stream(tok, TEXTS[1], 2, True)}
+        two = {0: token_stream(tok, text, 3, True, 0), 1: token_stream(tok, TEXTS[1], 2, True, 1)}
         joined2 = join_streams(tok, two)
         ok &= joined2[0] == reference
         ok &= joined2[1] == join_stream(tok, token_stream(tok, TEXTS[1], 1, True))
