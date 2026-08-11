@@ -41,6 +41,9 @@ class ModelConfig:
     linear_conv_kernel_dim: int = 0
     partial_rotary_factor: float = 1.0
     attn_output_gate: bool = False
+    # Qwen3.5 attention output gate activation: "sigmoid" (default) or "swish"
+    # (Qwen3.6, gate * sigmoid(gate)). Default preserves Qwen3.5 byte-identity.
+    output_gate_type: str = "sigmoid"
     mtp_num_hidden_layers: int = 0
     mamba_ssm_dtype: str = "float32"
 
@@ -146,6 +149,7 @@ class ModelConfig:
             linear_conv_kernel_dim=getattr(config, "linear_conv_kernel_dim", 0),
             partial_rotary_factor=partial_rotary_factor,
             attn_output_gate=getattr(config, "attn_output_gate", False),
+            output_gate_type=getattr(config, "output_gate_type", "sigmoid"),
             mtp_num_hidden_layers=getattr(config, "mtp_num_hidden_layers", 0),
             mamba_ssm_dtype=getattr(config, "mamba_ssm_dtype", "float32"),
         )
