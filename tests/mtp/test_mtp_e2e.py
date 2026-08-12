@@ -235,7 +235,7 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
 
     # Step 8d: page-integrity no-leak. After every request drained (all pages back in
     # the prefix cache or the free list), free_slots + prefix_cache.total_size must equal
-    # num_pages exactly. The VerifyManager's last_paged_until logic must not leak a page
+    # num_pages exactly. The VerifyManager's next_alloc_pos logic must not leak a page
     # per round (the "re-allocate position C" hazard the scheduler design warns about).
     integrity_ok, integrity_msg = True, "ok"
     try:

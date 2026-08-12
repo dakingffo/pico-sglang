@@ -27,8 +27,10 @@ if TYPE_CHECKING:
 #   verify_rows = n_drafts + 1: rows this req contributes to the verify forward,
 #               [old_bonus, draft_0 .. draft_{n_drafts-1}].
 #   C           cached_len at round start (already-committed length).
-#   num_sampled drafts committed by the count-by-comparison (<= n_drafts; a full
-#               commit where the bonus also matched yields n_drafts + 1).
+#   num_sampled committed tokens this round = accepted drafts + 1: the +1 is the
+#               new bonus (token at position C+num_sampled, the next round's carry),
+#               so num_sampled >= 1 always and ranges over [1, n_drafts + 1]. Only
+#               the accepted-draft COUNT is capped at n_drafts.
 #   T           total verify-batch rows = sum of verify_rows over all reqs.
 #
 # Fixed-shape tensors pad to the budget, so "K" / "K+1" in a shape are caps, not
@@ -43,51 +45,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class VerifyState:
-    """Per-request spec-decode state (keyed by req.table_idx).
-
-    carry_positions / carry_hidden hold the MTP draft carry window with the DeepSeek-MTP
-    *leading-token* pairing: entry r is (token at position p, main hidden at position p-1),
-    so feeding the window through ``mtp.draft`` predicts position p+1 (the row after the
-    window's last token). The window therefore always ends at the current bonus position.
-
-    Pairing is empirically settled (experiments/mtp_pairing_test.py): the module predicts
-    p+1 from (token_p, hidden_X, pos p) for either alignment, but same-position hidden
-    (X=p) correlates better with the main model's next-token logits (cosine 0.86 vs 0.72).
-    Same-position is however unattainable for the window's last row -- the bonus token is
-    sampled, so its own hidden is never computed (and for a partial accept the hidden at
-    that position belongs to the rejected draft). Leading-token is therefore forced for the
-    bonus row and, by extension, for the whole carry. It affects only draft acceptance
-    rate, never output correctness (rejection sampling guarantees the target either way).
-
-    draft_probs is (K, vocab) fp32 -- the MTP head's distribution per draft step (used for
-    the residual rejection sampling) -- or None when the request is greedy (argmax drafts,
-    which carry no distribution).
-
-    last_commit is set by ``settle`` at the next schedule's start and consumed by
-    ``process`` at the same iteration's end: (C, num_sampled, committed, n_drafts) for THIS
-    round. ``process`` cannot re-derive num_sampled because the next round's drafting
-    overwrites draft_tokens; it reads the settled bookkeeping instead.
-    """
-
     draft_tokens    : list[int]
     draft_probs     : torch.Tensor | None
     carry_positions : list[int]
-    carry_hidden    : torch.Tensor          # (window_len, hidden) main-model hidden, leading-token
-    last_paged_until: int
-    # upper bound of the round MOST RECENTLY SCHEDULED for this req (cached_len + n_drafts + 1),
-    # set by schedule_next_batch. Never cleared by settle; process clears it only when it
-    # still equals the round it just processed (i.e. no newer round was scheduled for this
-    # req -- a continuing req's next schedule has already overwritten it). abort_req uses
-    # it to free a mid-round abort's window pages.
-    round_window_end: int | None = None
-    # settle writes this at schedule time, process reads it at the same iteration's end.
-    last_commit     : tuple[int, int, list[int], int] | None = None  # (C, num_sampled, committed, n_drafts)
-    # Carried MTP-layer window K/V in (heads, L, head_dim) layout, main-hidden-derived
-    # (only committed tokens with their real main hidden -- never draft-position rows).
-    # Entry r == K/V for carry_positions[r]; L == number of materialized leading positions,
-    # bounded at window_size. Set by _draft_loop's step-0 materialization; front-sliced by
-    # _update_carry when the window truncates. None until the first draft round (the first
-    # round materializes the whole window, exactly like the pre-optimization step-0).
+    carry_hidden    : torch.Tensor # (window_len, hidden) main-model hidden, leading-token
+    next_alloc_pos: int                 # pages [0, next_alloc_pos) already allocated; next round allocates from here
+    verify_window_end: int | None = None  # this round's verify-window upper bound (C+n_drafts+1); abort frees [cached_len, it)
+    last_commit     : tuple[int, int, list[int], int] | None = None  
+                      # (C, num_sampled, committed, n_drafts)
     mtp_kv          : tuple[torch.Tensor, torch.Tensor] | None = None
 
 
@@ -97,27 +62,7 @@ class VerifyManager(ARManagerBase):
     Replaces DecodeManager when ``--enable-mtp`` (fixed at startup -- this manager is never
     swapped for a decode manager at runtime). Owns no sampling math (that lives in
     Engine / Sampler.reject_sample); this class only schedules verify batches and commits
-    their results. Three responsibilities are split across the loop:
-
-    * ``settle`` (called by the scheduler at every iteration's schedule start) commits the
-      in-flight round from the previous forward -- derives num_sampled by comparing the
-      verify forward's extend_token against the drafts (count-by-comparison), advances the
-      reqs via ``complete_n`` + linear-state rollback, writes the new bonus to the token
-      pool, extends the carry, and stores the commit into ``VerifyState.last_commit``.
-      PURE internal accounting -- it never emits user-facing output.
-    * ``schedule_next_batch`` drafts the next round (from the settled carry) and builds a
-      an n_drafts+1-token verify batch: every running req processed as a mini-prefill
-      [old_bonus, draft_0..draft_{n_drafts-1}], with pages allocated for exactly the missing
-      region and drafts staged into the token pool.
-    * ``process`` (called by the scheduler at the iteration's end) emits the committed
-      tokens, frees the rejected suffix, and finishes EOS / max_tokens requests. It reads
-      the settled bookkeeping from ``last_commit``; it never re-derives the commit.
-
-    Position alignment: the verify forward processes positions C..C+n_drafts, logits[C+i] is the
-    target's prediction for the token at position C+i+1, and draft_i (token at C+1+i) is
-    rejected against it. Accepting num_sampled tokens commits positions C+1..C+num_sampled,
-    so the new bonus (written to token_pool at C+num_sampled) is sampled from logits at
-    C+num_sampled-1. ``device_len == cached_len + 1`` always holds outside a verify round.
+    their results. 
     """
 
     def __init__(
@@ -152,15 +97,8 @@ class VerifyManager(ARManagerBase):
         req = self.running_reqs.pop(uid, None)
         if req is not None:
             st = self._state.pop(req.table_idx, None)
-            # Mid-round abort: this req's verify-window pages [cached_len, round_window_end)
-            # were allocated in schedule_next_batch but process() (which frees the rejected
-            # suffix and restores device_len) will never run for it. cache_req in
-            # _free_req_resources only covers [:cached_len], so without this the window's
-            # pages leak one round per abort. Cached_len is the pre-commit C when the abort
-            # lands before settle (whole window), C+num_sampled after settle (bonus page +
-            # suffix) -- round_window_end is only cleared by process, so it is always live.
-            if st is not None and st.round_window_end is not None:
-                C, D = req.cached_len, st.round_window_end
+            if st is not None and st.verify_window_end is not None:
+                C, D = req.cached_len, st.verify_window_end
                 if D > C:
                     self.cache_manager._free(self.page_table[req.table_idx, C:D])
         return req
@@ -168,14 +106,8 @@ class VerifyManager(ARManagerBase):
     def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
         """Hand off a finished prefill req to the verify loop.
 
-        ``full_hidden`` is this req's rows of the prefill batch's full hidden (positions
-        [c0, C), C = req.cached_len; the sampled bonus already sits at token_pool[.., C]).
-        Seeds the carry window (last min(W, len) rows, leading-token paired) only -- the
-        next round's drafts are generated by schedule_next_batch from that carry. The last
-        row (the bonus at C) is necessarily paired with hidden at C-1 -- hidden_C does not
-        exist after prefill since the bonus is sampled, not processed. From round 2 on the
-        same is true of the new bonus each round, so the whole loop stays leading-token
-        (see VerifyState).
+        The last row (the bonus at C) is necessarily paired with hidden at C-1.
+        hidden_C does not exist after prefill since the bonus is sampled, not processed.
         """
         req_hidden = full_hidden[mapping == req.table_idx]
         C = req.cached_len
@@ -187,19 +119,16 @@ class VerifyManager(ARManagerBase):
             # window ends at the bonus position C (token_pool[C] = bonus)
             carry_positions=list(range(C - window_len + 1, C + 1)),
             carry_hidden=req_hidden[-window_len:].contiguous(),
-            last_paged_until=C,
+            next_alloc_pos=C,
         )
         self.running_reqs[req.uid] = req
         self._state[req.table_idx] = st
 
-    # ====================================== settle ======================================
-
     def settle(self, ctx: Context) -> None:
-        """Commit the in-flight verify round (pure internal accounting, zero output).
+        """Commit the in-flight verify round.
 
-        Called by the scheduler as the first line of ``_schedule_next_batch``. The round's
-        forward finished last iteration, so ``copy_done_event.synchronize()`` is near-zero
-        wait; this deferred commit is what lets schedule_next_batch draft from THIS round's
+        Called by the scheduler as the first line of ``_schedule_next_batch``.
+        This deferred commit is what lets schedule_next_batch draft from THIS round's
         carry and process read its num_sampled while the NEXT forward already overlaps.
         """
         pending, self._pending = self._pending, None
@@ -224,9 +153,6 @@ class VerifyManager(ARManagerBase):
             C = req.cached_len
             seq = extend_token[i]  # (K+1,) int32, -1 padded beyond verify_rows
 
-            # ---- derive num_sampled + new bonus (count-by-comparison): first index j
-            # ---- where the target's commit differs from draft_j -> num_sampled = j+1 and
-            # ---- the bonus is extend_token[j]; all matched -> num_sampled = n_drafts+1.
             num_sampled = n_drafts + 1
             bonus_idx = n_drafts
             for j in range(n_drafts):
@@ -236,34 +162,19 @@ class VerifyManager(ARManagerBase):
                     break
             new_bonus = int(seq[bonus_idx].item())
 
-            # ---- commit: restore the real device_len, advance by num_sampled, roll the
-            # ---- linear-state slot pointer to the committed boundary (zero memcpy).
             req.device_len = C + 1
             req.complete_n(num_sampled)
             if pool is not None:
                 pool.rollback_to([req], num_sampled)
             self.token_pool[req.table_idx, req.cached_len] = new_bonus
-            st.last_paged_until = C + min(num_sampled, self.num_spec_tokens) + 1
+            st.next_alloc_pos = C + min(num_sampled, self.num_spec_tokens) + 1
 
-            # ---- carry extension only (drafting happens in schedule_next_batch).
             self._update_carry(st, full_hidden, row_start, C, num_sampled)
 
-            # ---- bookkeeping for process (same iteration's _process_last_data). process
-            # ---- cannot re-derive num_sampled: the next schedule's drafting overwrites
-            # ---- st.draft_tokens. round_window_end is NOT cleared here -- only process
-            # ---- clears it (conditionally, see its docstring).
             st.last_commit = (
                 C, num_sampled, [int(seq[j].item()) for j in range(num_sampled)], n_drafts
             )
 
-            # ---- finish detection, identical to process's. With overlap, schedule(R+1)
-            # ---- runs BEFORE process(R): if a req that EOS-terminates here stayed in
-            # ---- running_reqs, schedule(R+1) would draft + pre-allocate its window pages
-            # ---- past C+num_sampled), and process(R) -- which only
-            # ---- frees round R's own pages -- would leave those pre-allocated pages
-            # ---- leaking (free_pages 8188/8192 in the shell e2e). Popping it now means
-            # ---- the finished req is never drafted or scheduled again; process still
-            # ---- emits its last round and frees round R's pages (via st + last_commit).
             finish = not req.can_decode
             if not req.sampling_params.ignore_eos:
                 for j in range(num_sampled):
@@ -273,47 +184,27 @@ class VerifyManager(ARManagerBase):
             if finish:
                 self.running_reqs.pop(req.uid, None)
 
-    # ==================================== scheduling ====================================
-
     def schedule_next_batch(self) -> Batch | None:
-        """Build a verify batch for all running reqs, or None.
-
-        Drafts this round (from the settle-extended carry), temporarily mutates each req's
-        device_len to cached_len + n_drafts + 1 so prepare_batch's positions / input tuple / the
-        linear layer slicing all agree (settle restores it), allocates exactly the missing
-        page region via the last_paged_until trick, and stages the drafts into the token
-        pool. Returns a plain Batch; prepare_batch does the uniform prep.
-        """
         if not self.running_reqs:
             return None
         reqs = sorted(self.running_reqs.values())
         K = self.num_spec_tokens
-
-        # ---- 1) draft this round from the settled carry. Finished reqs are already out of
-        # ---- running_reqs (settle popped them), so remain_len is never <= 0 here.
         for req in reqs:
             self._draft_loop(req, self._state[req.table_idx])
 
-        # ---- 2) temp device_len: n_drafts = min(K, remain_len - 1) keeps even a full commit's
-        # ---- bonus position within [0, max_device_len).
         for req in reqs:
             C = req.cached_len
             n_drafts = min(K, req.remain_len - 1)
             req.device_len = C + n_drafts + 1
-            # remember the window upper bound for mid-round abort page cleanup
-            self._state[req.table_idx].round_window_end = C + n_drafts + 1
+            self._state[req.table_idx].verify_window_end = C + n_drafts + 1
 
-        # ---- 3) page allocation: only the missing [last_paged_until, C+n_drafts+1) region. Never
-        # ---- allocate with (cached_len=C, device_len=C+K+1): that would re-allocate the
-        # ---- existing position C and leak one page per round.
         for req in reqs:
             st = self._state[req.table_idx]
             C = req.cached_len
-            req.cached_len = st.last_paged_until
+            req.cached_len = st.next_alloc_pos
             self.cache_manager.allocate_paged([req])
             req.cached_len = C
 
-        # ---- 4) stage this round's drafts into the token pool (positions C+1..C+n_drafts).
         for req in reqs:
             st = self._state[req.table_idx]
             C = req.cached_len
@@ -322,7 +213,6 @@ class VerifyManager(ARManagerBase):
                     torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
                 )
 
-        # ---- 5) batch assembly + draft fields for reject_sample.
         batch = Batch(reqs=reqs, phase="verify")
         batch.padded_reqs = reqs
         bs = len(reqs)
@@ -425,13 +315,13 @@ class VerifyManager(ARManagerBase):
                     self._free_req_resources(ctx, req)
                     new_finished.add(req)
 
-                # ---- round over for this req. Clear round_window_end ONLY if it still
+                # ---- round over for this req. Clear verify_window_end ONLY if it still
                 # ---- equals the round just processed (no newer round was scheduled for
                 # ---- this req yet -- a continuing req's schedule has already overwritten
                 # ---- it with the next round's upper bound, which must stay live for a
                 # ---- mid-round abort).
-                if st.round_window_end == C + n_drafts + 1:
-                    st.round_window_end = None
+                if st.verify_window_end == C + n_drafts + 1:
+                    st.verify_window_end = None
                 st.last_commit = None
 
         self.finished_reqs = new_finished
