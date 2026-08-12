@@ -135,8 +135,8 @@ class Sampler:
                   drafts are accepted the bonus is sampled from p_target at the last window
                   position.
 
-        ``logits`` is (T, vocab) full-position logits; each request's K_r+1 rows are sliced
-        by ``req.extend_len`` in batch.reqs order (same segmentation as the input tuple).
+        ``logits`` is (T, vocab) full-position logits; each request's n_drafts+1 rows are
+        sliced by ``req.extend_len`` in batch.reqs order (same segmentation as the input tuple).
         """
         bs = batch.size
         K = 0 if batch.draft_tokens is None else batch.draft_tokens.shape[1]
@@ -146,7 +146,7 @@ class Sampler:
 
         offset = 0
         for i, req in enumerate(batch.reqs):
-            num_drafts = req.extend_len - 1  # K_r
+            num_drafts = req.extend_len - 1  # = n_drafts (drafts this round)
             seg = logits[offset : offset + num_drafts + 1]
             offset += num_drafts + 1
             seg_float = seg.float()
@@ -154,7 +154,7 @@ class Sampler:
             params = req.sampling_params
 
             if params.is_greedy:
-                argmax = torch.argmax(seg_float, dim=-1)  # (K_r+1,)
+                argmax = torch.argmax(seg_float, dim=-1)  # (n_drafts+1,)
                 accepted = 0
                 if num_drafts > 0:
                     # one host sync for the whole row; extend_token writes stay on device
@@ -170,7 +170,7 @@ class Sampler:
                 continue
 
             # ---- sampling path ----
-            target_probs = self._target_dist(seg_float, params)  # (K_r+1, vocab)
+            target_probs = self._target_dist(seg_float, params)  # (n_drafts+1, vocab)
             assert batch.draft_probs is not None, "sampling verify batch needs draft_probs"
             draft_probs = batch.draft_probs[i]  # (K, vocab) fp32
             accepted = 0

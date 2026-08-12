@@ -20,7 +20,7 @@ class ARManagerBase:
 
     Scheduler instantiates exactly one AR manager by config and never dispatches on
     decode vs verify again; the loop only calls this interface. decode/verify differ in
-    ``schedule_next_batch`` (one token per req vs a K_r+1-token verify window) and in
+    ``schedule_next_batch`` (one token per req vs an n_drafts+1-token verify window) and in
     the ``settle`` / ``after_forward`` / ``process`` hooks. User-facing emit (DetokenizeMsg
     -> send_result) happens only in ``process``, which the scheduler calls at the end of
     the iteration in ``_process_last_data`` -- never in ``settle`` or the schedule path.

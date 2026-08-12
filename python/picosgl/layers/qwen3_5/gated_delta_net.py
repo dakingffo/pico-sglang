@@ -333,17 +333,17 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def _forward_verify_one(
         self, x: torch.Tensor, req, pool, L: int
     ) -> torch.Tensor:
-        """Spec-decode verify step: process a request's K_r+1 tokens
-        [old_bonus, draft_0..draft_{K_r-1}] as a mini-prefill, writing each token's
+        """Spec-decode verify step: process a request's n_drafts+1 tokens
+        [old_bonus, draft_0..draft_{n_drafts-1}] as a mini-prefill, writing each token's
         post-state to circular slots so the scheduler can roll back by pointer arithmetic.
 
         Unlike prefill/decode this does NOT advance the committed slot pointer: the accept
         boundary is set by VerifyManager via ``pool.rollback_to`` after rejection sampling.
         The last snapshot may wrap onto the baseline slot p; that is safe because the
-        baseline is only read at round start. Math == K_r+1 decode rounds (per-token
+        baseline is only read at round start. Math == n_drafts+1 decode rounds (per-token
         recurrent rule), which test2 already equates to the chunked prefill rule.
         """
-        seq_len = x.shape[0]  # K_r + 1
+        seq_len = x.shape[0]  # n_drafts + 1
         table_idx = req.table_idx
         p = 0 if pool.depth == 1 else int(pool.slots[table_idx])
 
@@ -379,7 +379,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # Per-token recurrent rule (K_r+1 sequential steps, exactly like K_r+1 decode
+        # Per-token recurrent rule (n_drafts+1 sequential steps, exactly like n_drafts+1 decode
         # rounds). The rule never mutates its input, so the baseline can be passed as a
         # view; each step's final state is snapshotted to its circular slot.
         # per-token output is (num_v_heads, head_v_dim); flatten like the chunked rule
