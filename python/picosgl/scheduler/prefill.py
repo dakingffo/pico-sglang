@@ -5,10 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.core import Batch, Request, ChunkedRequest
+from picosgl.core import Batch, Context, Request, ChunkedRequest
 from picosgl.utils import init_logger
 
 from .utils import PendingRequest
+from .ar import ForwardInput, ForwardOutput
 
 if TYPE_CHECKING:
     from picosgl.cache import BaseCacheHandle
@@ -139,6 +140,25 @@ class PrefillManager:
                 self.pending_list.pop(i)
                 return req.chunked_req
         return None
+
+    def advance_for_next_schedule(
+        self,
+        forward_input: ForwardInput,
+        output       : ForwardOutput,
+        token_pool   : torch.Tensor,
+        ctx          : Context,
+    ) -> None:
+        batch, _, _, output_mapping = forward_input
+        if not batch.is_verify:
+            token_pool[output_mapping] = output.next_tokens_gpu
+        if batch.is_prefill:
+            for req in batch.reqs:
+                req.complete_to_device_len()
+            # each prefill chunk commits one linear-state snapshot (the layer wrote the
+            # post-chunk state to slot p+1); advance the ring pointer to it so the first
+            # verify round reads the right baseline. depth==1 (non-MTP) is a no-op.
+            if (pool := getattr(ctx, "linear_state", None)) is not None:
+                pool.rollback_to(batch.reqs, 1)
 
     @property
     def runnable(self) -> bool:

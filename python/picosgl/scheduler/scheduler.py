@@ -155,22 +155,11 @@ class Scheduler(SchedulerIOMixin):
         return self.engine.prepare_batch(batch, self.cache_manager) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
-        batch, sample_args, input_mapping, output_mapping = forward_input
+        batch, sample_args, input_mapping, _ = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
-        # Write the next-round input token immediately (non-verify). process's deferred
-        # commit would run one iteration later, and decode (no scheduable drain, unlike
-        # verify) would read a stale token on the next forward. verify commits its own
-        # tokens in process; the write tuple is empty for it.
-        if not batch.is_verify:
-            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        if batch.is_prefill:
-            for req in batch.reqs:
-                req.complete_to_device_len()
-            # each prefill chunk commits one linear-state snapshot (the layer wrote the
-            # post-chunk state to slot p+1); advance the ring pointer to it so the first
-            # verify round reads the right baseline. depth==1 (non-MTP) is a no-op.
-            if (pool := getattr(self.engine.ctx, "linear_state", None)) is not None:
-                pool.rollback_to(batch.reqs, 1)
+        self.prefill_manager.advance_for_next_schedule(
+            forward_input, forward_output, self.token_pool, self.engine.ctx
+        )
         self.ar_manager.advance_for_next_schedule(forward_input)
         return forward_output
