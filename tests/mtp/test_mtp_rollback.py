@@ -4,7 +4,8 @@ Core circular-buffer test: after a verify round accepts num_sampled tokens, roll
 must land on the snapshot that holds "the state after exactly num_sampled tokens were
 appended to the baseline" -- i.e. the state a plain (non-MTP) decode would be at.
 
-  baseline: prefill, committed slot p (=1 after advance_batch)
+  baseline: prefill, committed slot p (=1 after the scheduler's per-batch rollback_to(1),
+            which replaced the removed pool.advance_batch)
   reference: from baseline, 2 sequential per-token decodes (t0,t1) -> committed slot
              (p+2) holds "state after 2 tokens". Same for 5 tokens (wrap: slot p).
   verify:    from baseline, fused verify window [C, C+5) with tokens
@@ -146,7 +147,7 @@ def main():
     with ctx.forward_batch(pb):
         hidden_p, logits_p = model.forward_verify()
     bonus = int(logits_p[0].argmax().item())
-    pool.advance_batch([req])
+    pool.rollback_to([req], 1)  # == scheduler._forward's per-prefill-batch pointer commit
     p = int(pool.slots[TIDX])
     print(f"prompt_len={S} bonus={bonus} baseline slot p={p} depth={D}")
     assert p == 1, f"baseline slot should be 1, got {p}"

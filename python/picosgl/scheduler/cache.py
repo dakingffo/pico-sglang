@@ -65,7 +65,7 @@ class CacheManager:
         # [new_handle.cached_len, req.cached_len)   This part is tailing part that can not inserted into the prefix cache.
         #                                           We should free it if the request has finished.
         insert_ids = req.input_ids[: req.cached_len]
-        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        page_indices = self.page_table[req.table_idx, :req.cached_len]
         old_handle = req.cache_handle
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         # unlock until all operations on handle is done
@@ -73,7 +73,7 @@ class CacheManager:
         # this part is already in the prefix cache, free it
         self._free(page_indices[old_handle.cached_len: cached_len])
         if finished:  # this tail part should be freed
-            self._free(page_indices[new_handle.cached_len :])
+            self._free(page_indices[new_handle.cached_len:])
         else:  # keep the tail part, update the handle
             req.cache_handle = new_handle
             self.lock(new_handle)

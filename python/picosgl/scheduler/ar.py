@@ -16,16 +16,6 @@ if TYPE_CHECKING:
 
 
 class ARManagerBase:
-    """Shared base for DecodeManager / VerifyManager.
-
-    Scheduler instantiates exactly one AR manager by config and never dispatches on
-    decode vs verify again; the loop only calls this interface. decode/verify differ in
-    ``schedule_next_batch`` (one token per req vs an n_drafts+1-token verify window) and in
-    the ``settle`` / ``after_forward`` / ``process`` hooks. User-facing emit (DetokenizeMsg
-    -> send_result) happens only in ``process``, which the scheduler calls at the end of
-    the iteration in ``_process_last_data`` -- never in ``settle`` or the schedule path.
-    """
-
     def __init__(
         self,
         config       : SchedulerConfig,
@@ -59,9 +49,6 @@ class ARManagerBase:
             for req in self.running_reqs.values()
         )
 
-    def filter_reqs(self, reqs) -> None:
-        self.running_reqs |= {req.uid: req for req in reqs if req.can_decode}
-
     def remove_req(self, req: Request) -> None:
         self.running_reqs.pop(req.uid, None)
 
@@ -74,43 +61,30 @@ class ARManagerBase:
         if (pool := getattr(ctx, "linear_state", None)) is not None:
             pool.reset(req.table_idx)
 
-    def settle(self, ctx: Context) -> None:
-        """Commit in-flight bookkeeping at the next schedule's start. decode: no-op.
-
-        Called as the first line of ``_schedule_next_batch`` every iteration. Must be pure
-        internal accounting -- it never emits user-facing output.
-        """
-        return None
-
     def on_prefill_done(self, req: Request, full_hidden, mapping) -> None:
         """Prefill -> AR handoff hook. decode: no-op; verify (MTP): seed the carry."""
         return None
 
-    def after_forward(self, forward_input: ForwardInput, output: ForwardOutput) -> None:
-        """Manager post-forward hook (base: empty).
+    def advance_for_next_schedule(self, forward_input: ForwardInput) -> None:
+        """Advance the state of the manager after a forward pass, before scheduling the next batch.
 
-        The next-round input write (``token_pool[write_tuple]``, which carries the MTP
-        prefill bonus too) is done in scheduler._forward's non-verify branch, NOT here, so
-        there is no super() chain and no path that "calls an empty method and drops the
-        prefill token". Subclasses only do their own tail work: decode -> filter_reqs (also
-        the non-MTP prefill->decode handoff); verify -> filter + stash the round's output.
+        Note that only decode_manager needs to implement this,
+        verify_manager disable a inflight req from being scheduled again.
         """
+
         return None
 
     def process(
-        self, 
-        ctx          : Context, 
-        forward_input: ForwardInput, 
+        self,
+        ctx          : Context,
+        forward_input: ForwardInput,
         output       : ForwardOutput
     ) -> list[DetokenizeMsg]:
-        """Non-verify user output (single-token emit / prefill commit), matching today's
-        ``_process_last_data`` else-branch token for token. Runs inside the scheduler's
-        lazy_free_region (page frees are batched).
-        """
         batch = forward_input.batch
         next_tokens_cpu = output.next_tokens_cpu
         reply: list[DetokenizeMsg] = []
         new_finished: set[Request] = set()
+
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedRequest):
@@ -128,6 +102,8 @@ class ARManagerBase:
                     self._free_req_resources(ctx, req)
                     new_finished.add(req)
                 elif batch.is_prefill:
+                    if req.can_decode:
+                        self.running_reqs[req.uid] = req
                     if batch.full_hidden is not None:
                         self.on_prefill_done(req, batch.full_hidden, forward_input.input_tuple[0])
                     self.cache_manager.cache_req(req, finished=False)

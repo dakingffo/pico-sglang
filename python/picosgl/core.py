@@ -45,7 +45,7 @@ class Request:
 
     def __lt__(self, other: Request) -> bool:
         return self.uid < other.uid
-    
+
     @property
     def remain_len(self) -> int:
         return self.max_device_len - self.device_len
@@ -54,9 +54,8 @@ class Request:
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
 
-    def complete_one(self) -> None:
+    def complete_to_device_len(self) -> None:
         self.cached_len = self.device_len
-        self.device_len += 1
 
     def complete_n(self, n: int) -> None:
         self.device_len += n
@@ -82,7 +81,7 @@ class ChunkedRequest(Request):
 
     @property
     def can_decode(self) -> bool:
-        return False  # avoid being added to decode manager
+        return False  # avoid being added to ar manager
 
 
 @dataclass
@@ -125,7 +124,7 @@ class Batch:
     @property
     def padded_size(self) -> int:
         return len(self.padded_reqs)
-    
+
 
 @dataclass
 class Context:

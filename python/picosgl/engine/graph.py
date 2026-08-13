@@ -49,14 +49,14 @@ def _determine_cuda_graph_bs(
 ) -> list[int]:
     if cuda_graph_bs is not None:
         return cuda_graph_bs
-    
+
     if cuda_graph_max_bs is None:
         free_memory_gb = free_memory / (1024**3)
         if free_memory_gb > 80:  # H200
             cuda_graph_max_bs = 256
         else:
             cuda_graph_max_bs = 160
-            
+
     bs = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
     return [b for b in bs if b <= cuda_graph_max_bs]
 
@@ -152,11 +152,14 @@ class GraphRunner:
         return self.buffer.logits[:batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
-        padded_size = (  # choose the first available batch size
-            next(bs for bs in self.graph_bs_list if bs >= batch.size)
-            if self.can_use_cuda_graph(batch) else batch.size
-        )
-        batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
+        if batch.is_verify:
+            batch.padded_reqs = batch.reqs
+        else:
+            padded_size = (  # choose the first available batch size
+                next(bs for bs in self.graph_bs_list if bs >= batch.size)
+                if self.can_use_cuda_graph(batch) else batch.size
+            )
+            batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:

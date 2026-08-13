@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from picosgl.message import UserMsg
 
     from .cache import CacheManager
-    from .decode import DecodeManager
     from .table import TableManager
 
 logger = init_logger(__name__)

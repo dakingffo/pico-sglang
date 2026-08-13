@@ -122,24 +122,19 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
     # about its different choice -> genuine fused-context drift, not a near-tie.
     verify_margins: dict[tuple[int, int], float] = {}
 
-    # record each verify round's committed length (acceptance histogram) without
-    # touching production code. The commit happens in settle at this iteration's schedule
-    # start; num_sampled is stored in each req's last_commit and read here before process
-    # clears it.
+    # record each verify round's committed length (acceptance histogram) without touching
+    # production code. The commit now happens inside process (deferred one iteration after
+    # the verify forward), and each non-aborted req emits one list-typed DetokenizeMsg per
+    # round whose length is num_sampled -- read it from the reply.
     hist: list[tuple[int, int]] = []
     if enable_mtp:
         orig_process = sched.verify_manager.process
 
         def rec_process(ctx, batch, output):
-            commit_len = {}
-            for r in batch.batch.reqs:
-                st = sched.verify_manager._state.get(r.table_idx)
-                if st is not None and st.last_commit is not None:
-                    commit_len[r.uid] = st.last_commit[1]
             reply = orig_process(ctx, batch, output)
-            for uid, n in commit_len.items():
-                if n > 0:
-                    hist.append((uid, n))
+            for msg in reply:
+                if isinstance(msg.next_token, list):
+                    hist.append((msg.uid, len(msg.next_token)))
             return reply
 
         sched.verify_manager.process = rec_process
@@ -235,8 +230,9 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
 
     # Step 8d: page-integrity no-leak. After every request drained (all pages back in
     # the prefix cache or the free list), free_slots + prefix_cache.total_size must equal
-    # num_pages exactly. The VerifyManager's next_alloc_pos logic must not leak a page
-    # per round (the "re-allocate position C" hazard the scheduler design warns about).
+    # num_pages exactly. Committed positions stay in the req's cache; the rejected suffix
+    # is freed in process each round; an abort frees the in-flight window -- no page may
+    # leak.
     integrity_ok, integrity_msg = True, "ok"
     try:
         sched.cache_manager.check_integrity()

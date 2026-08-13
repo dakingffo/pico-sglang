@@ -127,7 +127,7 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-       
+
         mtp_skip_graphs = getattr(config, "enable_mtp", False)
         self.graph_runner = GraphRunner(
             stream=self.stream,
@@ -226,8 +226,7 @@ class Engine:
         -> sampler.prepare.
         """
         self.graph_runner.pad_batch(batch)
-        if not batch.is_verify:
-            cache_manager.allocate_paged(batch.reqs)
+        cache_manager.allocate_paged(batch.reqs)
         batch.positions = self._make_positions(batch, self.device)
         input_mapping = self._make_input_tuple(batch, self.device)
         write_mapping = self._make_write_tuple(batch, self.device)
@@ -239,7 +238,7 @@ class Engine:
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
-    
+
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs
     ) -> ForwardOutput | VerifyOutput:
@@ -259,13 +258,7 @@ class Engine:
             copy_done_event = torch.cuda.Event()
             copy_done_event.record(self.stream)
             return VerifyOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, hidden)
-        else: # prefill / decode default path
-            for req in batch.reqs:  
-                req.complete_one()
-
-            if (pool := getattr(self.ctx, "linear_state", None)) is not None:
-                pool.advance_batch(batch.reqs)
-
+        else: # prefill / decode
             next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
             copy_done_event = torch.cuda.Event()

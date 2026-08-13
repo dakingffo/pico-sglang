@@ -271,13 +271,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         use_state = req.cached_len > 0
         table_idx = req.table_idx
         # unified circular buffer: read the committed baseline from slot p, write the new
-        # committed state to slot (p+1). The pointer itself is advanced ONCE per model
-        # forward (pool.advance_batch in engine.forward_batch), NOT here -- every layer
-        # must read the same baseline slot p and write to the same slot (p+1), otherwise
-        # each layer's committed state lands in a different slot and decode/verify (which
-        # read slot p for all layers) observe the wrong baselines. depth==1 (non-MTP)
-        # short-circuits to slot 0 with no device access -> byte-identical to the
-        # single-depth pool.
+        # committed state to slot (p+1). The pointer is advanced by the scheduler, NOT
+        # here: once per prefill batch (scheduler._forward's rollback_to) and by
+        # num_sampled at each verify commit. Every layer must read the same baseline slot p
+        # and write to the same slot (p+1), otherwise each layer's committed state lands in
+        # a different slot and decode/verify (which read slot p for all layers) observe the
+        # wrong baselines. depth==1 (non-MTP) short-circuits to slot 0 with no device
+        # access -> byte-identical to the single-depth pool.
         if pool.depth == 1:
             p = new_slot = 0
         else:
@@ -419,10 +419,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         mixed_qkv = _causal_conv1d_update(mixed_qkv, conv_state, self.conv1d.weight)
         # NOTE: pool[... , tensor_idx] is advanced indexing -> a COPY, so `.copy_()` on it
         # would never reach the pool. Write back per request with a scalar index (a view),
-        # exactly like the prefill path. As in prefill, the pointer is advanced once per
-        # model forward (pool.advance_batch in engine.forward_batch), not per layer: all
-        # layers write their state to the same slot (p+1) so slot p holds every layer's
-        # state at the committed position.
+        # exactly like the prefill path. As in prefill, the pointer is advanced by the
+        # scheduler (once per prefill batch; num_sampled at each verify commit), not per
+        # layer: all layers write their state to the same slot (p+1) so slot p holds every
+        # layer's state at the committed position.
         if pool.depth == 1:
             new_slots_list = [0] * bs
         else:

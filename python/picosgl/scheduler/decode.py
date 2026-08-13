@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from picosgl.core import Batch
+from picosgl.core import Batch, ChunkedRequest
 
 from .ar import ARManagerBase
 
@@ -12,7 +12,14 @@ if TYPE_CHECKING:
 
 class DecodeManager(ARManagerBase):
     def schedule_next_batch(self) -> Batch | None:
-        return Batch(reqs=sorted(self.running_reqs.values()), phase="decode") if self.runnable else None
+        if not self.runnable:
+            return None
 
-    def after_forward(self, forward_input: ForwardInput, output) -> None:
-        self.filter_reqs(forward_input.batch.reqs)
+        return Batch(reqs=sorted(self.running_reqs.values()), phase="decode")
+
+    def advance_for_next_schedule(self, forward_input: ForwardInput) -> None:
+        batch = forward_input.batch
+        for req in batch.reqs:
+            if isinstance(req, ChunkedRequest):
+                continue
+            req.complete_n(1)

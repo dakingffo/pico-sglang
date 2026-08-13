@@ -62,11 +62,3 @@ class LinearStatePool:
             self.slots[req.table_idx] = (
                 (self.slots[req.table_idx] + num_sampled) % self.depth
             )
-
-    def advance_batch(self, reqs) -> None:
-        if self.depth == 1:
-            return
-        for req in reqs:
-            self.slots[req.table_idx] = (
-                (self.slots[req.table_idx] + 1) % self.depth
-            )

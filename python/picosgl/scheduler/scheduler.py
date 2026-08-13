@@ -47,17 +47,17 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         if config.enable_mtp:
             self.ar_manager = VerifyManager(
-                config, self.device, self.engine.sampler, self.engine.model.mtp, 
+                config, self.device, self.engine.sampler, self.engine.model.mtp,
                 self.cache_manager, self.table_manager,
                 self.eos_token_id, config.num_spec_tokens,
             )
         else:
             self.ar_manager = DecodeManager(
-                config, self.device, 
-                self.cache_manager, self.table_manager, 
+                config, self.device,
+                self.cache_manager, self.table_manager,
                 self.eos_token_id
             )
-        
+
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager()
@@ -102,8 +102,9 @@ class Scheduler(SchedulerIOMixin):
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
-        last_data[1].copy_done_event.synchronize()
-        reply = self.ar_manager.process(self.engine.ctx, last_data[0], last_data[1])
+        last_input, last_output = last_data
+        last_output.copy_done_event.synchronize()
+        reply = self.ar_manager.process(self.engine.ctx, last_input, last_output)
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -131,7 +132,7 @@ class Scheduler(SchedulerIOMixin):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = (
                 self.prefill_manager.abort_req(msg.uid)
-                or self.ar_manager.abort_req(msg.uid) 
+                or self.ar_manager.abort_req(msg.uid)
             )
             if req_to_free is not None:
                 self.ar_manager._free_req_resources(self.engine.ctx, req_to_free)
@@ -140,28 +141,36 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # 1) First settle the previous verify round's in-flight accounting (decode: no-op).
-        self.ar_manager.settle(self.engine.ctx)
-        # 2) Prefill has priority, then the AR manager's own batch; reserved leaves room for
-        #    the AR manager's in-flight tokens.
         batch = (
-            self.prefill_manager.schedule_next_batch(PrefillAdder(
-                token_budget=self.prefill_budget,
-                reserved_size=self.ar_manager.inflight_tokens,
-                cache_manager=self.cache_manager,
-                table_manager=self.table_manager,
-            ))
-            or self.ar_manager.schedule_next_batch()
+            self.prefill_manager.schedule_next_batch(
+                PrefillAdder(
+                    token_budget=self.prefill_budget,
+                    reserved_size=self.ar_manager.inflight_tokens,
+                    cache_manager=self.cache_manager,
+                    table_manager=self.table_manager,
+                )
+            ) or
+            self.ar_manager.schedule_next_batch()
         )
-        # 3) Uniform prep: pad -> page allocation (verify skips: it allocated in schedule) ->
-        #    positions -> input tuple -> write tuple (empty for verify) -> metadata -> sampler.
         return self.engine.prepare_batch(batch, self.cache_manager) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        # Write the next-round input token immediately (non-verify). process's deferred
+        # commit would run one iteration later, and decode (no scheduable drain, unlike
+        # verify) would read a stale token on the next forward. verify commits its own
+        # tokens in process; the write tuple is empty for it.
         if not batch.is_verify:
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.ar_manager.after_forward(forward_input, forward_output)
+        if batch.is_prefill:
+            for req in batch.reqs:
+                req.complete_to_device_len()
+            # each prefill chunk commits one linear-state snapshot (the layer wrote the
+            # post-chunk state to slot p+1); advance the ring pointer to it so the first
+            # verify round reads the right baseline. depth==1 (non-MTP) is a no-op.
+            if (pool := getattr(self.engine.ctx, "linear_state", None)) is not None:
+                pool.rollback_to(batch.reqs, 1)
+        self.ar_manager.advance_for_next_schedule(forward_input)
         return forward_output
