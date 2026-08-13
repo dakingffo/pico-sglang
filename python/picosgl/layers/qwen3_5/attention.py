@@ -29,7 +29,6 @@ class Qwen3_5Attention(BaseOP):
         self.scaling = self.head_dim**-0.5
         self._layer_id = layer_id
         self.paged = paged
-        self.output_gate_type = config.output_gate_type
 
         self.q_proj = LinearColParallelMerged(
             config.hidden_size, [self.num_qo_heads * self.head_dim * 2], has_bias=False
@@ -75,9 +74,7 @@ class Qwen3_5Attention(BaseOP):
         else:
             o, _, _ = self._eager_attention(query, key, value)
         o = o.reshape(-1, self.num_qo_heads, self.head_dim)
-        # Qwen3.5 gates with sigmoid; Qwen3.6 (output_gate_type="swish") uses gate*sigmoid.
-        # The sigmoid branch is bit-identical to the old hardcoded path.
-        o = o * (F.silu(gate) if self.output_gate_type == "swish" else torch.sigmoid(gate))
+        o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o.reshape(-1, self.num_qo_heads * self.head_dim))
 
     def forward_with_kv(
@@ -103,9 +100,7 @@ class Qwen3_5Attention(BaseOP):
             past_k, past_v = past_kv
         o, k, v = self._eager_attention(query, key, value, past_k, past_v)
         o = o.reshape(-1, self.num_qo_heads, self.head_dim)
-        # Qwen3.5 gates with sigmoid; Qwen3.6 (output_gate_type="swish") uses gate*sigmoid.
-        # The sigmoid branch is bit-identical to the old hardcoded path.
-        o = o * (F.silu(gate) if self.output_gate_type == "swish" else torch.sigmoid(gate))
+        o = o * torch.sigmoid(gate)
         o = self.o_proj.forward(o.reshape(-1, self.num_qo_heads * self.head_dim))
         return o, (k, v)
 

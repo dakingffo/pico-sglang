@@ -295,34 +295,36 @@ def main() -> None:
             print(f"  {name:12s} non-MTP {len(ta):3d} tok, MTP {len(tb):3d} tok, "
                   f"{'IDENTICAL' if same else '*** DIFFER ***'}")
             if not same:
-                for i, (x, y) in enumerate(zip(ta, tb)):
-                    if x != y:
-                        # the divergent token sits at stream position i = model position
-                        # P+i, predicted by the decode step at position P+i-1. The non-MTP
-                        # run's margin there is measured against the true greedy context,
-                        # so it reflects whether the model was genuinely at a tie.
-                        P = b.get("prompt_len", {}).get(name, 0)
-                        marg = dm.get((uid, P + i))
-                        vmarg = vm.get((uid, P + i))
-                        vm_s = f"verify margin={vmarg:.4f}" if vmarg is not None else "verify margin=n/a"
-                        # The divergence is decided by the MTP VERIFY forward's own logits
-                        # (that is the logits used to commit the token), not by the
-                        # reference path's. So the near-tie criterion is the VERIFY margin
-                        # at the divergent position: bf16 fused-context rounding noise
-                        # (verified 0.125 at both observed divergences) flips an argmax the
-                        # verify forward itself judged a tie. The reference decode margin is
-                        # reported as context -- it can be confident (4.6) because the fused
-                        # mini-prefill context drifts ~0.25 hidden/layer and accumulates
-                        # across rounds, swinging the verify logits to a tie.
-                        if vmarg is not None and vmarg < TIE_MARGIN:
-                            near_ties.append((name, i, x, y, vmarg))
-                            print(f"    diff at idx {i}: {x} vs {y}  -> bf16 NEAR-TIE "
-                                  f"(verify margin={vmarg:.4f} < {TIE_MARGIN}; "
-                                  f"decode margin={marg})")
-                        else:
-                            print(f"    REAL diff at idx {i}: {x} vs {y} "
-                                  f"(decode margin={marg}; {vm_s})")
-                        break
+                for i in range(max(len(ta), len(tb))):
+                    if i < len(ta) and i < len(tb) and ta[i] == tb[i]:
+                        continue
+                    # the divergent token sits at stream position i = model position
+                    # P+i, predicted by the decode step at position P+i-1. The non-MTP
+                    # run's margin there is measured against the true greedy context,
+                    # so it reflects whether the model was genuinely at a tie.
+                    x = ta[i] if i < len(ta) else "<EOS>"
+                    y = tb[i] if i < len(tb) else "<EOS>"
+                    P = b.get("prompt_len", {}).get(name, 0)
+                    marg = dm.get((uid, P + i))
+                    vmarg = vm.get((uid, P + i))
+                    vm_s = f"verify margin={vmarg:.4f}" if vmarg is not None else "verify margin=n/a"
+                    # The divergence is decided by the MTP VERIFY forward's own logits
+                    # (that is the logits used to commit the token), not by the
+                    # reference path's. So the near-tie criterion is the VERIFY margin
+                    # at the divergent position: bf16 fused-context rounding noise
+                    # (verified 0.125 at both observed divergences) flips an argmax the
+                    # verify forward itself judged a tie. The reference decode margin is
+                    # reported as context -- it can be confident (4.6) because the fused
+                    # mini-prefill context drifts ~0.25 hidden/layer and accumulates
+                    # across rounds, swinging the verify logits to a tie.
+                    if vmarg is not None and vmarg < TIE_MARGIN:
+                        near_ties.append((name, i, x, y, vmarg))
+                        print(f"    diff at idx {i}: {x} vs {y}  -> bf16 NEAR-TIE "
+                              f"(verify margin={vmarg:.4f} < {TIE_MARGIN}; "
+                              f"decode margin={marg})")
+                    else:
+                        print(f"    REAL diff at idx {i}: {x} vs {y} "
+                              f"(decode margin={marg}; {vm_s})")
         print(f"rounds(MTP)={b.get('rounds')} avg_accept={b.get('avg_accept')} "
               f"full={b.get('full_commit')} one={b.get('one_tok')} "
               f"missing={b.get('missing') or a.get('missing')}")
