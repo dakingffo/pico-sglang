@@ -60,7 +60,7 @@ class Scheduler(SchedulerIOMixin):
 
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
-        self.prefill_manager = PrefillManager()
+        self.prefill_manager = PrefillManager(self.token_pool)
         self.prefill_budget = config.max_extend_tokens
 
 
@@ -159,7 +159,7 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.prefill_manager.advance_for_next_schedule(
-            forward_input, forward_output, self.token_pool, self.engine.ctx
+            self.engine.ctx, forward_input, forward_output
         )
         self.ar_manager.advance_for_next_schedule(forward_input)
         return forward_output

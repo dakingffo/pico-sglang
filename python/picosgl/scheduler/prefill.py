@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -107,9 +107,13 @@ class PrefillAdder:
         return None
 
 
-@dataclass
 class PrefillManager:
-    pending_list  : list[PendingRequest] = field(default_factory=list)
+    def __init__(
+        self,
+        token_pool   : torch.Tensor,
+    ):
+        self.token_pool = token_pool
+        self.pending_list: list[PendingRequest] = []
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingRequest(req.uid, req.input_ids, req.sampling_params))
@@ -143,14 +147,13 @@ class PrefillManager:
 
     def advance_for_next_schedule(
         self,
+        ctx          : Context,
         forward_input: ForwardInput,
         output       : ForwardOutput,
-        token_pool   : torch.Tensor,
-        ctx          : Context,
     ) -> None:
         batch, _, _, output_mapping = forward_input
         if not batch.is_verify:
-            token_pool[output_mapping] = output.next_tokens_gpu
+            self.token_pool[output_mapping] = output.next_tokens_gpu
         if batch.is_prefill:
             for req in batch.reqs:
                 req.complete_to_device_len()
