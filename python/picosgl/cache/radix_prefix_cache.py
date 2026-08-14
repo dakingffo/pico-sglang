@@ -11,59 +11,32 @@ import torch
 from picosgl.core import get_global_ctx
 from picosgl.utils import align_down
 
-from .base import BaseCacheHandle, BasePrefixCache, InsertResult, MatchResult, SizeInfo
+from .base import (
+    BaseCacheHandle, 
+    BasePrefixCache, 
+    InsertResult, 
+    MatchResult, 
+    SizeInfo
+)
 
 
 KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 
-class NaiveCacheHandle(BaseCacheHandle):
-    empty_tensor: torch.Tensor  # should be set by NaivePrefixCache
 
-    def __init__(self):
-        super().__init__(cached_len=0)
+def _get_key_fn(page_size: int) -> KEY_FN:
+    if page_size == 1:
+        return lambda x: x[0].item()
+    else:
+        return lambda x: tuple(x[:page_size].tolist())
 
-    def get_matched_indices(self) -> torch.Tensor:
-        return self.empty_tensor
-
-
-class NaivePrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
-        NaiveCacheHandle.empty_tensor = self.empty_tensor
-        super().__init__()
-
-    def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
-        pass
-
-    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
-        return MatchResult(NaiveCacheHandle())
-
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
-        return InsertResult(0, NaiveCacheHandle())
-
-    def evict(self, size: int) -> torch.Tensor:
-        if size != 0:
-            raise NotImplementedError("NaiveCacheManager does not support eviction.")
-        return self.empty_tensor
-
-    def reset(self) -> None:
-        pass
-
-    @property
-    def size_info(self) -> SizeInfo:
-        return SizeInfo(evictable_size=0, protected_size=0)
-
-    def check_integrity(self) -> None:
-        pass
-
-
+    
 class RadixTreeNode:
     counter = count(0)
 
-    def __init__(self, key_fn: KEY_FN, tic: int | None = None) -> None:
+    def __init__(self, key_fn: KEY_FN, page_size: int = 1, tic: int | None = None) -> None:
         self.uuid = next(RadixTreeNode.counter)
         self.key_fn = key_fn
+        self.page_size = page_size
         self.children: dict[Any, RadixTreeNode] = {}
         self._parent: RadixTreeNode | None = None
         self.ref_count: int = 0
@@ -73,12 +46,25 @@ class RadixTreeNode:
         self._key: torch.Tensor
         self._value: torch.Tensor
         self._length: int
+        # one linear-state pool slot per cached page (only for hybrid_radix)
+        self._state_value: torch.Tensor | None = None
 
-    def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
+    def set_key_value(
+        self,
+        key        : torch.Tensor,
+        value      : torch.Tensor,
+        state_value: torch.Tensor | None = None,
+    ) -> None:
         assert len(key) == len(value)
         self._key = key
         self._value = value
         self._length = len(key)
+        if state_value is not None:
+            assert len(state_value) == len(value) // self.page_size, (
+                f"state_value ({len(state_value)}) must be one entry per page "
+                f"({len(value)} // {self.page_size})"
+            )
+            self._state_value = state_value
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         assert isinstance(parent, RadixTreeNode)
@@ -113,12 +99,24 @@ class RadixTreeNode:
         assert 0 < pos < self.length
         parent = self.parent
 
-        new_node = RadixTreeNode(self.key_fn, self.timestamp)
-        new_node.set_key_value(self._key[:pos], self._value[:pos])
+        new_node = RadixTreeNode(self.key_fn, self.page_size, self.timestamp)
+        if self._state_value is not None:
+            split = pos // self.page_size
+            new_node.set_key_value(
+                self._key[:pos], self._value[:pos], self._state_value[:split]
+            )
+        else:
+            new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
 
-        self.set_key_value(self._key[pos:], self._value[pos:])
+        if self._state_value is not None:
+            split = pos // self.page_size
+            self.set_key_value(
+                self._key[pos:], self._value[pos:], self._state_value[split:]
+            )
+        else:
+            self.set_key_value(self._key[pos:], self._value[pos:])
         self.set_parent(new_node)
 
         return new_node
@@ -138,7 +136,24 @@ class RadixCacheHandle(BaseCacheHandle):
             value_list.append(node.value)
             node = node.parent
         value_list.reverse()
+        if not value_list:
+            return torch.empty(0, dtype=torch.int32, device=self.node._key.device)
         return torch.cat(value_list)
+
+    def get_matched_state_slots(self) -> torch.Tensor | None:
+        """Pool slot ids of the matched pages, in page order. None if the cache holds
+        no state info (non-hybrid radix) or nothing was matched."""
+        node = self.node
+        state_list: list[torch.Tensor] = []
+        while not node.is_root():
+            if node._state_value is None:
+                return None
+            state_list.append(node._state_value)
+            node = node.parent
+        state_list.reverse()
+        if not state_list:
+            return None
+        return torch.cat(state_list)
 
 
 class RadixPrefixCache(BasePrefixCache):
@@ -150,7 +165,7 @@ class RadixPrefixCache(BasePrefixCache):
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
         self.protected_size = 0
-        self.root_node = RadixTreeNode(self.key_fn)
+        self.root_node = RadixTreeNode(self.key_fn, self.page_size)
         self.root_node.ref_count = 1  # root is always protected
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
@@ -176,26 +191,42 @@ class RadixPrefixCache(BasePrefixCache):
         node, prefix_len = self._tree_walk(input_ids)
         return MatchResult(RadixCacheHandle(prefix_len, node))
 
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+    def insert_prefix(
+        self,
+        input_ids   : torch.Tensor,
+        indices     : torch.Tensor,
+        state_slots : torch.Tensor | None = None,
+    ) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         node, prefix_len = self._tree_walk(input_ids)
         if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
-            new_node = RadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
+            new_node = RadixTreeNode(self.key_fn, self.page_size)
+            if state_slots is not None:
+                new_node.set_key_value(
+                    input_ids[prefix_len:], indices[prefix_len:].clone(),
+                    state_slots[prefix_len // self.page_size : insert_len // self.page_size].clone(),
+                )
+            else:
+                new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
             self.evictable_size += new_node.length
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
-    def evict(self, size: int) -> torch.Tensor:
+    def evict(self, size: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Evict prefixes. Returns (evicted KV page indices, evicted state slots).
+
+        For the non-hybrid radix cache the state slots are None.
+        """
         if size == 0:
-            return self.empty_tensor
+            return self.empty_tensor, None
         assert size <= self.evictable_size, f"Can't evict {size}, only {self.evictable_size}"
 
         leave_nodes = self._collect_leave_nodes_for_evict()
         heapq.heapify(leave_nodes)
         evicted_indices: list[torch.Tensor] = []
+        evicted_state  : list[torch.Tensor] = []
         evicted_size = 0
 
         while evicted_size < size:
@@ -204,6 +235,8 @@ class RadixPrefixCache(BasePrefixCache):
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
             evicted_size += node.length
             evicted_indices.append(node.value)
+            if node._state_value is not None:
+                evicted_state.append(node._state_value)
             self.evictable_size -= node.length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
@@ -211,7 +244,9 @@ class RadixPrefixCache(BasePrefixCache):
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
-        return torch.cat(evicted_indices)
+        return torch.cat(evicted_indices), (
+            torch.cat(evicted_state) if evicted_state else None
+        )
 
     def reset(self) -> None:
         raise NotImplementedError("RadixManager.reset is not implemented")
@@ -225,6 +260,17 @@ class RadixPrefixCache(BasePrefixCache):
 
     def check_integrity(self) -> None:
         pass
+
+    def total_state_pages(self) -> int:
+        """Total number of linear-state slots owned by the tree (one per cached page)."""
+        total = 0
+        stack: list[RadixTreeNode] = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node._state_value is not None:
+                total += len(node._state_value)
+            stack.extend(node.children.values())
+        return total
 
     def _collect_leave_nodes_for_evict(self) -> list[RadixTreeNode]:
         nodes: list[RadixTreeNode] = [self.root_node]
@@ -270,8 +316,14 @@ class RadixPrefixCache(BasePrefixCache):
         return node, prefix_len
 
 
-def _get_key_fn(page_size: int) -> KEY_FN:
-    if page_size == 1:
-        return lambda x: x[0].item()
-    else:
-        return lambda x: tuple(x[:page_size].tolist())
+class HybridRadixPrefixCache(RadixPrefixCache):
+    def insert_prefix(
+        self,
+        input_ids   : torch.Tensor,
+        indices     : torch.Tensor,
+        state_slots : torch.Tensor | None = None,
+    ) -> InsertResult:
+        insert_len = align_down(len(input_ids), self.page_size)
+        if insert_len > 0:
+            assert state_slots is not None, "hybrid_radix requires per-page state slots"
+        return super().insert_prefix(input_ids, indices, state_slots)

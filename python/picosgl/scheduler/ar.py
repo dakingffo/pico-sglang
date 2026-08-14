@@ -58,8 +58,6 @@ class ARManagerBase:
     def _free_req_resources(self, ctx: Context, req: Request) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
-        if (pool := getattr(ctx, "linear_state", None)) is not None:
-            pool.reset(req.table_idx)
 
     def on_prefill_done(self, req: Request, full_hidden, mapping) -> None:
         """Prefill -> AR handoff hook. decode: no-op; verify (MTP): seed the carry."""

@@ -36,6 +36,7 @@ class Request:
     cache_handle   : BaseCacheHandle
     device_len     : int = field(init=False)
     max_device_len : int = field(init=False)
+    baseline_slot  : int = field(default=-1, init=False)  # for verify
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -129,13 +130,16 @@ class Batch:
 @dataclass
 class Context:
     page_size: int
-    # NOTE: this table always treat page_size = 1
     page_table  : torch.Tensor    = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend : BaseMoeBackend  = field(init=False)
-    kv_cache    : BaseKVCachePool = field(init=False)
-    linear_state: LinearStatePool = field(init=False)
-    _batch      : Batch | None    = field(default=None, init=False)
+    kv_cache    : BaseKVCachePool = field(init=False)   # full attention
+    linear_state: LinearStatePool = field(init=False)   # linear attention
+
+    state_table : torch.Tensor | None = field(default=None, init=False)
+    draft_state : int | None          = field(default=None, init=False)
+
+    _batch      : Batch | None        = field(default=None, init=False)
 
     @property
     def batch(self) -> Batch:

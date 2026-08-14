@@ -147,15 +147,23 @@ def test2_gated_delta_net_math(mcfg):
         mcfg.linear_num_key_heads * mcfg.linear_key_head_dim * 2
         + mcfg.linear_num_value_heads * mcfg.linear_value_head_dim
     )
-    ctx = Context(page_size=1)
+    ps = 64  # hybrid: page boundaries must align with the 64-token chunk rule
+    ctx = Context(page_size=ps)
     ctx.linear_state = LinearStatePool(
-        num_linear_layers=1, max_req=4, conv_dim=conv_dim,
+        num_slots=32, num_linear_layers=1, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,
         head_k_dim=mcfg.linear_key_head_dim,
         head_v_dim=mcfg.linear_value_head_dim,
         device=torch.device("cpu"), dtype=torch.float32,
     )
+    # one state slot per page the layer will write (reqs 0,1,2, pages 0..3 cover 256 tokens)
+    # the pool is a pure buffer now (free-list lives in CacheManager); hand out distinct slots
+    ctx.state_table = torch.full((4, 8), -1, dtype=torch.int32)
+    slot = iter(range(ctx.linear_state.conv_state.shape[0]))
+    for tidx in (0, 1, 2):
+        for p in range(4):
+            ctx.state_table[tidx, p] = next(slot)
     set_global_ctx(ctx)
 
     torch.manual_seed(0)
@@ -223,20 +231,28 @@ def test3_full_model(mcfg, loaded=None):
         mcfg.linear_num_key_heads * mcfg.linear_key_head_dim * 2
         + mcfg.linear_num_value_heads * mcfg.linear_value_head_dim
     )
-    ctx = Context(page_size=1)
+    ctx = Context(page_size=64)
     num_pages = 4096
     ctx.kv_cache = create_kvcache_pool(
         model_config=mcfg, num_pages=num_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
     ctx.linear_state = LinearStatePool(
-        num_linear_layers=mcfg.num_linear_layers, max_req=4, conv_dim=conv_dim,
+        num_slots=8, num_linear_layers=mcfg.num_linear_layers, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,
         head_k_dim=mcfg.linear_key_head_dim,
         head_v_dim=mcfg.linear_value_head_dim,
         device=device, dtype=torch.bfloat16,
     )
+    # one state slot per page the layer writes. All prefill/decode here stays in page 0
+    # (the prompt is ~15 tokens < 64); the prefill chunk callback writes page 0 for each
+    # request's row, decode reads/writes page 0 too.
+    ctx.state_table = torch.full((8, 16), -1, dtype=torch.int32, device=device)
+    ctx.draft_state = 16  # no verify batches in this test
+    slot = iter(range(ctx.linear_state.conv_state.shape[0]))
+    for tidx in (3, 4):
+        ctx.state_table[tidx, 0] = next(slot)
     ctx.page_table = torch.zeros((8, 8192), dtype=torch.int32, device=device)
     # sequential pages per req
     base = torch.arange(num_pages, device=device, dtype=torch.int32).view(1, -1)
@@ -287,7 +303,8 @@ def test3_full_model(mcfg, loaded=None):
     print("  full prefill last-token logits == incremental prefill  ✓")
 
     # (b) step-by-step decode
-    ctx.linear_state.reset(3)
+    # no pool.reset: the fresh prefill below (cached_len=0, baseline=None) overwrites
+    # page 0's slot from zero, so stale state from the reference prefills can't leak in.
     # prefill token 0 on req slot 3
     req = mk_req(3, 1, 0, uid=2)
     batch = make_batch([req], "prefill", id_t[:1], torch.zeros(1, device=device, dtype=torch.int64))

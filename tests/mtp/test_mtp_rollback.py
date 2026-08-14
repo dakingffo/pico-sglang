@@ -1,23 +1,22 @@
-"""Step 8c: linear-state rollback correctness.
+"""Step 8c (rework): MTP verify reserve-commit correctness on the hybrid page cache.
 
-Core circular-buffer test: after a verify round accepts num_sampled tokens, rollback_to
-must land on the snapshot that holds "the state after exactly num_sampled tokens were
-appended to the baseline" -- i.e. the state a plain (non-MTP) decode would be at.
+The old circular-buffer rollback_to is gone. The verify forward writes each candidate's
+post-state into the K+1 reserve columns R[0..K], and committing ``num_sampled`` accepted
+tokens is a pure index shuffle (pin / refill / swap, zero state memcpy -- see
+test_reserve_index_ops.py for the index-level contract). This test drives the real 0.8B
+model through the three commit shapes and checks the committed baseline state equals
+"state after num_sampled tokens appended to the prefill terminal state", measured
+against an independent sequential-decode reference:
 
-  baseline: prefill, committed slot p (=1 after the scheduler's per-batch rollback_to(1),
-            which replaced the removed pool.advance_batch)
-  reference: from baseline, 2 sequential per-token decodes (t0,t1) -> committed slot
-             (p+2) holds "state after 2 tokens". Same for 5 tokens (wrap: slot p).
-  verify:    from baseline, fused verify window [C, C+5) with tokens
-             [t0, t1, d2, d3, d4], then pool.rollback_to(req, num_sampled) ->
-             slots = (p+num_sampled) % D. Read the slot it points at.
-  compare:   conv_state / recurrent_state at the rolled-back slot vs the reference slot.
+  * no page crossing    (C=100, num_sampled=3): swap R[0] <-> R[2]; baseline = R[2].
+  * crossing, last      (C=126, num_sampled=2): pin R[1] -> page 1; baseline = page slot.
+  * crossing, mid       (C=125, num_sampled=4): pin R[2] -> page 1, refill R[2],
+                         swap R[0] <-> R[3]; baseline = R[3] (state after 128).
 
-Expected: the pointer arithmetic is exact (integer mod); the content matches the
-reference within bf16 ULP (verify projects all window tokens batched, decode per token,
-so ~1 ULP input difference into the shared per-token recurrent rule -- NOT a structural
-divergence). num_sampled=5 exercises the ring wrap (slot (p+5)%5 == p, the baseline slot,
-which is safe to overwrite because it is only read at round start).
+The verify forward and the direct-decode reference feed the same token sequence from the
+same baseline state, so the committed state matches the reference within the bf16 band
+(the verify's fused attention context drifts ~1 ULP from per-token decode -- same
+tolerance the old test used).
 
 Run: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_mtp_rollback.py
 """
@@ -71,12 +70,13 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    from picosgl.core import Context, Request, Batch, set_global_ctx
+    from picosgl.core import Batch, Context, Request, set_global_ctx
     from picosgl.cache import create_kvcache_pool
-    from picosgl.cache import LinearStatePool
+    from picosgl.cache.linear.state_pool import LinearStatePool
     from picosgl.layers.attention_backend import create_attention_backend
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
     from picosgl.models.weight import load_weight
+    from picosgl.scheduler.cache import CacheManager
 
     loaded = {k: v for k, v in load_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -86,111 +86,125 @@ def main():
     to_device(model, device)
     torch.cuda.empty_cache()
 
-    K = 4  # num_spec_tokens
-    D = K + 1
+    K = 4                 # num_spec_tokens
+    D = K + 1             # reserve width (verify window size)
+    PS = 64               # state page size (hybrid; page boundary == 64-chunk boundary)
     conv_dim = (
         mcfg.linear_num_key_heads * mcfg.linear_key_head_dim * 2
         + mcfg.linear_num_value_heads * mcfg.linear_value_head_dim
     )
-    ctx = Context(page_size=1)
-    num_pages = 8192
+    ctx = Context(page_size=PS)
+    # KV cache is per-token pages (page_size=1); the 64-granular pages below are STATE
+    # pages (state_table columns), indexed by the layer, not by the attention backend.
+    kv_pages = 4096
     ctx.kv_cache = create_kvcache_pool(
-        model_config=mcfg, num_pages=num_pages, page_size=1,
+        model_config=mcfg, num_pages=kv_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
     pool = LinearStatePool(
-        num_linear_layers=mcfg.num_linear_layers, max_req=4, conv_dim=conv_dim,
+        num_slots=64, num_linear_layers=mcfg.num_linear_layers, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,
         head_k_dim=mcfg.linear_key_head_dim,
         head_v_dim=mcfg.linear_value_head_dim,
-        device=device, dtype=torch.bfloat16, depth=D,
+        device=device, dtype=torch.bfloat16,
     )
     ctx.linear_state = pool
-    ctx.page_table = torch.zeros((8, num_pages), dtype=torch.int32, device=device)
-    base = torch.arange(num_pages, device=device, dtype=torch.int32).view(1, -1)
-    ctx.page_table[:, :num_pages] = base
+
+    MAX_SEQ = 1024
+    ctx.page_table = torch.zeros((8, MAX_SEQ), dtype=torch.int32, device=device)
+    # disjoint per-token KV page ranges: row V=4 (verify), row R=5 (decode reference)
+    for tidx, base in ((4, 0), (5, 2048)):
+        ctx.page_table[tidx, :MAX_SEQ] = torch.arange(base, base + MAX_SEQ, device=device)
+
+    # state_table: 16 page columns + D reserve columns (tail). -1 = unallocated.
+    page_cols = (MAX_SEQ + PS - 1) // PS  # 16
+    rb = page_cols
+    st = torch.full((8, page_cols + D), -1, dtype=torch.int32, device=device)
+    ctx.state_table = st
+    ctx.draft_state = rb
     set_global_ctx(ctx)
     ctx.attn_backend = create_attention_backend("fi", mcfg)
+
+    cm = CacheManager(
+        num_pages=8, page_size=PS, num_states=64,
+        page_table=torch.zeros((8, 16), dtype=torch.int32, device=device),
+        type="hybrid_radix", state_table=st, state_pool=pool,
+        draft_state=rb,
+    )
+    # one state slot per page each row's prefill + decode will write
+    for tidx, pages in ((4, (0, 1)), (5, (0, 1, 2))):
+        for p in pages:
+            st[tidx, p] = int(cm._allocate(needed_states=1)[1][0])
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    text = "def quicksort(arr):\n    if len(arr) <= 1:"
-    ids = tokenizer(text, return_tensors="pt").input_ids[0].to(device)
-    S = ids.shape[0]
-    TIDX = 4
-    C = S
-
-    req = Request(
-        input_ids=ids.cpu(), table_idx=TIDX, cached_len=0, output_len=40, uid=0,
-        sampling_params=None,  # type: ignore
-        cache_handle=None,  # type: ignore
-    )
+    ids = tokenizer(
+        "def quicksort(arr):\n    if len(arr) <= 1:", return_tensors="pt"
+    ).input_ids[0]
+    ids = torch.cat([ids, ids[:1].expand(150)]).to(device)  # >= 131 tokens for the window
+    N = ids.shape[0]
 
     kv = ctx.kv_cache
     storage = kv._storage_shape
 
-    def zero_window():
+    def zero_window(tidx, lo, hi):
         for layer in range(kv.num_layers):
-            for p in range(C, C + K + 1):
+            for p in range(lo, hi):
                 kv.k_cache(layer).view(storage)[p].zero_()
                 kv.v_cache(layer).view(storage)[p].zero_()
 
-    # ---------------- prefill ----------------
-    pb = Batch(reqs=[req], phase="prefill")
-    pb.input_ids = ids
-    pb.positions = torch.arange(S, device=device)
-    pb.padded_reqs = [req]
-    pb.out_loc = ctx.page_table[TIDX, :S]
-    ctx.attn_backend.prepare_metadata(pb)
-    with ctx.forward_batch(pb):
-        hidden_p, logits_p = model.forward_verify()
-    bonus = int(logits_p[0].argmax().item())
-    pool.rollback_to([req], 1)  # == scheduler._forward's per-prefill-batch pointer commit
-    p = int(pool.slots[TIDX])
-    print(f"prompt_len={S} bonus={bonus} baseline slot p={p} depth={D}")
-    assert p == 1, f"baseline slot should be 1, got {p}"
+    def mk_req(tidx, n_tokens, cached_len):
+        return Request(
+            input_ids=ids[:n_tokens].cpu(), table_idx=tidx, cached_len=cached_len,
+            output_len=16, uid=tidx, sampling_params=None,  # type: ignore
+            cache_handle=None,  # type: ignore
+        )
 
-    snap = (pool.conv_state.clone(), pool.recurrent_state.clone(), pool.slots.clone())
+    def run_prefill(tidx, n):
+        """Fresh prefill of ids[:n] on row tidx; returns the Request."""
+        req = mk_req(tidx, n, cached_len=0)
+        pb = Batch(reqs=[req], phase="prefill")
+        pb.input_ids = ids[:n]
+        pb.positions = torch.arange(n, device=device)
+        pb.padded_reqs = [req]
+        pb.out_loc = ctx.page_table[tidx, :n]
+        ctx.attn_backend.prepare_metadata(pb)
+        with ctx.forward_batch(pb):
+            model.forward_verify()
+        return req
 
-    def restore():
-        pool.conv_state.copy_(snap[0])
-        pool.recurrent_state.copy_(snap[1])
-        pool.slots.copy_(snap[2])
-        req.cached_len = C
-        req.device_len = C + 1
-
-    def decode_at(pos, tok):
-        req.device_len = pos + 1
-        db = Batch(reqs=[req], phase="decode")
-        db.input_ids = tok
-        db.positions = torch.tensor([pos], device=device)
-        db.padded_reqs = [req]
-        db.out_loc = ctx.page_table[TIDX, pos : pos + 1]
-        ctx.attn_backend.prepare_metadata(db)
-        with ctx.forward_batch(db):
-            model.model.forward(tok)
-        pool.slots[TIDX] = (int(pool.slots[TIDX]) + 1) % pool.depth
-
-    def verify_window(toks):
+    def run_verify(tidx, C, toks):
+        """Verify window [C, C+n) -> R[0..n); returns (req, n)."""
         n = toks.shape[0]
+        req = mk_req(tidx, C + n, cached_len=C)
+        req.baseline_slot = int(st[tidx, (C - 1) // PS])
+        st[tidx, rb : rb + D] = cm._allocate(needed_states=D)[1]  # K+1 reserve slots
         vb = Batch(reqs=[req], phase="verify")
         vb.input_ids = toks
         vb.positions = torch.arange(C, C + n, device=device)
         vb.padded_reqs = [req]
-        req.device_len = C + n
-        vb.out_loc = ctx.page_table[TIDX, C : C + n]
+        vb.out_loc = ctx.page_table[tidx, C : C + n]
         ctx.attn_backend.prepare_metadata(vb)
         with ctx.forward_batch(vb):
             model.forward_verify()
+        return req, n
 
-    def read_slot(slot):
-        s = slot % D
-        return (
-            pool.conv_state[:, s, TIDX].clone(),
-            pool.recurrent_state[:, s, TIDX].clone(),
-        )
+    def run_decode(tidx, pos, tok):
+        """Single decode step at position pos (KV + state read/write on row tidx)."""
+        req = mk_req(tidx, pos + 1, cached_len=pos)
+        db = Batch(reqs=[req], phase="decode")
+        db.input_ids = tok
+        db.positions = torch.tensor([pos], device=device)
+        db.padded_reqs = [req]
+        db.out_loc = ctx.page_table[tidx, pos : pos + 1]
+        ctx.attn_backend.prepare_metadata(db)
+        with ctx.forward_batch(db):
+            model.model.forward(tok)
+
+    def read_state(slot):
+        return (pool.conv_state[slot].clone(), pool.recurrent_state[slot].clone())
 
     def cmp(tag, a, b):
         dc = (a[0].float() - b[0].float()).abs().max().item()
@@ -198,64 +212,50 @@ def main():
         ac = a[0].abs().max().item()
         ar = a[1].abs().max().item()
         rel = max(dc / max(ac, 1e-9), dr / max(ar, 1e-9))
-        print(f"  {tag:28s} conv|d|={dc:.6f} (absmax {ac:.3f})  "
-              f"recurrent|d|={dr:.6f} (absmax {ar:.3f})  rel={rel:.2e}")
+        print(f"  {tag:30s} conv|d|={dc:.5f}  recurrent|d|={dr:.5f}  rel={rel:.2e}")
         return rel
 
-    t0 = torch.tensor([bonus], device=device)
-    drafts = torch.tensor([123, 456, 789, 999], device=device)
-    vt = torch.cat([t0, drafts])
+    def run_case(tag, C, num_sampled, tidx_v=4, tidx_r=5):
+        print(f"\n=== {tag}: C={C}, num_sampled={num_sampled} ===")
+        # ---- prefill the verify row to C (fresh KV) ----
+        run_prefill(tidx_v, C)
+        # ---- verify window [C, C+D) using the REAL continuation ids as drafts ----
+        toks = ids[C : C + D]
+        zero_window(tidx_v, C, C + D)  # the mini-prefill window must be clean KV
+        req, n = run_verify(tidx_v, C, toks)
+        assert n == D
+        # ---- commit: pure index ops ----
+        old_page_slot = int(st[tidx_v, (C - 1) // PS])
+        cm.state_commit_verify(req, C, num_sampled)
+        committed = read_state(req.baseline_slot)
+        print(f"  committed baseline_slot={req.baseline_slot} (page slot was {old_page_slot})")
+        # ---- reference: fresh prefill to C on the ref row + num_sampled decodes ----
+        run_prefill(tidx_r, C)
+        for j in range(num_sampled):
+            run_decode(tidx_r, C + j, toks[j : j + 1])
+        ref_slot = int(st[tidx_r, (C + num_sampled - 1) // PS])
+        ref = read_state(ref_slot)
+        rel = cmp("committed vs direct decode", committed, ref)
+        # ---- structural: the committed state is NOT the stale prefill terminal state ----
+        stale = read_state(old_page_slot)
+        dc = (committed[0].float() - stale[0].float()).abs().max().item()
+        dr = (committed[1].float() - stale[1].float()).abs().max().item()
+        print(f"  committed vs stale baseline: conv|d|={dc:.4f} recurrent|d|={dr:.4f}")
+        return rel, max(dc, dr)
 
-    # ---- reference: direct per-token decodes -> state at slot (p+2) and slot (p+5)=p ----
-    restore()
-    zero_window()
-    for j in range(5):
-        decode_at(C + j, vt[j].view(1))
-    ref2 = read_slot(p + 2)   # state after 2 tokens (num_sampled=2)
-    ref5 = read_slot(p + 5)   # state after 5 tokens (wrap -> slot p)
-    print(f"\nreference: committed slot after 5 decodes = {int(pool.slots[TIDX])} (expect {(p+5)%D})")
+    rels = []
+    # case A: no crossing. C=100, num_sampled=3 -> swap R[0]<->R[2], baseline=R[2].
+    rels.append(run_case("no-cross swap", C=100, num_sampled=3)[0])
+    # case B: crossing, boundary token is the LAST accepted. C=126, num_sampled=2 ->
+    #         pin R[1]->page 1, baseline = page slot (early return, no swap).
+    rels.append(run_case("crossing, boundary-last", C=126, num_sampled=2)[0])
+    # case C: crossing, boundary token mid-window. C=125, num_sampled=4 ->
+    #         pin R[2]->page 1, refill R[2], swap R[0]<->R[3], baseline=R[3].
+    rels.append(run_case("crossing, boundary-mid", C=125, num_sampled=4)[0])
 
-    # ---- verify + rollback_to(2): slot (p+2) must hold "state after 2 tokens" ----
-    restore()
-    zero_window()
-    verify_window(vt)
-    pool.rollback_to([req], 2)
-    got2 = read_slot(int(pool.slots[TIDX]))
-    print(f"rollback_to(2): slot={int(pool.slots[TIDX])} (expect {(p+2)%D})")
-    r2 = cmp("num_sampled=2 vs direct-2", got2, ref2)
-
-    # ---- verify + rollback_to(5): wrap, slot (p+5)%5=p must hold "state after 5" ----
-    restore()
-    zero_window()
-    verify_window(vt)
-    pool.rollback_to([req], 5)
-    got5 = read_slot(int(pool.slots[TIDX]))
-    print(f"rollback_to(5): slot={int(pool.slots[TIDX])} (expect {(p+5)%D})")
-    r5 = cmp("num_sampled=5 vs direct-5", got5, ref5)
-
-    # ---- structural check: the rolled-back state is NOT the stale prefill baseline ----
-    restore()
-    verify_window(vt)
-    pool.rollback_to([req], 2)
-    g2 = read_slot(int(pool.slots[TIDX]))
-    b2 = read_slot(p)  # stale baseline
-    dc = (g2[0].float() - b2[0].float()).abs().max().item()
-    dr = (g2[1].float() - b2[1].float()).abs().max().item()
-    print(f"\nrollback(2) slot vs stale baseline slot p: conv|d|={dc:.4f} "
-          f"recurrent|d|={dr:.4f}  (>>0 => rollback is NOT pointing at stale baseline)")
-
-    # ---- pointer-arithmetic sanity: rollback_to must be idempotent on the commit ----
-    restore()
-    verify_window(vt)
-    pool.rollback_to([req], 3)
-    assert int(pool.slots[TIDX]) == (p + 3) % D
-    pool.rollback_to([req], 2)
-    assert int(pool.slots[TIDX]) == (p + 5) % D
-    print(f"\npointer arithmetic: rollback(3) -> {(p+3)%D}, then rollback(2) -> {(p+5)%D} OK")
-
-    ok = max(r2, r5) < 0.02  # bf16 ULP band for state content
-    print(f"\nROLLBACK: {'PASS' if ok else 'CHECK'} (max rel state diff {max(r2, r5):.2e}; "
-          f"pointer arithmetic exact)")
+    ok = max(rels) < 0.02  # bf16 ULP band (same tolerance as the old rollback test)
+    print(f"\nRESERVE COMMIT: {'PASS' if ok else 'CHECK'} "
+          f"(max rel state diff {max(rels):.2e})")
     torch.cuda.synchronize()
 
 

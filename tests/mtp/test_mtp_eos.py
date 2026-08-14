@@ -104,6 +104,21 @@ def main() -> None:
         json.dump(result, f)
     print(json.dumps(result))
 
+    # Pass/fail: a committed eos must end the stream exactly there (unless ignore_eos).
+    # n_emitted==max_tokens with the eos token somewhere in the stream but NOT at the end
+    # means the round committing the eos did not stop the request -- a real EOS bug.
+    # Note: the decode path fires its finished flag one position early (overlap advances
+    # the counters before the flag is computed), so fin_at may contain a trailing
+    # max_tokens-2 entry; only the LAST finished position must be max_tokens-1.
+    emitted_eos = eos_used in stream
+    if args.ignore_eos:
+        ok = len(stream) == args.max_tokens and fin_at and max(fin_at) == args.max_tokens - 1
+    else:
+        ok = not emitted_eos or result["stopped_at_eos"]
+    print(f"EOS TEST: {'PASS' if ok else 'FAIL'} (eos_in_stream={emitted_eos}, "
+          f"stopped_at_eos={result['stopped_at_eos']})")
+    sys.exit(0 if ok else 1)
+
 
 if __name__ == "__main__":
     main()

@@ -105,7 +105,7 @@ def main() -> None:
         print(f"  {names[u]:5s}: n={len(streams[u]):3d}  finished={'yes' if u in done else 'NO'}  "
               f"{'' if u != ABORT_UID else '(aborted)'}")
     print(f"integrity: {'PASS' if integrity_ok else 'FAIL'}  {integrity_msg}")
-    print(f"free_pages={len(sched.cache_manager.free_slots)}/{sched.cache_manager.num_pages}")
+    print(f"free_pages={len(sched.cache_manager.free_pages)}/{sched.cache_manager.num_pages}")
 
     aborted = len(streams[ABORT_UID])
     others_ok = all(u == ABORT_UID or (len(streams[u]) == MAX_TOKENS and u in done) for u in range(5))

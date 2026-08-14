@@ -66,7 +66,7 @@ class TestAllocateEvictPageAlignment:
 
         # Exhaust all free pages
         cm._allocate(num_pages)
-        assert len(cm.free_slots) == 0
+        assert len(cm.free_pages) == 0
 
         # Insert 2 pages worth of data into the cache (evictable)
         input_ids = torch.arange(page_size * 2, dtype=torch.int32)
@@ -75,9 +75,9 @@ class TestAllocateEvictPageAlignment:
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 1 page — triggers eviction
-        allocated = cm._allocate(1)
+        allocated = cm._allocate(1)[0]
         _assert_all_page_aligned(allocated, page_size, "allocated")
-        _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots after evict")
+        _assert_all_page_aligned(cm.free_pages, page_size, "_free_slots after evict")
 
     def test_consecutive_allocations_after_evict_no_overlap(self):
         """Multiple allocations after eviction must not produce overlapping pages."""
@@ -94,8 +94,8 @@ class TestAllocateEvictPageAlignment:
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 2 pages one by one
-        page_a = cm._allocate(1)
-        page_b = cm._allocate(1)
+        page_a = cm._allocate(1)[0]
+        page_b = cm._allocate(1)[0]
         all_pages = torch.cat([page_a, page_b])
 
         _assert_all_page_aligned(all_pages, page_size, "all_pages")
@@ -121,7 +121,7 @@ class TestAllocateEvictPageAlignment:
         cm._allocate(1)
 
         # All remaining free slots must be page-aligned
-        _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots")
+        _assert_all_page_aligned(cm.free_pages, page_size, "_free_slots")
 
     def test_allocate_exact_pages_needed_from_evict(self):
         """When exactly N pages are needed, eviction must provide at least N pages."""
@@ -139,7 +139,7 @@ class TestAllocateEvictPageAlignment:
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 2 pages at once — needs eviction of at least 2 pages
-        allocated = cm._allocate(2)
+        allocated = cm._allocate(2)[0]
         assert len(allocated) == 2
         _assert_all_page_aligned(allocated, page_size, "allocated")
         _assert_no_overlap(allocated, page_size)
@@ -158,7 +158,7 @@ class TestAllocateEvictPageAlignment:
         _insert_evictable(cm, input_ids, indices)
 
         # Allocate 2 pages via eviction
-        pages = cm._allocate(2)
+        pages = cm._allocate(2)[0]
         tokens = cm._page_to_token(pages)
 
         # Each page should expand to page_size consecutive tokens
@@ -175,7 +175,7 @@ class TestAllocateEvictPageAlignment:
         cm = _make_cache_manager(num_pages, page_size)
 
         # Allocate 2 pages (simulating a request using them)
-        pages_for_cache = cm._allocate(2)
+        pages_for_cache = cm._allocate(2)[0]
         # free_slots: 6 pages remaining
 
         # Insert those 2 pages into radix cache (simulating a finished request)
@@ -191,12 +191,12 @@ class TestAllocateEvictPageAlignment:
 
         # Now exhaust free slots and trigger eviction
         cm._allocate(6)
-        assert len(cm.free_slots) == 0
+        assert len(cm.free_pages) == 0
 
         # Allocate 1 more page — must evict from cache
-        allocated = cm._allocate(1)
+        allocated = cm._allocate(1)[0]
         _assert_all_page_aligned(allocated, page_size, "allocated after evict")
-        _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots after evict")
+        _assert_all_page_aligned(cm.free_pages, page_size, "_free_slots after evict")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,12 @@ class PrefillAdder:
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
             page_entry.copy_(handle.get_matched_indices())
+            # borrow the matched pages' linear-state slots (per page) instead of allocating
+            if (state_table := self.cache_manager.state_table) is not None:
+                matched_state = handle.get_matched_state_slots()
+                if matched_state is not None:
+                    ps = self.cache_manager.page_size
+                    state_table[table_idx, : cached_len // ps] = matched_state
 
         return handle, table_idx
 
@@ -157,11 +163,8 @@ class PrefillManager:
         if batch.is_prefill:
             for req in batch.reqs:
                 req.complete_to_device_len()
-            # each prefill chunk commits one linear-state snapshot (the layer wrote the
-            # post-chunk state to slot p+1); advance the ring pointer to it so the first
-            # verify round reads the right baseline. depth==1 (non-MTP) is a no-op.
-            if (pool := getattr(ctx, "linear_state", None)) is not None:
-                pool.rollback_to(batch.reqs, 1)
+            # the layer wrote each 64-chunk's boundary state directly into its page's
+            # state_table slot, so no pointer advance is needed here.
 
     @property
     def runnable(self) -> bool:

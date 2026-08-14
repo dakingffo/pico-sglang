@@ -55,6 +55,7 @@ def _chunk_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    chunk_state_callback=None,
 ):
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
@@ -124,6 +125,10 @@ def _chunk_gated_delta_rule(
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)
             @ v_new
         )
+        # per-chunk boundary state (used by the hybrid prefix cache to cache states at
+        # page boundaries). Only fires when the caller wants it.
+        if chunk_state_callback is not None:
+            chunk_state_callback(i, last_recurrent_state)
 
     if not output_final_state:
         last_recurrent_state = None
@@ -267,22 +272,18 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def _forward_prefill_one(
         self, x: torch.Tensor, req, pool, L: int
     ) -> torch.Tensor:
+        ctx = get_global_ctx()
+        state_table = ctx.state_table
+        page_size = ctx.page_size
         seq_len = x.shape[0]
         use_state = req.cached_len > 0
         table_idx = req.table_idx
-        # unified circular buffer: read the committed baseline from slot p, write the new
-        # committed state to slot (p+1). The pointer is advanced by the scheduler, NOT
-        # here: once per prefill batch (scheduler._forward's rollback_to) and by
-        # num_sampled at each verify commit. Every layer must read the same baseline slot p
-        # and write to the same slot (p+1), otherwise each layer's committed state lands in
-        # a different slot and decode/verify (which read slot p for all layers) observe the
-        # wrong baselines. depth==1 (non-MTP) short-circuits to slot 0 with no device
-        # access -> byte-identical to the single-depth pool.
-        if pool.depth == 1:
-            p = new_slot = 0
-        else:
-            p = int(pool.slots[table_idx])
-            new_slot = (p + 1) % pool.depth
+        C_start = req.cached_len
+        # baseline = the state at the last processed position of the page holding C_start-1.
+        # For a cache-hit prefill this is the borrowed tree slot; for a chunked continuation
+        # it is the previous chunk's terminal state, written to this page by that chunk.
+        if use_state:
+            baseline_slot = int(state_table[table_idx, (C_start - 1) // page_size])
 
         mixed_qkv = self.in_proj_qkv.forward(x).transpose(0, 1).unsqueeze(0)  # (1, conv_dim, seq)
         z = self.in_proj_z.forward(x).reshape(1, seq_len, -1, self.head_v_dim)
@@ -291,7 +292,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
         conv_in = mixed_qkv
         if use_state:
-            conv_in = torch.cat([pool.conv_state[L, p, table_idx].unsqueeze(0), conv_in], dim=-1)
+            conv_in = torch.cat(
+                [pool.conv_state[baseline_slot, L].unsqueeze(0), conv_in], dim=-1
+            )
         total_len = conv_in.shape[-1]
         new_conv_state = F.pad(conv_in, (self.state_len - total_len, 0))
         conv_out = F.silu(
@@ -301,7 +304,29 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             )
         )
         mixed_qkv = conv_out[:, :, :total_len][:, :, -seq_len:]
-        pool.conv_state[L, new_slot, table_idx].copy_(new_conv_state[0])
+
+        # Snapshot each 64-chunk's boundary state into its page's slot. Chunk and page
+        # boundaries are both multiples of 64, so the chunk boundary IS the page boundary
+        # (page_size > 64 just means consecutive chunks overwrite the same page slot, and
+        # the last one wins, which is the correct page-boundary state). The final chunk
+        # uses new_conv_state[0] (== the generic slice for the non-padded case) so a
+        # padded partial chunk still stores the state after the last real token.
+        n_chunks = (seq_len + 63) // 64
+
+        def chunk_state_cb(i: int, last_recurrent_state: torch.Tensor) -> None:
+            # clamp the final (possibly padded) chunk to the last real token so the
+            # snapshot lands in the last data page, never one page past it.
+            end_pos = min(C_start + (i + 1) * 64, C_start + seq_len)
+            page = (end_pos - 1) // page_size
+            slot = int(state_table[table_idx, page])
+            if i == n_chunks - 1:
+                conv_slice = new_conv_state[0]
+            elif use_state:
+                conv_slice = conv_in[0, :, (i + 1) * 64 : (i + 1) * 64 + self.state_len]
+            else:
+                conv_slice = conv_in[0, :, (i + 1) * 64 - self.state_len : (i + 1) * 64]
+            pool.conv_state[slot, L].copy_(conv_slice)
+            pool.recurrent_state[slot, L].copy_(last_recurrent_state[0])
 
         query, key, value = torch.split(mixed_qkv.transpose(1, 2), [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = query.reshape(1, seq_len, -1, self.head_k_dim)
@@ -314,16 +339,17 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # recurrent_state[L, p, table_idx] is (num_v_heads, head_k_dim, head_v_dim); the rule
-        # expects (batch_size, num_heads, k_head_dim, v_head_dim).
+        # recurrent_state[baseline_slot, L] is (num_v_heads, head_k_dim, head_v_dim); the
+        # rule expects (batch_size, num_heads, k_head_dim, v_head_dim).
         initial_state = (
-            pool.recurrent_state[L, p, table_idx].unsqueeze(0) if use_state else None
+            pool.recurrent_state[baseline_slot, L].unsqueeze(0) if use_state else None
         )
-        core_attn_out, last_state = _chunk_gated_delta_rule(
+        core_attn_out, _last_state = _chunk_gated_delta_rule(
             query, key, value, g=g, beta=beta,
             initial_state=initial_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
+            chunk_state_callback=chunk_state_cb,
         )
-        pool.recurrent_state[L, new_slot, table_idx].copy_(last_state[0])
+        # NOTE: the final chunk's boundary state was already written by the callback.
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -335,24 +361,34 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     ) -> torch.Tensor:
         """Spec-decode verify step: process a request's n_drafts+1 tokens
         [old_bonus, draft_0..draft_{n_drafts-1}] as a mini-prefill, writing each token's
-        post-state to circular slots so the scheduler can roll back by pointer arithmetic.
+        post-state to the reserve slots R[0..K] (indexed via the state_table tail columns).
 
-        Unlike prefill/decode this does NOT advance the committed slot pointer: the accept
-        boundary is set by VerifyManager via ``pool.rollback_to`` after rejection sampling.
-        The last snapshot may wrap onto the baseline slot p; that is safe because the
-        baseline is only read at round start. Math == n_drafts+1 decode rounds (per-token
-        recurrent rule), which test2 already equates to the chunked prefill rule.
+        The baseline (req.baseline_slot) may be a reserve slot (R[0] for rounds after the
+        first) that candidate 0 also writes to; that is safe because the baseline is only
+        read at round start, into locals, before any candidate write. Committing the
+        accepted boundary is done by the scheduler via pure index ops (no state copy).
+        Math == n_drafts+1 decode rounds (per-token recurrent rule), which test2 already
+        equates to the chunked prefill rule.
         """
         seq_len = x.shape[0]  # n_drafts + 1
         table_idx = req.table_idx
-        p = 0 if pool.depth == 1 else int(pool.slots[table_idx])
+        ctx = get_global_ctx()
+        state_table = ctx.state_table
+        rb = ctx.draft_state
+        assert rb is not None
+        baseline_slot = req.baseline_slot
+        reserve_slots = [
+            int(s) for s in state_table[table_idx, rb : rb + seq_len]
+        ]
 
         mixed_qkv = self.in_proj_qkv.forward(x).transpose(0, 1).unsqueeze(0)  # (1, conv_dim, seq)
         z = self.in_proj_z.forward(x).reshape(1, seq_len, -1, self.head_v_dim)
         b = self.in_proj_b.forward(x).unsqueeze(0)  # (1, seq, num_v_heads)
         a = self.in_proj_a.forward(x).unsqueeze(0)
 
-        conv_in = torch.cat([pool.conv_state[L, p, table_idx].unsqueeze(0), mixed_qkv], dim=-1)
+        conv_in = torch.cat(
+            [pool.conv_state[baseline_slot, L].unsqueeze(0), mixed_qkv], dim=-1
+        )
         total_len = conv_in.shape[-1]
         conv_out = F.silu(
             F.conv1d(
@@ -364,7 +400,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # conv_state after token j = the last state_len entries of [baseline | tokens 0..j]
         # = conv_in[:, :, j+1 : state_len+j+1]  (direct slice, no sequential conv).
         for j in range(seq_len):
-            pool.conv_state[L, (p + j + 1) % pool.depth, table_idx].copy_(
+            pool.conv_state[reserve_slots[j], L].copy_(
                 conv_in[0, :, j + 1 : self.state_len + j + 1]
             )
 
@@ -387,7 +423,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_attn_out = torch.empty(
             seq_len, self.num_v_heads, self.head_v_dim, device=x.device, dtype=x.dtype
         )
-        state = pool.recurrent_state[L, p, table_idx]
+        state = pool.recurrent_state[baseline_slot, L]
         for j in range(seq_len):
             out_j, state_j = _recurrent_gated_delta_rule(
                 query[:, j : j + 1], key[:, j : j + 1], value[:, j : j + 1],
@@ -397,7 +433,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             )
             state = state_j[0]  # (num_v_heads, k_dim, v_dim)
             core_attn_out[j] = out_j[0, 0]
-            pool.recurrent_state[L, (p + j + 1) % pool.depth, table_idx].copy_(state)
+            pool.recurrent_state[reserve_slots[j], L].copy_(state)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -405,11 +441,24 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         return self.out_proj.forward(core_attn_out).reshape(seq_len, -1)
 
     def _forward_decode(self, x: torch.Tensor, batch, pool, L: int) -> torch.Tensor:
+        ctx = get_global_ctx()
+        state_table = ctx.state_table
+        page_size = ctx.page_size
         bs = batch.size
         table_idxs = torch.tensor([r.table_idx for r in batch.reqs], device=x.device)
-        p_slots = pool.slots[table_idxs]  # (bs,) int32 [copy]
-        conv_state = pool.conv_state[L, p_slots, table_idxs]  # (bs, conv_dim, state_len) [copy]
-        recurrent_state = pool.recurrent_state[L, p_slots, table_idxs]
+        # At decode-forward time cached_len = device_len - 1 = the position being processed.
+        # Read the state after cached_len-1 (written by the previous forward / prefill
+        # chunk) and write the state after cached_len into the page the new token lands in.
+        read_pages = torch.tensor(
+            [(r.cached_len - 1) // page_size for r in batch.reqs], device=x.device
+        )
+        write_pages = torch.tensor(
+            [r.cached_len // page_size for r in batch.reqs], device=x.device
+        )
+        read_slots = state_table[table_idxs, read_pages]   # (bs,) int32 [copy]
+        write_slots = state_table[table_idxs, write_pages]
+        conv_state = pool.conv_state[read_slots, L]  # (bs, conv_dim, state_len) [copy]
+        recurrent_state = pool.recurrent_state[read_slots, L]
 
         mixed_qkv = self.in_proj_qkv.forward(x.unsqueeze(1)).transpose(1, 2)  # (bs, conv_dim, 1)
         z = self.in_proj_z.forward(x).reshape(bs, 1, -1, self.head_v_dim)
@@ -419,16 +468,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         mixed_qkv = _causal_conv1d_update(mixed_qkv, conv_state, self.conv1d.weight)
         # NOTE: pool[... , tensor_idx] is advanced indexing -> a COPY, so `.copy_()` on it
         # would never reach the pool. Write back per request with a scalar index (a view),
-        # exactly like the prefill path. As in prefill, the pointer is advanced by the
-        # scheduler (once per prefill batch; num_sampled at each verify commit), not per
-        # layer: all layers write their state to the same slot (p+1) so slot p holds every
-        # layer's state at the committed position.
-        if pool.depth == 1:
-            new_slots_list = [0] * bs
-        else:
-            new_slots_list = ((p_slots + 1) % pool.depth).tolist()
+        # exactly like the prefill path. The write page (hence slot) was allocated by the
+        # scheduler before this forward (allocate_state_pages).
+        new_slots_list = write_slots.tolist()
         for b_i, tidx in enumerate(table_idxs.tolist()):
-            pool.conv_state[L, new_slots_list[b_i], tidx].copy_(conv_state[b_i])
+            pool.conv_state[new_slots_list[b_i], L].copy_(conv_state[b_i])
 
         query, key, value = torch.split(mixed_qkv.transpose(1, 2), [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = query.reshape(bs, 1, -1, self.head_k_dim)
@@ -446,7 +490,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             initial_state=recurrent_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
         )
         for b_i, tidx in enumerate(table_idxs.tolist()):
-            pool.recurrent_state[L, new_slots_list[b_i], tidx].copy_(last_state[b_i])
+            pool.recurrent_state[new_slots_list[b_i], L].copy_(last_state[b_i])
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

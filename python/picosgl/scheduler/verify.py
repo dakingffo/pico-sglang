@@ -8,6 +8,7 @@ import torch
 from picosgl.engine import VerifyOutput, Sampler
 from picosgl.core import Batch, Request, Context
 from picosgl.message import DetokenizeMsg
+from picosgl.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
 
@@ -58,9 +59,13 @@ class VerifyManager(ARManagerBase):
             return None
         st = self._state_table.pop(req.table_idx, None)
         if st is not None and not st.scheduable:
-            # if the req is in-flight but aborted, free the draft tokens in the page table
             C, D = req.cached_len, req.device_len
-            self.cache_manager._free(self.page_table[req.table_idx, C:D])
+            ps = self.page_size
+            for page in range(div_ceil(C, ps), div_ceil(D, ps)):
+                p_start = page * ps
+                self.cache_manager._free(
+                    self.page_table[req.table_idx, p_start: p_start + ps]
+                )
         return req
 
     def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
@@ -75,6 +80,15 @@ class VerifyManager(ARManagerBase):
             carry_positions=list(range(C + 1 - window_len, C + 1)),
             carry_hidden=req_hidden[-window_len:].contiguous(),
         )
+        # MTP verify reserve: allocate the K+1 reserve slots once and set the baseline to
+        # the prefill terminal state (state after position C-1). Pure index bookkeeping.
+        if self.cache_manager.state_pool is not None:
+            begin = self.cache_manager.draft_state
+            slots = self.cache_manager._allocate(needed_states = self.num_spec_tokens + 1)[1]
+            self.cache_manager.state_table[req.table_idx, begin: begin + self.num_spec_tokens + 1] = slots
+            req.baseline_slot = int(
+                self.cache_manager.state_table[req.table_idx, (C - 1) // self.page_size]
+            )
         self.running_reqs[req.uid] = req
         self._state_table[req.table_idx] = st
 
@@ -130,7 +144,6 @@ class VerifyManager(ARManagerBase):
 
         extend_token = output.next_tokens_gpu  # (bs, K+1) int32
         full_hidden = output.full_hidden       # (sum of num_sampled, hidden)
-        pool = getattr(ctx, "linear_state", None)
         offset = 0
         committed: list[tuple[int, int, list[int], int]] = [tuple()] * len(batch.reqs)
 
@@ -158,8 +171,8 @@ class VerifyManager(ARManagerBase):
 
             req.device_len = C + 1
             req.complete_n(num_sampled)
-            if pool is not None:
-                pool.rollback_to([req], num_sampled)
+            # commit the accepted states: pure index ops on the reserve (pin/swap/refill)
+            self.cache_manager.state_commit_verify(req, C, num_sampled)
             self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
             self._update_carry(st, full_hidden, row_start, C, num_sampled)
             committed[i] = (C, num_sampled, sampled_token, n_drafts)
@@ -186,8 +199,15 @@ class VerifyManager(ARManagerBase):
                 req.append_host(torch.tensor(sampled_token, dtype=torch.int32))
 
                 if num_sampled <= n_drafts:
-                    suffix = self.page_table[req.table_idx, C + num_sampled: C + n_drafts + 1]
-                    self.cache_manager._free(suffix)
+                    ps = self.page_size
+                    C_end = C + num_sampled
+                    suffix_end = C + n_drafts + 1  # exclusive
+                    for page in range(C_end // ps, div_ceil(suffix_end, ps)):
+                        if C_end - 1 < page * ps:
+                            p_start = page * ps
+                            self.cache_manager._free(
+                                self.page_table[req.table_idx, p_start: p_start + ps]
+                            )
 
                 if finish and req not in self.finished_reqs:
                     self.remove_req(req)
