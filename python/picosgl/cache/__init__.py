@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from picosgl.utils import Registry
+from picosgl.distributed import DistributedInfo, try_get_tp_info
+from picosgl.utils import Registry, div_even
 
 if TYPE_CHECKING:    
     from picosgl.models import ModelConfig
@@ -17,6 +18,10 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+
+# Fallback when TP info is unset (unit tests build pools without an engine).
+_TP_DEFAULT = DistributedInfo(rank=0, size=1)
+
 
 class CacheManagerCreator(Protocol):
     def __call__(self, device: torch.device) -> BasePrefixCache: ...
@@ -44,15 +49,28 @@ def create_kvcache_pool(
         dtype=dtype,
     )
 
+def _local_linear_head_counts(model_config: ModelConfig) -> tuple[int, int]:
+    """Per-TP-rank linear-attention head counts. The loader shards in_proj/conv1d/
+    A_log/dt_bias column-parallel, so each rank's state pool and budget use the
+    LOCAL heads. Falls back to tp=1 when unset (unit tests)."""
+    tp_size = (try_get_tp_info() or _TP_DEFAULT).size
+    return (
+        div_even(model_config.linear_num_key_heads, tp_size),
+        div_even(model_config.linear_num_value_heads, tp_size),
+    )
+
+
 def linear_state_slot_bytes_for_config(model_config: ModelConfig, dtype: torch.dtype) -> int:
-    """Bytes of one state slot for a model, using the same conv_dim formula as the pool."""
+    """Bytes of one per-rank state slot for a model, using the same conv_dim formula
+    as the pool (local head counts under TP)."""
+    num_k_heads, num_v_heads = _local_linear_head_counts(model_config)
     conv_dim = (
-        model_config.linear_num_key_heads * model_config.linear_key_head_dim * 2
-        + model_config.linear_num_value_heads * model_config.linear_value_head_dim
+        num_k_heads * model_config.linear_key_head_dim * 2
+        + num_v_heads * model_config.linear_value_head_dim
     )
     per_layer = (
-        conv_dim * (model_config.linear_conv_kernel_dim - 1) 
-        + model_config.linear_num_value_heads * model_config.linear_key_head_dim * model_config.linear_value_head_dim
+        conv_dim * (model_config.linear_conv_kernel_dim - 1)
+        + num_v_heads * model_config.linear_key_head_dim * model_config.linear_value_head_dim
     )
     return model_config.num_linear_layers * per_layer * dtype.itemsize
 
@@ -63,16 +81,17 @@ def create_linear_state_pool(
     device         : torch.device,
     dtype          : torch.dtype,
 ) -> LinearStatePool:
+    num_k_heads, num_v_heads = _local_linear_head_counts(model_config)
     conv_dim = (
-        model_config.linear_num_key_heads * model_config.linear_key_head_dim * 2
-        + model_config.linear_num_value_heads * model_config.linear_value_head_dim
+        num_k_heads * model_config.linear_key_head_dim * 2
+        + num_v_heads * model_config.linear_value_head_dim
     )
     return LinearStatePool(
         num_slots=num_slots,
         num_linear_layers=model_config.num_linear_layers,
         conv_dim=conv_dim,
         kernel_size=model_config.linear_conv_kernel_dim,
-        num_v_heads=model_config.linear_num_value_heads,
+        num_v_heads=num_v_heads,
         head_k_dim=model_config.linear_key_head_dim,
         head_v_dim=model_config.linear_value_head_dim,
         device=device,

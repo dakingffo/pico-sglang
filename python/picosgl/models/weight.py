@@ -15,6 +15,7 @@ _SPLIT_DIM_0 = [
     # Qwen3.5 linear attention / MTP
     ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
     ".conv1d.weight",
+    ".A_log", ".dt_bias",  # per-value-head vectors, column-parallel like in_proj_b/a
 ]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj", ".out_proj", ".fc"]
 

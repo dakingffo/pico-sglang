@@ -5,13 +5,17 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from picosgl.core import get_global_ctx
+from picosgl.distributed import DistributedInfo, try_get_tp_info
 from picosgl.layers import BaseOP, LinearColParallelMerged, LinearRowParallel
-from picosgl.utils import nvtx_annotate
+from picosgl.utils import div_even, nvtx_annotate
 
 from .norm import Qwen3_5RMSNormGated
 
 if TYPE_CHECKING:
     from picosgl.models.config import ModelConfig
+
+# Fallback when TP info is unset (unit tests build layers without an engine).
+_TP_DEFAULT = DistributedInfo(rank=0, size=1)
 
 
 # =====================================================================================
@@ -210,8 +214,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(self, config: ModelConfig, linear_layer_idx: int):
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
-        self.num_k_heads = config.linear_num_key_heads
-        self.num_v_heads = config.linear_num_value_heads
+        # Linear-attention heads are column-parallel: each TP rank owns hidden_size/tp
+        # of the conv/KV dims, matching the loader's _SPLIT_DIM_0 sharding of
+        # in_proj_qkv / conv1d / A_log / dt_bias. Head counts and derived dims below are
+        # the LOCAL (per-rank) values; the projections are built with FULL sizes and
+        # shard internally (LinearColParallelMerged / LinearRowParallel).
+        tp_size = (try_get_tp_info() or _TP_DEFAULT).size
+        self.num_k_heads = div_even(config.linear_num_key_heads, tp_size)
+        self.num_v_heads = div_even(config.linear_num_value_heads, tp_size)
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = config.linear_conv_kernel_dim
@@ -224,19 +234,26 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # A_log / gated-norm weight are fp32 in the checkpoint (mamba_ssm_dtype=float32)
         self.A_log = torch.zeros(self.num_v_heads, dtype=torch.float32)
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
-        self.out_proj = LinearRowParallel(self.value_dim, config.hidden_size, has_bias=False)
+        self.out_proj = LinearRowParallel(
+            config.linear_num_value_heads * self.head_v_dim, config.hidden_size, has_bias=False
+        )
 
         self.in_proj_qkv = LinearColParallelMerged(
-            config.hidden_size, [self.key_dim * 2 + self.value_dim], has_bias=False
+            config.hidden_size,
+            [
+                config.linear_num_key_heads * self.head_k_dim * 2
+                + config.linear_num_value_heads * self.head_v_dim
+            ],
+            has_bias=False,
         )
         self.in_proj_z = LinearColParallelMerged(
-            config.hidden_size, [self.value_dim], has_bias=False
+            config.hidden_size, [config.linear_num_value_heads * self.head_v_dim], has_bias=False
         )
         self.in_proj_b = LinearColParallelMerged(
-            config.hidden_size, [self.num_v_heads], has_bias=False
+            config.hidden_size, [config.linear_num_value_heads], has_bias=False
         )
         self.in_proj_a = LinearColParallelMerged(
-            config.hidden_size, [self.num_v_heads], has_bias=False
+            config.hidden_size, [config.linear_num_value_heads], has_bias=False
         )
 
     @nvtx_annotate("GatedDeltaNet", layer_id_field="_linear_layer_idx")
