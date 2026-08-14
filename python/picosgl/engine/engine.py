@@ -26,6 +26,11 @@ from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
 
+# Smallest KV cache we will ever build. When the worst-case MTP state reserve is too
+# large to leave room for this many pages, the reserve is capped instead of refusing
+# to start (runtime eviction absorbs the deficit).
+_MIN_KV_PAGES = 2
+
 
 Indice2D : TypeAlias = tuple[torch.Tensor, torch.Tensor]
 
@@ -202,28 +207,42 @@ class Engine:
         )
         # For hybrid models every KV page also owns one linear-state slot, and each MTP
         # request additionally owns a K+1 slot reserve. Both are inside the memory budget.
-        state_slot_bytes = 0
         reserve_bytes = 0
+        reserve_state = 0
+        cache_per_state = 0
         if config.model_config.is_hybrid:
             cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
             reserve_per_req = config.num_spec_tokens + 1 if config.enable_mtp else 0
             reserve_state = config.max_running_req * reserve_per_req
             reserve_bytes = reserve_state * cache_per_state
-            
+
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             if config.model_config.is_hybrid:
+                # The K+1 verify reserve is a worst case (max_running_req concurrent MTP
+                # requests). Cap it so it can never starve the KV cache below MIN_KV_PAGES;
+                # if more requests verify concurrently than slots were reserved, runtime
+                # eviction frees page state slots to absorb the deficit.
+                min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
+                reserve_state = min(
+                    reserve_state,
+                    max(0, (available_memory - min_pages_bytes) // cache_per_state),
+                )
+                reserve_bytes = reserve_state * cache_per_state
                 available_memory -= reserve_bytes
-                num_pages = available_memory // (cache_per_page + cache_per_state)
+                num_pages = max(
+                    _MIN_KV_PAGES,
+                    available_memory // (cache_per_page + cache_per_state),
+                )
             else:
                 num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, (
             "Not enough memory for KV cache, try reducing --num-pages. "
-            f"(hybrid: cache_per_page={mem_GB(cache_per_page)}, state_slot_bytes="
-            f"{mem_GB(state_slot_bytes)}, reserve_bytes={mem_GB(reserve_bytes)})"
+            f"(hybrid: cache_per_page={mem_GB(cache_per_page)}, cache_per_state="
+            f"{mem_GB(cache_per_state)}, reserve_bytes={mem_GB(reserve_bytes)})"
         )
         num_tokens = num_pages * config.page_size
         logger.info(f"Allocating {num_tokens} tokens for KV cache,\
@@ -231,8 +250,8 @@ class Engine:
         if config.model_config.is_hybrid:
             reserve_per_req = config.num_spec_tokens + 1 if config.enable_mtp else 0
             logger.info(
-                f"Allocating {num_pages + config.max_running_req * reserve_per_req}"
-                f" linear state slots = {mem_GB(num_pages * state_slot_bytes + reserve_bytes)}"
+                f"Allocating {num_pages + reserve_state}"
+                f" linear state slots = {mem_GB(num_pages * cache_per_state + reserve_bytes)}"
             )
             return num_pages, num_tokens, num_pages + reserve_state
         else:
