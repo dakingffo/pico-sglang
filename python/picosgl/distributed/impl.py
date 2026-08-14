@@ -62,18 +62,21 @@ class DistributedCommunicator:
 
 
 def enable_pynccl_distributed(
-    tp_info     : DistributedInfo, 
+    tp_info     : DistributedInfo,
     tp_cpu_group: dist.ProcessGroup,
     max_bytes   : int
 ) -> None:
     from picosgl.kernel import init_pynccl
 
-    DistributedCommunicator.impl = init_pynccl(
+    # Wrap the raw PyNCCL FFI object so its all_reduce(x, "sum") signature matches the
+    # DistributedImpl protocol (callers invoke impl.all_reduce(x)).
+    comm = init_pynccl(
         tp_rank=tp_info.rank,
         tp_size=tp_info.size,
         tp_cpu_group=tp_cpu_group,
         max_size_bytes=max_bytes,
     )
+    DistributedCommunicator.impl = PyNCCLDistributedImpl(comm=comm)
 
 
 def destroy_distributed() -> None:
