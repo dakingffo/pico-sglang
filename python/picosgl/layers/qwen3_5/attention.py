@@ -5,14 +5,18 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from picosgl.core import get_global_ctx
+from picosgl.distributed import DistributedInfo, try_get_tp_info
 from picosgl.layers import BaseOP, LinearColParallelMerged, LinearRowParallel
-from picosgl.utils import nvtx_annotate
+from picosgl.utils import div_even, nvtx_annotate
 
 from .norm import Qwen3_5RMSNorm
 from .rotary import Qwen3_5RotaryEmbedding
 
 if TYPE_CHECKING:
     from picosgl.models.config import ModelConfig
+
+# Fallback when TP info is unset (unit tests build layers without an engine).
+_TP_DEFAULT = DistributedInfo(rank=0, size=1)
 
 
 class Qwen3_5Attention(BaseOP):
@@ -24,23 +28,27 @@ class Qwen3_5Attention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, paged: bool = True):
         self.head_dim = config.head_dim
-        self.num_qo_heads = config.num_qo_heads
-        self.num_kv_heads = config.num_kv_heads
+        # Projections are column/row-parallel, so per-rank head counts are the sharded
+        # ones (forward reshapes use these) while projections get the FULL sizes and
+        # shard internally (LinearColParallelMerged/LinearRowParallel).
+        tp_size = (try_get_tp_info() or _TP_DEFAULT).size
+        self.num_qo_heads = div_even(config.num_qo_heads, tp_size)
+        self.num_kv_heads = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
         self.scaling = self.head_dim**-0.5
         self._layer_id = layer_id
         self.paged = paged
 
         self.q_proj = LinearColParallelMerged(
-            config.hidden_size, [self.num_qo_heads * self.head_dim * 2], has_bias=False
+            config.hidden_size, [config.num_qo_heads * self.head_dim * 2], has_bias=False
         )
         self.k_proj = LinearColParallelMerged(
-            config.hidden_size, [self.num_kv_heads * self.head_dim], has_bias=False
+            config.hidden_size, [config.num_kv_heads * self.head_dim], has_bias=False
         )
         self.v_proj = LinearColParallelMerged(
-            config.hidden_size, [self.num_kv_heads * self.head_dim], has_bias=False
+            config.hidden_size, [config.num_kv_heads * self.head_dim], has_bias=False
         )
         self.o_proj = LinearRowParallel(
-            self.num_qo_heads * self.head_dim, config.hidden_size, has_bias=False
+            config.num_qo_heads * self.head_dim, config.hidden_size, has_bias=False
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
