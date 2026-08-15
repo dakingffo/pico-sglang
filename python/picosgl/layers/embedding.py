@@ -101,7 +101,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        if bs == 1 and input_shape[0] == 1:
+            # single-token decode fast path; only valid when the gather input really is
+            # one row per rank (an MTP verify batch is bs==1 but T = n_drafts+1 rows, so
+            # it must fall through to the general reshape below)
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
