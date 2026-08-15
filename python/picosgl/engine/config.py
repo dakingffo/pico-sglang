@@ -19,12 +19,12 @@ class EngineConfig:
     model_path          : str
     tp_info             : DistributedInfo
     dtype               : torch.dtype
-    max_running_req     : int              = 256
+    max_running_req     : int              = 128
     attention_backend   : str              = "auto"
     moe_backend         : str              = "auto"
     cuda_graph_bs       : list[int] | None = None
     cuda_graph_max_bs   : int | None       = None
-    page_size           : int              = 1
+    page_size           : int              = 128
     memory_ratio        : float            = 0.85
     distributed_timeout : float            = 60.0
     use_dummy_weight    : bool             = False
