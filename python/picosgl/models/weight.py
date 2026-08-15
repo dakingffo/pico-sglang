@@ -16,8 +16,11 @@ _SPLIT_DIM_0 = [
     ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
     ".conv1d.weight",
     ".A_log", ".dt_bias",  # per-value-head vectors, column-parallel like in_proj_b/a
+    # MTP fusion fc takes the FULL cat([embedding; hidden]) input, so it is
+    # column-parallel (output-split) — see LinearColumnParallel.
+    ".fc",
 ]
-_SPLIT_DIM_1 = [".o_proj", ".down_proj", ".out_proj", ".fc"]
+_SPLIT_DIM_1 = [".o_proj", ".down_proj", ".out_proj"]
 
 # Merge groups: individual projections -> fused projection
 _MERGE_GROUPS = {

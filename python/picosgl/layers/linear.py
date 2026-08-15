@@ -125,3 +125,31 @@ class LinearRowParallel(_LinearTPImpl):
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
+
+
+class LinearColumnParallel(_LinearTPImpl):
+    """Column-parallel (output-split) linear with an all-reduce on the output.
+
+    Takes the FULL input width (LinearRowParallel instead expects the per-rank input
+    shard) and emits the FULL output after all-reduce. Used where the input is a
+    concatenation of full-width tensors that cannot be sharded per-rank, e.g. the
+    MTP fusion fc over [embedding; hidden]."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        has_bias: bool,
+    ):
+        tp_info = get_tp_info()
+        local_input_size = input_size
+        local_output_size = div_even(output_size, tp_info.size)
+        self._comm = DistributedCommunicator()
+        self._tp_size = tp_info.size
+        super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.linear(x, self.weight, self.bias)
+        if self._tp_size > 1:
+            y = self._comm.all_reduce(y)
+        return y

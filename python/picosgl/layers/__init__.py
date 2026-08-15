@@ -4,6 +4,7 @@ from .base import BaseOP, OPList, StateLessOP
 from .embedding import ParallelLMHead, VocabParallelEmbedding
 from .linear import (
     LinearColParallelMerged,
+    LinearColumnParallel,
     LinearOProj,
     LinearQKVMerged,
     LinearReplicated,
@@ -23,6 +24,7 @@ __all__ = [
     "VocabParallelEmbedding",
     "ParallelLMHead",
     "LinearColParallelMerged",
+    "LinearColumnParallel",
     "LinearRowParallel",
     "LinearOProj",
     "LinearQKVMerged",

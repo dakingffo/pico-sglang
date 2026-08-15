@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from picosgl.core import get_global_ctx
 from picosgl.layers import (
     BaseOP,
-    LinearRowParallel,
+    LinearColumnParallel,
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -57,7 +57,10 @@ class Qwen3_5MultiTokenPredictor(BaseOP):
     def __init__(self, config: ModelConfig, embed_tokens, lm_head):
         self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fc = LinearRowParallel(config.hidden_size * 2, config.hidden_size, has_bias=False)
+        # Input is the cat([embedding; hidden]) — full width on every rank — so the
+        # fc must be output-split (LinearColumnParallel) and all-reduce back to full
+        # hidden. LinearRowParallel would expect a per-rank input shard and break at tp>1.
+        self.fc = LinearColumnParallel(config.hidden_size * 2, config.hidden_size, has_bias=False)
         self.layers = OPList(
             [
                 Qwen3_5DecoderLayer(
@@ -84,9 +87,24 @@ class Qwen3_5MultiTokenPredictor(BaseOP):
         return self.norm.forward(h)
 
     def get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project MTP output to vocab logits via the shared lm_head."""
+        """Project MTP output to vocab logits via the shared lm_head.
+
+        The lm_head is vocab-parallel (each rank holds vocab/tp rows), so the per-rank
+        logits must be all-gathered into full-vocab logits before the draft argmax /
+        p_draft (draft_probs is sized to the full vocab). Mirrors ParallelLMHead.forward
+        but standalone: draft runs outside a forward batch, so it must not read ctx.batch.
+        """
         module = self._lm_head.tied_embedding or self._lm_head
-        return F.linear(hidden_states, module.weight, self._lm_head.bias)
+        logits = F.linear(hidden_states, module.weight, self._lm_head.bias)
+        if self._lm_head.tp_size > 1:
+            input_shape = logits.shape
+            gathered = self._lm_head._comm.all_gather(logits)
+            gathered = gathered.view((self._lm_head.tp_size,) + input_shape)
+            gathered = gathered.permute(1, 0, 2).contiguous()
+            logits = gathered.reshape(
+                input_shape[:1] + (self._lm_head.tp_size * input_shape[1],)
+            )[:, : module.num_embeddings]
+        return logits
 
     def draft(self, input_ids, positions, hidden_states, past_kv=None):
         """Single MTP draft step, returns (next_token, logits, hidden, kv).
