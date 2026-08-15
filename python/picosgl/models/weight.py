@@ -40,8 +40,27 @@ _SLOT_NAMES = {
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
 
-def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
-    """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+def _shard_tensor(
+    key: str,
+    value: torch.Tensor,
+    r: int,
+    n: int,
+    num_kv_heads: int,
+    qkv_regions: tuple[int, int, int] | None = None,
+):
+    """Extract rank r's shard from a single tensor. Returns a contiguous copy.
+
+    ``qkv_regions`` = (q_rows, k_rows, v_rows) for the fused linear-attention
+    ``in_proj_qkv`` = [q; k; v] (regions of different sizes). A naive dim-0 chunk puts the
+    chunk boundary inside a region and makes the layer's local [q;k;v] split mix regions,
+    so each region is chunked by head count independently and the local halves re-concat.
+    """
+    if qkv_regions is not None and (key.count(".in_proj_qkv") or key.count(".conv1d.weight")):
+        q_rows, k_rows, v_rows = qkv_regions
+        q, k, v = torch.split(value, [q_rows, k_rows, v_rows], dim=0)
+        return torch.cat(
+            [q.chunk(n, 0)[r], k.chunk(n, 0)[r], v.chunk(n, 0)[r]], dim=0
+        ).clone()
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
@@ -92,6 +111,15 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
 
+    # Fused linear-attention in_proj_qkv = [q; k; v] with different region sizes; naive
+    # dim-0 sharding would put the tp chunk boundary inside a region. Compute the region
+    # sizes so _shard_tensor can shard each by head count.
+    qkv_regions = None
+    if config.is_hybrid and config.linear_num_key_heads:
+        qk = config.linear_num_key_heads * config.linear_key_head_dim
+        v = config.linear_num_value_heads * config.linear_value_head_dim
+        qkv_regions = (qk, qk, v)
+
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
@@ -105,7 +133,9 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 name = name.removeprefix("language_model.")
                 # Qwen3.5: text weights live under model.language_model.*, strip the middle prefix
                 name = name.replace("model.language_model.", "model.", 1)
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                tensor = _shard_tensor(
+                    name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, qkv_regions
+                )
                 del raw
 
                 if config.is_hybrid or (info := _get_merge_info(name)) is None:
