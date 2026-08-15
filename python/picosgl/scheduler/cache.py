@@ -185,7 +185,13 @@ class CacheManager:
             j_b = B - 1 - C  # candidate index of the boundary token (<= num_sampled - 1)
             old = int(self.state_table[uid, P])
             self.state_table[uid, P] = int(self.state_table[uid, begin + j_b])
-            self.free_states = torch.cat([self.free_states, torch.tensor([old], dtype=torch.int32, device=self.device)])
+            # `old` is page P's previous checkpoint. It is a valid slot only for the page
+            # that carried the prefill-end live slot; for every later page the slot is
+            # never allocated between commits (the live state lives in R[0]), so
+            # state_table[uid, P] is -1. Never push -1 into free_states -- it breaks the
+            # free_state + tree_state == num_states invariant.
+            if old >= 0:
+                self.free_states = torch.cat([self.free_states, torch.tensor([old], dtype=torch.int32, device=self.device)])
             self.state_table[uid, begin + j_b] = int(self.free_states[0])
             self.free_states = self.free_states[1:]
             if j_b == num_sampled - 1:
