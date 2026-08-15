@@ -128,12 +128,13 @@ class LinearRowParallel(_LinearTPImpl):
 
 
 class LinearColumnParallel(_LinearTPImpl):
-    """Column-parallel (output-split) linear with an all-reduce on the output.
+    """Column-parallel (output-split) linear with an all-gather on the output.
 
     Takes the FULL input width (LinearRowParallel instead expects the per-rank input
-    shard) and emits the FULL output after all-reduce. Used where the input is a
-    concatenation of full-width tensors that cannot be sharded per-rank, e.g. the
-    MTP fusion fc over [embedding; hidden]."""
+    shard) and emits the FULL output. Each rank computes a DISJOINT out/tp slice of
+    the output rows, so the full output is the all-gathered concatenation (not an
+    all-reduce sum). Used where the input is a concatenation of full-width tensors
+    that cannot be sharded per-rank, e.g. the MTP fusion fc over [embedding; hidden]."""
 
     def __init__(
         self,
@@ -151,5 +152,10 @@ class LinearColumnParallel(_LinearTPImpl):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
-            y = self._comm.all_reduce(y)
+            # all_gather concatenates the per-rank output slices along dim 0
+            # (rank-contiguous): (T*tp, out/tp) -> view(tp, T, out/tp) -> (T, out).
+            gathered = self._comm.all_gather(y)
+            gathered = gathered.view((self._tp_size,) + y.shape)
+            gathered = gathered.permute(1, 0, 2).contiguous()
+            y = gathered.reshape(y.shape[:1] + (self._tp_size * y.shape[1],))
         return y
