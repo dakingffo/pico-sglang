@@ -393,7 +393,7 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_hybrid:
         if getattr(config, "cache_type", "radix") != "hybrid_radix":
             override("cache_type", "hybrid_radix")
-            logger.warning_rank0("Prefix cache set to hybrid_radix for hybrid (linear attention) model.")
+            logger.info_rank0("Prefix cache set to hybrid_radix for hybrid (linear attention) model.")
         if config.page_size % 64 != 0:
             original_page_size = config.page_size
             override("page_size", 64)
