@@ -4,6 +4,7 @@ from typing import NoReturn
 
 import torch
 
+from picosgl.core import Request
 from picosgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -11,7 +12,7 @@ from picosgl.message import (
     ExitMsg,
     UserMsg,
 )
-from picosgl.utils import init_logger, load_tokenizer
+from picosgl.utils import init_logger, load_tokenizer, div_ceil
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
 from .ar import ForwardInput
@@ -108,8 +109,10 @@ class Scheduler(SchedulerIOMixin):
             return
         last_input, last_output = last_data
         last_output.copy_done_event.synchronize()
-        reply = self.ar_manager.process(self.engine.ctx, last_input, last_output)
+        reply, finished_reqs = self.ar_manager.process(self.engine.ctx, last_input, last_output)
         self.send_result(reply)
+        for req in finished_reqs:
+            self._free_req_resources(req)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -134,15 +137,29 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = (
-                self.prefill_manager.abort_req(msg.uid)
-                or self.ar_manager.abort_req(msg.uid)
-            )
-            if req_to_free is not None:
-                self.ar_manager._free_req_resources(self.engine.ctx, req_to_free)
+            req: Request
+            inflight: bool
+            req, inflight = self.prefill_manager.abort_req(msg.uid)
+            if req is None:
+                req, inflight = self.ar_manager.abort_req(msg.uid)
+            if req is not None:
+                self._free_req_resources(req, inflight)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
+
+    def _free_req_resources(self, req: Request, inflight: bool = False) -> None:
+        if inflight: # The inflight aborted req has been allocated at [cached_len, device_len)
+            C, D = req.cached_len, req.device_len
+            ps = self.cache_manager.page_size
+            for page in range(div_ceil(C, ps), div_ceil(D, ps)):
+                p_start = page * ps
+                tid = req.table_idx
+                self.cache_manager._free(
+                    self.table_manager.page_table[tid, p_start: p_start + ps]
+                )
+        self.table_manager.free(req.table_idx)
+        self.cache_manager.cache_req(req, finished=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         batch = (

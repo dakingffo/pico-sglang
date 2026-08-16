@@ -41,6 +41,7 @@ class VerifyManager(ARManagerBase):
         window_size    : int = 128,
     ) -> None:
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
+        self.page_table = table_manager.page_table
         self.num_spec_tokens = num_spec_tokens
         self.window_size = window_size
         self.sampler = sampler
@@ -48,22 +49,16 @@ class VerifyManager(ARManagerBase):
         self.vocab_size = self.sampler.vocab_size
         self._state_table: dict[int, VerifyState] = {}
 
-    def abort_req(self, uid: int) -> Request | None:
+    def abort_req(self, uid: int) -> tuple[Request | None, bool]:
         inflight: bool = uid in self.inflight_uids[1]
         self.inflight_uids[1].discard(uid)
         req = self.running_reqs.pop(uid, None)
         if req is None:
-            return None
-        self._state_table.pop(req.table_idx, None)
-        if inflight:
-            C, D = req.cached_len, req.device_len
-            ps = self.page_size
-            for page in range(div_ceil(C, ps), div_ceil(D, ps)):
-                p_start = page * ps
-                self.cache_manager._free(
-                    self.page_table[req.table_idx, p_start: p_start + ps]
-                )
-        return req
+            return None, False
+        else:
+            req.aborted = True
+            self._state_table.pop(req.table_idx, None)
+            return req, inflight
 
     def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
         req_hidden = full_hidden[mapping == req.table_idx]
@@ -92,15 +87,15 @@ class VerifyManager(ARManagerBase):
         K = self.num_spec_tokens
 
         self.inflight_uids[0] = self.inflight_uids[1]
-        self.inflight_uids[1] = []
+        self.inflight_uids[1] = set()
 
         scheduled_token = 0
         reqs = []
         for uid, req in self.running_reqs.items():
             if scheduled_token >= self.token_budget:
                 break
-            elif uid not in self.inflight_uids[0]: 
-                self.inflight_uids[1].append(uid)
+            elif uid not in self.inflight_uids[0]:
+                self.inflight_uids[1].add(uid)
                 reqs.append(req)
                 scheduled_token += K
                 st = self._state_table[req.table_idx]
@@ -140,7 +135,7 @@ class VerifyManager(ARManagerBase):
         ctx          : Context,
         forward_input: ForwardInput,
         output       : VerifyOutput
-    ) -> list[DetokenizeMsg]:
+    ) -> tuple[list[DetokenizeMsg], list[Request]]:
         batch = forward_input.batch
         if not batch.is_verify:
             return super().process(ctx, forward_input, output)  # prefill commit
@@ -213,12 +208,11 @@ class VerifyManager(ARManagerBase):
 
                 if finish and req not in self.finished_reqs:
                     self._finish_req(req)
-                    self._free_req_resources(ctx, req)
                     new_finished.add(req)
 
-        self.inflight_uids[0] = []
+        self.inflight_uids[0] = set()
         self.finished_reqs = new_finished
-        return reply
+        return reply, new_finished
 
     def _finish_req(self, req: Request) -> None:
         self.running_reqs.pop(req.uid, None)

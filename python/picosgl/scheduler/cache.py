@@ -9,7 +9,7 @@ from picosgl.cache import BaseCacheHandle, MatchResult, create_prefix_cache
 from picosgl.utils import align_down, div_ceil
 
 if TYPE_CHECKING:
-    from .utils import PendingRequest
+    from .prefill import PendingRequest
 
 
 class CacheManager:

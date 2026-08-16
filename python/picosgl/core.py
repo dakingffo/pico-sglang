@@ -37,6 +37,7 @@ class Request:
     device_len     : int = field(init=False)
     max_device_len : int = field(init=False)
     baseline_slot  : int = field(default=-1, init=False)  # for verify
+    aborted        : bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -67,7 +68,7 @@ class Request:
 
     @property
     def can_decode(self) -> bool:
-        return self.remain_len > 0
+        return self.remain_len > 0 and not self.aborted
 
     def __repr__(self) -> str:
         return (

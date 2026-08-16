@@ -135,11 +135,11 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
         orig_process = sched.verify_manager.process
 
         def rec_process(ctx, batch, output):
-            reply = orig_process(ctx, batch, output)
+            reply, finished = orig_process(ctx, batch, output)
             for msg in reply:
                 if isinstance(msg.next_token, list):
                     hist.append((msg.uid, len(msg.next_token)))
-            return reply
+            return reply, finished
 
         sched.verify_manager.process = rec_process
 

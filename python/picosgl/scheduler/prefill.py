@@ -5,10 +5,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.core import Batch, Context, Request, ChunkedRequest
+from picosgl.core import (
+    SamplingParams, 
+    Request, 
+    ChunkedRequest, 
+    Batch, 
+    Context 
+)
 from picosgl.utils import init_logger
 
-from .utils import PendingRequest
 from .ar import ForwardInput, ForwardOutput
 
 if TYPE_CHECKING:
@@ -21,6 +26,22 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass
+class PendingRequest:
+    uid            : int
+    input_ids      : torch.Tensor
+    sampling_params: SamplingParams
+    chunked_req    : ChunkedRequest | None = None
+
+    @property
+    def input_len(self) -> int:
+        return len(self.input_ids)
+
+    @property
+    def output_len(self) -> int:
+        return self.sampling_params.max_tokens
+
+    
 @dataclass
 class PrefillAdder:
     token_budget : int
@@ -120,11 +141,13 @@ class PrefillManager:
     ):
         self.token_pool = token_pool
         self.pending_list: list[PendingRequest] = []
+        self.inflight_reqs: dict[int, Request] = dict()
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingRequest(req.uid, req.input_ids, req.sampling_params))
 
     def schedule_next_batch(self, adder: PrefillAdder) -> Batch | None:
+        self.inflight_reqs.clear()
         if len(self.pending_list) == 0:
             return None
 
@@ -137,6 +160,7 @@ class PrefillManager:
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
+                self.inflight_reqs[req.uid] = req
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:
@@ -144,12 +168,21 @@ class PrefillManager:
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
-    def abort_req(self, uid: int) -> Request | None:
+    def abort_req(self, uid: int) -> tuple[Request | None, bool]:
+        # check ChunkedRequest
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
-                return req.chunked_req
-        return None
+                inflight_req = self.inflight_reqs.pop(uid, None)
+                if inflight_req is not None:
+                    inflight_req.aborted = True
+                return req.chunked_req, inflight_req is not None
+            
+        # check Request
+        inflight_req = self.inflight_reqs.pop(uid, None)
+        if inflight_req is not None:
+            inflight_req.aborted = True
+        return inflight_req, inflight_req is not None
 
     def advance_for_next_schedule(
         self,
