@@ -65,7 +65,7 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool)
-        self.prefill_budget = config.max_extend_tokens
+        self.prefill_budget = config.max_prefill_length
 
 
     def run_when_idle(self) -> None:
@@ -149,7 +149,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(
                 PrefillAdder(
                     token_budget=self.prefill_budget,
-                    reserved_size=self.ar_manager.inflight_tokens,
+                    reserved_size=self.ar_manager.need_tokens,
                     cache_manager=self.cache_manager,
                     table_manager=self.table_manager,
                 )
@@ -165,5 +165,4 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager.advance_for_next_schedule(
             self.engine.ctx, forward_input, forward_output
         )
-        self.ar_manager.advance_for_next_schedule(forward_input)
         return forward_output

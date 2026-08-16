@@ -2,24 +2,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from picosgl.core import Batch, ChunkedRequest
+from picosgl.core import Batch
 
 from .ar import ARManagerBase
-
-if TYPE_CHECKING:
-    from .ar import ForwardInput
 
 
 class DecodeManager(ARManagerBase):
     def schedule_next_batch(self) -> Batch | None:
-        if not self.runnable:
+        self.inflight_uids[0] = self.inflight_uids[1]
+        self.inflight_uids[1] = []
+    
+        scheduled_token = 0
+        reqs = []
+        for uid, req in self.running_reqs.items():
+            if scheduled_token >= self.token_budget:
+                break
+            elif uid not in self.inflight_uids[0]:
+                self.inflight_uids[1].append(uid)
+                reqs.append(req)
+                scheduled_token += 1
+
+        if reqs:
+            return Batch(reqs=reqs, phase="decode")
+        else:
             return None
-
-        return Batch(reqs=sorted(self.running_reqs.values()), phase="decode")
-
-    def advance_for_next_schedule(self, forward_input: ForwardInput) -> None:
-        batch = forward_input.batch
-        for req in batch.reqs:
-            if isinstance(req, ChunkedRequest):
-                continue
-            req.complete_n(1)

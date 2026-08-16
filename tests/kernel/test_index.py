@@ -3,7 +3,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from picosgl.benchmark.perf import compare_memory_kernel_perf
+from perf import compare_memory_kernel_perf
 from picosgl.kernel import indexing
 from picosgl.utils import call_if_main, init_logger
 

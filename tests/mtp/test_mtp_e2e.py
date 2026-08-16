@@ -206,10 +206,10 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
     idle = 0
     for _ in range(5000):
         # Terminate only when the loop goes truly idle: no batch scheduled (data is
-        # None) AND every running manager is empty. Breaking on the first `finished`
-        # DetokenizeMsg is NOT enough -- the non-MTP path's finished flag fires one
-        # position early (overlap advances the counters before the flag is computed),
-        # so a break-on-fin would truncate its stream one token short.
+        # None) AND every running manager is empty. Drain-until-idle is deliberately
+        # stronger than break-on-finished: it collects every sampled DetokenizeMsg even
+        # if a finished flag were mis-timed (historically the non-MTP path fired it one
+        # position early; now DecodeManager snapshots it at complete_n time).
         if data is None and not (
             sched.prefill_manager.runnable
             or sched.decode_manager.runnable

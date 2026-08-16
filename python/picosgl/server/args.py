@@ -127,11 +127,22 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
 
     parser.add_argument(
         "--max-prefill-length",
-        "--max-extend-length",
         type=int,
-        dest="max_extend_tokens",
-        default=ServerArgs.max_extend_tokens,
+        dest="max_prefill_length",
+        default=ServerArgs.max_prefill_length,
         help="Chunk Prefill maximum chunk size in tokens.",
+    )
+
+    parser.add_argument(
+        "--max-decode-length",
+        type=int,
+        dest="max_decode_length",
+        default=None,
+        help=(
+            "Max total tokens (positions) in a single decode/verify batch. "
+            "Default: max_running_req // 2, scaled by --num-spec-tokens when "
+            "--enable-mtp is set (each verify req occupies num_spec_tokens+1 positions)."
+        ),
     )
 
     parser.add_argument(
@@ -212,6 +223,13 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
+
+    # resolve the auto --max-decode-length default (token budget, not a req count)
+    if kwargs["max_decode_length"] is None:
+        base = max(1, kwargs["max_running_req"] // 2)
+        kwargs["max_decode_length"] = (
+            base * kwargs["num_spec_tokens"] if kwargs["enable_mtp"] else base
+        )
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])

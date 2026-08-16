@@ -163,8 +163,6 @@ class PrefillManager:
         if batch.is_prefill:
             for req in batch.reqs:
                 req.complete_to_device_len()
-            # the layer wrote each 64-chunk's boundary state directly into its page's
-            # state_table slot, so no pointer advance is needed here.
 
     @property
     def runnable(self) -> bool:

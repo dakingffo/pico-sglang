@@ -25,7 +25,6 @@ class VerifyState:
     carry_positions  : list[int]
     carry_hidden     : torch.Tensor  # (window_len, hidden) main-model hidden, leading-token
     mtp_kv           : tuple[torch.Tensor, torch.Tensor] | None = None
-    scheduable       : bool = True
 
 
 class VerifyManager(ARManagerBase):
@@ -49,16 +48,14 @@ class VerifyManager(ARManagerBase):
         self.vocab_size = self.sampler.vocab_size
         self._state_table: dict[int, VerifyState] = {}
 
-    def remove_req(self, req: Request) -> None:
-        self.running_reqs.pop(req.uid, None)
-        self._state_table.pop(req.table_idx, None)
-
     def abort_req(self, uid: int) -> Request | None:
+        inflight: bool = uid in self.inflight_uids[1]
+        self.inflight_uids[1].discard(uid)
         req = self.running_reqs.pop(uid, None)
         if req is None:
             return None
-        st = self._state_table.pop(req.table_idx, None)
-        if st is not None and not st.scheduable:
+        self._state_table.pop(req.table_idx, None)
+        if inflight:
             C, D = req.cached_len, req.device_len
             ps = self.page_size
             for page in range(div_ceil(C, ps), div_ceil(D, ps)):
@@ -69,7 +66,6 @@ class VerifyManager(ARManagerBase):
         return req
 
     def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
-        req.complete_n(1) # prefill done, add the bonus token
         req_hidden = full_hidden[mapping == req.table_idx]
         C = req.cached_len
         window_len = min(self.window_size, req_hidden.shape[0])
@@ -93,25 +89,32 @@ class VerifyManager(ARManagerBase):
         self._state_table[req.table_idx] = st
 
     def schedule_next_batch(self) -> Batch | None:
-        scheduable_reqs = [
-            req for req in self.running_reqs.values()
-                if self._state_table[req.table_idx].scheduable
-        ]
-        if not scheduable_reqs:
-            return None
-        reqs = sorted(scheduable_reqs)
         K = self.num_spec_tokens
-        for req in reqs:
-            st = self._state_table[req.table_idx]
-            st.scheduable = False
-            C = req.cached_len
-            n_drafts = self._draft(req, st)
-            req.device_len = C + n_drafts + 1
-            if st.draft_tokens:
-                self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
-                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
-                )
 
+        self.inflight_uids[0] = self.inflight_uids[1]
+        self.inflight_uids[1] = []
+
+        scheduled_token = 0
+        reqs = []
+        for uid, req in self.running_reqs.items():
+            if scheduled_token >= self.token_budget:
+                break
+            elif uid not in self.inflight_uids[0]: 
+                self.inflight_uids[1].append(uid)
+                reqs.append(req)
+                scheduled_token += K
+                st = self._state_table[req.table_idx]
+                C = req.cached_len
+                n_drafts = self._draft(req, st)
+                req.device_len = C + n_drafts + 1
+                if st.draft_tokens:
+                    self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
+                        torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
+                    )
+
+        if not reqs:
+            return None
+        
         batch = Batch(reqs=reqs, phase="verify")
         bs = len(reqs)
         draft_tokens = torch.full((bs, K), -1, dtype=torch.int32, device=self.device)
@@ -151,10 +154,9 @@ class VerifyManager(ARManagerBase):
             num_sampled = req.extend_len  # = n_drafts + 1 (this req's rows in logits/full_hidden)
             row_start = offset
             offset += num_sampled
-            st = self._state_table.get(req.table_idx, None)
-            if st is None:
+            if req.uid not in self.running_reqs:
                 continue
-            st.scheduable = True
+            st = self._state_table.get(req.table_idx, None)
             n_drafts = num_sampled - 1
             C = req.cached_len
 
@@ -182,9 +184,9 @@ class VerifyManager(ARManagerBase):
 
         with self.cache_manager.lazy_free_region():
             for req, com in zip(batch.reqs, committed):
-                st = self._state_table.get(req.table_idx, None)
-                if st is None:
+                if req.uid not in self.running_reqs:
                     continue
+                st = self._state_table.get(req.table_idx, None)
                 C, num_sampled, sampled_token, n_drafts = com
 
                 stop, finish = num_sampled, not req.can_decode
@@ -210,12 +212,17 @@ class VerifyManager(ARManagerBase):
                             )
 
                 if finish and req not in self.finished_reqs:
-                    self.remove_req(req)
+                    self._finish_req(req)
                     self._free_req_resources(ctx, req)
                     new_finished.add(req)
 
+        self.inflight_uids[0] = []
         self.finished_reqs = new_finished
         return reply
+
+    def _finish_req(self, req: Request) -> None:
+        self.running_reqs.pop(req.uid, None)
+        self._state_table.pop(req.table_idx, None)
 
     def _update_carry(
         self,
