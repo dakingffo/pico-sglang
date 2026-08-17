@@ -72,6 +72,9 @@ class EnvClassSingleton:
     # backend runtime
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     PYNCCL_MAX_BUFFER_SIZE      = EnvMem(_UNIT_MAP["G"])
+    # drafter target<->drafter data plane transport: "nccl" (production) or "pipe"
+    # (local single-GPU WSL2, which cannot bootstrap a 2-rank NCCL communicator)
+    DRAFTER_DATA_PLANE          = EnvVar[str]("nccl", str)
 
     def __new__(cls):
         if cls._instance is None:
