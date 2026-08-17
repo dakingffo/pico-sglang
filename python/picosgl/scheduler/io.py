@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
+import msgpack
+import numpy as np
 import torch
 
-from picosgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg
+from picosgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg, DraftReplyMsg
 from picosgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
 
 if TYPE_CHECKING:
@@ -125,3 +127,41 @@ class SchedulerIOMixin:
 
     def _reply_tokenizer_rank1(self, reply: list[DetokenizeMsg]) -> None:
         pass
+
+    def _send_draft_to_ranks(
+        self,
+        reply: DraftReplyMsg,
+        probs: torch.Tensor | None,
+    ) -> None:
+        """Rank0 broadcasts a step's draft results to the other TP ranks.
+
+        Only rank0 talks to the drafter (zmq + NCCL); every rank's VerifyManager schedules
+        the same requests, so rank>0 needs the identical DraftReplyMsg + draft_probs to
+        backfill its own DraftState. Mirror of ``_recv_msg_multi_rank0/1``: rank0 PUBs the
+        raw messages and gloo-broadcasts the count; the probs tensor crosses as raw fp32
+        bytes (the drafter side already did the GPU→CPU trip).
+        """
+        n = 2 if probs is not None else 1
+        src = torch.tensor(n)
+        self.tp_cpu_group.broadcast(src, root=0).wait()
+        self._send_into_ranks.put_raw(msgpack.packb(reply.encoder(), use_bin_type=True))
+        if probs is not None:
+            self._send_into_ranks.put_raw(probs.cpu().contiguous().numpy().tobytes())
+
+    def _recv_draft_from_rank0(
+        self,
+        vocab_size: int,
+    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+        """Non-primary-rank receive side of ``_send_draft_to_ranks``."""
+        dst = torch.tensor(-1)
+        self.tp_cpu_group.broadcast(dst, root=0).wait()
+        n = int(dst.item())
+        assert n in (1, 2), f"bad draft broadcast count {n}"
+        reply = DraftReplyMsg.decoder(
+            msgpack.unpackb(self._recv_from_rank0.get_raw(), raw=False)
+        )
+        probs = None
+        if n == 2:
+            data = np.frombuffer(self._recv_from_rank0.get_raw(), dtype=np.float32)
+            probs = torch.from_numpy(data).reshape(-1, vocab_size).to(self.device)
+        return reply, probs

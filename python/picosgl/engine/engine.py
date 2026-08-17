@@ -113,7 +113,7 @@ class Engine:
         # ======================= Linear state table ========================
         if config.model_config.is_hybrid:
             page_cols = div_ceil(self.max_seq_len, config.page_size)
-            reserve_cols = config.num_spec_tokens + 1 if config.enable_mtp else 0
+            reserve_cols = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
             self.ctx.state_table = self.state_table = torch.full(
                 (config.max_running_req + 1, page_cols + reserve_cols),
                 -1,
@@ -212,7 +212,7 @@ class Engine:
         cache_per_state = 0
         if config.model_config.is_hybrid:
             cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
-            reserve_per_req = config.num_spec_tokens + 1 if config.enable_mtp else 0
+            reserve_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
             reserve_state = config.max_running_req * reserve_per_req
             reserve_bytes = reserve_state * cache_per_state
 
@@ -248,7 +248,7 @@ class Engine:
         logger.info(f"Allocating {num_tokens} tokens for KV cache,\
                      K + V = {mem_GB(num_pages * cache_per_page)}")
         if config.model_config.is_hybrid:
-            reserve_per_req = config.num_spec_tokens + 1 if config.enable_mtp else 0
+            reserve_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
             logger.info(
                 f"Allocating {num_pages + reserve_state}"
                 f" linear state slots = {mem_GB(num_pages * cache_per_state + reserve_bytes)}"
@@ -405,7 +405,34 @@ def _adjust_config(config: EngineConfig):
             logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")
 
     if config.enable_mtp:
-        assert config.model_config.mtp_num_hidden_layers > 0, (
-            "--enable-mtp requires a model with an MTP head (mtp_num_hidden_layers > 0)."
+        assert config.speculative_algorithm == "MTP", (
+            "only the MTP algorithm is implemented (got --speculative-algorithm "
+            f"{config.speculative_algorithm!r})"
         )
-        assert config.num_spec_tokens >= 1, "--num-spec-tokens must be >= 1"
+        assert config.speculative_draft_model_path == config.model_path, (
+            "--speculative-draft-model-path must equal --model-path under MTP "
+            f"(got {config.speculative_draft_model_path!r} vs {config.model_path!r})."
+        )
+        assert config.model_config.mtp_num_hidden_layers > 0, (
+            "MTP speculative decoding requires a model with an MTP head "
+            "(mtp_num_hidden_layers > 0)."
+        )
+        assert config.speculative_num_draft_tokens >= 1, (
+            "--speculative-num-draft-tokens must be >= 1"
+        )
+        if config.enable_dt_separation:
+            import torch as _torch
+
+            assert _torch.cuda.device_count() > config.tp_info.size, (
+                "--enable-dt-separation requires at least tp_size + 1 GPUs "
+                f"(tp_size={config.tp_info.size})."
+            )
+    elif config.speculative_algorithm == "DFLASH":
+        raise NotImplementedError(
+            "DFLASH speculative decoding is not implemented yet; "
+            "only --speculative-algorithm MTP is supported."
+        )
+    elif config.enable_dt_separation:
+        raise ValueError(
+            "--enable-dt-separation requires --speculative-algorithm."
+        )

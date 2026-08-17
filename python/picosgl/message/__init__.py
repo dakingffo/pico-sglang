@@ -1,4 +1,15 @@
 from .backend import AbortBackendMsg, BaseBackendMsg, BatchBackendMsg, ExitMsg, UserMsg
+from .drafter import (
+    BaseDrafterMsg,
+    DraftHandshakeAckMsg,
+    DraftHandshakeMsg,
+    DraftInitMsg,
+    DraftRemoveMsg,
+    DraftReply,
+    DraftReplyMsg,
+    DraftStepMsg,
+    DraftStepReq,
+)
 from .frontend import BaseFrontendMsg, BatchFrontendMsg, UserReply
 from .tokenizer import AbortMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg, TokenizeMsg
 
@@ -16,4 +27,13 @@ __all__ = [
     "BaseFrontendMsg",
     "BatchFrontendMsg",
     "UserReply",
+    "BaseDrafterMsg",
+    "DraftHandshakeMsg",
+    "DraftHandshakeAckMsg",
+    "DraftInitMsg",
+    "DraftStepMsg",
+    "DraftStepReq",
+    "DraftReply",
+    "DraftReplyMsg",
+    "DraftRemoveMsg",
 ]
