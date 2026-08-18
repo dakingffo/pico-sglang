@@ -28,7 +28,7 @@ import sys
 import time
 from typing import Any
 
-_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "python"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
@@ -42,7 +42,8 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 # --page-size, --num-pages, --max-running-requests, --memory-ratio, --enable-mtp,
 # --num-spec-tokens, ...) is parsed by the library's picosgl.server.args.parse_args.
 BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
-    "--num-prompts": {"type": int, "default": 32, "help": "number of concurrent requests"},
+    "--num-prompts": {"type": str, "default": None,
+                      "help": "comma-separated concurrent request counts (default 32)"},
     "--input-len": {"type": int, "default": None, "help": "prompt length in tokens"},
     "--output-len": {"type": int, "default": None, "help": "generation length in tokens"},
     "--seed": {"type": int, "default": 0, "help": "RNG seed for prompt generation (A/B uses one batch)"},
@@ -69,6 +70,14 @@ def parse_full(argv: list[str], extra: dict[str, dict[str, Any]] | None = None):
 
     server_args, _ = parse_args(server_argv)
     return server_args, bench_ns, server_argv
+
+
+def parse_int_list(s: str | None, default: int) -> list[int]:
+    """Comma-separated bench flag value -> list of ints (None/empty -> [default])."""
+    if s is None:
+        return [default]
+    vals = [int(x) for x in s.split(",") if x.strip()]
+    return vals if vals else [default]
 
 
 # -------------------------------------------------------------------------------------
@@ -395,6 +404,17 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
     if s.get("avg_accept"):
         print(f"  verify rounds: {s['rounds']}  avg_accept: {s['avg_accept']:.2f} tok/round")
     print("=" * 64)
+
+
+def print_conc_summary(rows: list[tuple[int, dict]]) -> None:
+    print("=" * 66)
+    print("  concurrency sweep")
+    print(f"  {'conc':>6} {'decode':>10} {'total':>10} {'req/s':>8} "
+          f"{'TTFT p50':>10} {'TPOT p50':>10}")
+    for conc, s in rows:
+        print(f"  {conc:>6} {s['decode_tok_per_s']:>10.1f} {s['total_tok_per_s']:>10.1f} "
+              f"{s['req_per_s']:>8.2f} {s['ttft_ms'][1]:>10.2f} {s['tpot_ms'][1]:>10.2f}")
+    print("=" * 66)
 
 
 def print_compare(a: dict, b: dict) -> None:
