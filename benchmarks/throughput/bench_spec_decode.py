@@ -58,7 +58,7 @@ def main() -> int:
             server_argv,
             port=port,
             enable_mtp=enable_mtp,
-            num_spec_tokens=server_args.num_spec_tokens,
+            num_spec_tokens=server_args.speculative_num_draft_tokens,
         )
         try:
             base = wait_server_ready(port)
