@@ -269,13 +269,6 @@ class Engine:
         )
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
-        if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
-            logger.error(
-                f"Memory across TP ranks are imbalanced:"
-                f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
-            )
-            raise RuntimeError("Memory across TP ranks are imbalanced")
-
         return min_free_memory, max_free_memory
 
     def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:

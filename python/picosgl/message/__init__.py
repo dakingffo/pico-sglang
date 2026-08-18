@@ -1,5 +1,5 @@
 from .backend import AbortBackendMsg, BaseBackendMsg, BatchBackendMsg, ExitMsg, UserMsg
-from .drafter import (
+from .speculator import (
     BaseDrafterMsg,
     DraftHandshakeAckMsg,
     DraftHandshakeMsg,

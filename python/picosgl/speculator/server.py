@@ -10,7 +10,7 @@ from picosgl.message import BaseDrafterMsg, DraftStepMsg
 from picosgl.models.drafters import Qwen3_5MTPDrafter
 from picosgl.utils import ZmqPullQueue, ZmqPushQueue
 
-from .data_plane import DataPlane, NCCLDataPlane
+from .data_plane import NCCLDataPlane
 from .drafters.mtp import MTPEngine
 from .runner import DrafterRunner
 
@@ -19,19 +19,11 @@ if TYPE_CHECKING:
 
 
 @torch.inference_mode()
-def launch_drafter_worker(
+def drafter_worker(
     *,
-    args       : SchedulerConfig,
-    data_plane : DataPlane | None = None,
-    ack_queue  : mp.Queue[str] | None = None,
+    args      : SchedulerConfig,
+    ack_queue : mp.Queue[str] | None = None,
 ) -> None:
-    """Launch the drafter process (mirrors ``tokenize_worker``).
-
-    Loads the standalone drafter on ``cuda:{tp_size}`` when DT separation is on (else
-    ``cuda:0``, sharing the target rank0's device), builds the MTP engine, and runs the
-    DrafterRunner loop over the zmq control plane. ``data_plane`` defaults to NCCL; local
-    tests inject a PipeDataPlane end.
-    """
     device = torch.device(
         f"cuda:{args.tp_info.size}" if args.enable_dt_separation else "cuda:0"
     )
@@ -51,12 +43,14 @@ def launch_drafter_worker(
     engine = MTPEngine(
         model, device, args.model_config.vocab_size, args.speculative_num_draft_tokens
     )
-    if data_plane is None:
-        data_plane = NCCLDataPlane(device, rank=1, dtype=args.dtype)
+    data_plane = NCCLDataPlane(device, rank=1, dtype=args.dtype)
 
-    recv = ZmqPullQueue(args.zmq_drafter_addr, create=False, decoder=DraftStepMsg.decoder)
-    reply = ZmqPushQueue(args.zmq_drafter_reply_addr, create=False, encoder=BaseDrafterMsg.encoder)
-    runner = DrafterRunner(engine, data_plane, recv, reply)
+    runner = DrafterRunner(
+        engine,
+        data_plane,
+        recv=ZmqPullQueue(args.zmq_drafter_addr, create=False, decoder=DraftStepMsg.decoder), 
+        reply=ZmqPushQueue(args.zmq_drafter_reply_addr, create=False, encoder=BaseDrafterMsg.encoder)
+    )
 
     if ack_queue is not None:
         ack_queue.put("Drafter is ready")

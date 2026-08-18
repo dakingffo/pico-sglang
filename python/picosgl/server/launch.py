@@ -4,13 +4,10 @@ import sys
 import multiprocessing as mp
 from dataclasses import replace
 
-import torch
-
 from picosgl.distributed import DistributedInfo
-from picosgl.env import ENV
 from picosgl.utils import init_logger
 from picosgl.scheduler import schedule_worker
-from picosgl.speculator import PipeDataPlane, launch_drafter_worker
+from picosgl.speculator import drafter_worker
 from picosgl.tokenizer import tokenize_worker, detokenize_worker
 
 
@@ -27,31 +24,6 @@ def launch_server(run_shell: bool = False) -> None:
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue[str] = mp.Queue()
 
-        # Local single-GPU WSL2 cannot bootstrap a 2-rank NCCL communicator ("Duplicate
-        # GPU detected" — GPU-PV topology, see wsl2-nccl-2rank), so setting
-        # picosgl_DRAFTER_DATA_PLANE=pipe swaps the target<->drafter data plane for a
-        # PipeDataPlane pair (multiprocessing.Queue round-trip). Production default is
-        # NCCL, unchanged.
-        use_pipe = (
-            server_args.speculative_algorithm is not None
-            and ENV.DRAFTER_DATA_PLANE.value == "pipe"
-        )
-        target_dp: PipeDataPlane | None = None
-        drafter_dp: PipeDataPlane | None = None
-        if use_pipe:
-            to_drafter, to_target = mp.Queue(), mp.Queue()
-            drafter_dev = (
-                f"cuda:{world_size}" if server_args.enable_dt_separation else "cuda:0"
-            )
-            target_dp = PipeDataPlane(
-                torch.device("cuda:0"), 0, to_drafter, to_target,
-                dtype=server_args.dtype,
-            )
-            drafter_dp = PipeDataPlane(
-                torch.device(drafter_dev), 1, to_drafter, to_target,
-                dtype=server_args.dtype,
-            )
-
         for i in range(world_size):
             args = replace(
                 server_args,
@@ -61,8 +33,6 @@ def launch_server(run_shell: bool = False) -> None:
                 "args": args,
                 "ack_queue": ack_queue,
             }
-            if i == 0 and target_dp is not None:
-                kwargs["drafter_data_plane"] = target_dp
             mp.Process(
                 target=schedule_worker,
                 kwargs=kwargs,
@@ -70,16 +40,16 @@ def launch_server(run_shell: bool = False) -> None:
                 name=f"picosgl-TP{i}-scheduler",
             ).start()
 
-        if server_args.speculative_algorithm is not None:
-            kwargs = {
-                "args": server_args,
-                "ack_queue": ack_queue,
-            }
-            if drafter_dp is not None:
-                kwargs["data_plane"] = drafter_dp
+        enable_drafter_worker: bool = (
+            server_args.enable_dt_separation and server_args.speculative_algorithm is not None
+        )
+        if enable_drafter_worker:
             mp.Process(
-                target=launch_drafter_worker,
-                kwargs=kwargs,
+                target=drafter_worker,
+                kwargs={
+                    "args": server_args,
+                    "ack_queue": ack_queue,
+                },
                 daemon=False,
                 name="picosgl-drafter",
             ).start()
@@ -114,10 +84,7 @@ def launch_server(run_shell: bool = False) -> None:
             name="picosgl-detokenizer-0",
         ).start()
 
-        num_workers = (
-            server_args.num_tokenizer + 2
-            + (1 if server_args.speculative_algorithm is not None else 0)
-        )
+        num_workers = server_args.num_tokenizer + 2 + int(enable_drafter_worker)
         for _ in range(num_workers):
             logger.info(ack_queue.get())
 

@@ -13,7 +13,7 @@ from picosgl.utils import div_ceil
 from .ar import ARManagerBase, ForwardInput
 
 if TYPE_CHECKING:
-    from picosgl.speculator import DraftBroadcastReceiver, DrafterClient
+    from picosgl.speculator import DrafterClientBase
 
     from .cache import CacheManager
     from .config import SchedulerConfig
@@ -33,7 +33,7 @@ class VerifyManager(ARManagerBase):
     since the last step and blocks on the draft reply (``client.step``); ``process``
     buffers committed rows in ``_pending_carry`` for the next step and notifies the
     drafter on finish / abort. On non-primary TP ranks ``client`` is a
-    ``DraftBroadcastReceiver`` and results arrive via rank0's broadcast.
+    ``BroadcastDrafterClient`` and results arrive via rank0's broadcast.
     """
 
     def __init__(
@@ -43,7 +43,7 @@ class VerifyManager(ARManagerBase):
         cache_manager : CacheManager,
         table_manager : TableManager,
         eos_token_id  : int,
-        client        : DrafterClient | DraftBroadcastReceiver,
+        client        : DrafterClientBase,
         vocab_size    : int,
         broadcast     : tuple[DraftBroadcastSend | None, DraftBroadcastRecv | None] | None = None,
     ) -> None:

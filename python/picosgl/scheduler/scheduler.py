@@ -12,7 +12,12 @@ from picosgl.message import (
     ExitMsg,
     UserMsg,
 )
-from picosgl.speculator import DataPlane, DraftBroadcastReceiver, DrafterClient
+from picosgl.speculator import (
+    BroadcastDrafterClient,
+    DrafterClientBase,
+    LocalDrafterClient,
+    RemoteDrafterClient,
+)
 from picosgl.utils import init_logger, load_tokenizer, div_ceil
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
@@ -29,7 +34,7 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerIOMixin):
-    def __init__(self, config: SchedulerConfig, drafter_data_plane: DataPlane | None = None):
+    def __init__(self, config: SchedulerConfig):
         self.engine = Engine(config)
         super().__init__(config, self.engine.tp_cpu_group)
         # use another stream to overlap metadata processing with computation
@@ -53,7 +58,7 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.drafter_client = None
         if config.enable_mtp:
-            self.drafter_client = self._make_drafter_client(drafter_data_plane)
+            self.drafter_client = self._make_drafter_client()
             if config.tp_info.size > 1:
                 if config.tp_info.is_primary():
                     broadcast = (self._send_draft_to_ranks, None)
@@ -79,18 +84,31 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(self.token_pool)
         self.prefill_budget = config.max_prefill_length
 
-    def _make_drafter_client(self, data_plane: DataPlane | None) -> DrafterClient | DraftBroadcastReceiver:
-        """Build the drafter interface for this rank: the real zmq+NCCL client on TP
-        rank0 (``data_plane`` injectable for local split-process tests), a broadcast
-        receiver on non-primary ranks."""
-        if self.config.tp_info.is_primary():
-            mc = self.engine.config.model_config
-            return DrafterClient(
+    def _make_drafter_client(self) -> DrafterClientBase:
+        mc = self.engine.config.model_config
+        if not self.config.tp_info.is_primary():
+            return BroadcastDrafterClient(
                 self.config, self.device, mc.vocab_size, mc.hidden_size,
-                data_plane=data_plane,
+                scheduler_io=self
+            )
+        if self.config.enable_dt_separation:
+            return RemoteDrafterClient(
+                self.config, self.device, mc.vocab_size, mc.hidden_size
             )
         else:
-            return DraftBroadcastReceiver(self, self.engine.config.model_config.vocab_size)
+            from picosgl.distributed import DistributedInfo, tp_override
+            from picosgl.models.drafters import Qwen3_5MTPDrafter
+            from picosgl.speculator import MTPEngine
+            with tp_override(DistributedInfo(0, 1)):
+                drafter = Qwen3_5MTPDrafter(mc)
+                drafter.load_weights(self.config.speculative_draft_model_path, self.device)
+                engine = MTPEngine(
+                    drafter, self.device, mc.vocab_size, self.config.speculative_num_draft_tokens
+                )
+            return LocalDrafterClient(
+                self.config, self.device, mc.vocab_size, mc.hidden_size,
+                engine=engine
+            )
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")

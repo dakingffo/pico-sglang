@@ -22,15 +22,6 @@ logger = init_logger(__name__)
 
 
 class DrafterRunner:
-    """Drafter-process event loop: handshake, init, step, remove.
-
-    Mirrors the old in-model ``VerifyManager._draft`` one request at a time through
-    ``EngineBase``; the target blocks on each step (single data-plane buffer, no overrun),
-    so this loop is strictly sequential. The rolling carry window (positions / tokens /
-    hidden) is maintained here in ``MTPState`` — the target ships committed rows over the
-    control plane (ids) and data plane (hidden) every step.
-    """
-
     def __init__(
         self,
         engine    : EngineBase,
@@ -59,8 +50,7 @@ class DrafterRunner:
             handshake.max_hidden_rows, handshake.hidden_size,
             handshake.max_prob_rows, handshake.vocab_size,
         )
-        # NB ordering: ncclCommInitRank blocks until both ranks call it, so we must NOT
-        # gate our init on the target's ack — the target drains our ack after ITS init.
+        # Don't gate on the target's ack: ncclCommInitRank blocks until both ranks arrive.
         self.data_plane.init_rank1(handshake.nccl_uid, sizes)
         self.reply.put(DraftHandshakeAckMsg())
         logger.info(
@@ -93,8 +83,6 @@ class DrafterRunner:
         )
 
     def _on_step(self, msg: DraftStepMsg) -> None:
-        # appends: one recv_hidden for the whole step, then update_carry per request
-        # (row order matches the reqs' append_positions lengths).
         total_rows = sum(len(r.append_positions) for r in msg.reqs)
         if total_rows > 0:
             hidden = self.data_plane.recv_hidden(total_rows, self.hidden_size)
@@ -102,19 +90,20 @@ class DrafterRunner:
             for r in msg.reqs:
                 n = len(r.append_positions)
                 if n:
-                    self.states[r.uid].update_carry(
+                    st = self.states[r.uid]
+                    st.update_carry(
                         r.append_positions, r.append_tokens, hidden[off : off + n]
                     )
                     off += n
             assert off == total_rows
-
+        # Every request needs n_drafts; the first round's empty append_positions skips the loop above.
         for st, r in zip((self.states[r.uid] for r in msg.reqs), msg.reqs):
             st.n_drafts = r.n_drafts
+
         self.engine.draft([self.states[r.uid] for r in msg.reqs])
 
         sampling_reqs = [r for r in msg.reqs if r.sampling]
         if sampling_reqs:
-            rows = sum(r.n_drafts for r in sampling_reqs)
             probs = torch.cat(
                 [self.states[r.uid].draft_probs[: r.n_drafts] for r in sampling_reqs],
                 dim=0,

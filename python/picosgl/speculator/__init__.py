@@ -8,23 +8,24 @@ the Qwen3.5 MTP engine.
 """
 
 from .base import DraftState, EngineBase
-from .client import DraftBroadcastReceiver, DrafterClient
-from .data_plane import DataPlane, DataPlaneSizes, NCCLDataPlane, PipeDataPlane
+from .client import BroadcastDrafterClient, DrafterClientBase, LocalDrafterClient, RemoteDrafterClient
+from .data_plane import DataPlane, DataPlaneSizes, NCCLDataPlane
 from .drafters import MTPEngine, MTPState
 from .runner import DrafterRunner
-from .server import launch_drafter_worker
+from .server import drafter_worker
 
 __all__ = [
     "DraftState",
     "EngineBase",
-    "DrafterClient",
-    "DraftBroadcastReceiver",
+    "DrafterClientBase",
+    "LocalDrafterClient",
+    "RemoteDrafterClient",
+    "BroadcastDrafterClient",
     "DataPlane",
     "DataPlaneSizes",
     "NCCLDataPlane",
-    "PipeDataPlane",
     "MTPEngine",
     "MTPState",
     "DrafterRunner",
-    "launch_drafter_worker",
+    "drafter_worker",
 ]
