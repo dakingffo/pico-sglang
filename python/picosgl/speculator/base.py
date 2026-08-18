@@ -15,7 +15,7 @@ class DraftState:
     allocates a ``DraftState`` per table_idx, the drafter fills it in via ``client.step``.
     """
 
-    draft_tokens: list[int] = field(default_factory=list)
+    draft_tokens: list[int]           = field(default_factory=list)
     draft_probs : torch.Tensor | None = None
 
 

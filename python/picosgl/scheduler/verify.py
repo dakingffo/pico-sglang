@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -19,23 +20,27 @@ if TYPE_CHECKING:
     from .config import SchedulerConfig
     from .table import TableManager
 
-DraftBroadcastSend = Callable[[DraftReplyMsg, torch.Tensor | None], None]
-DraftBroadcastRecv = Callable[[int], tuple[DraftReplyMsg, torch.Tensor | None]]
+
+@dataclass
+class VerifyState(DraftState):
+    carry_tokens   : list[int] = field(default_factory=list, init=False)
+    carry_positions: list[int] = field(default_factory=list, init=False)
+    carry_hidden   : torch.Tensor | None = None
+
+    def set_carry(self, tokens, positions, hidden):
+        self.carry_tokens = tokens
+        self.carry_positions = positions
+        self.carry_hidden = hidden
+
+    def get_carry(self):
+        return (
+            self.carry_tokens,
+            self.carry_positions,
+            self.carry_hidden
+        )
 
 
 class VerifyManager(ARManagerBase):
-    """MTP verify manager with the drafter split into its own process.
-
-    The target keeps only a thin per-request ``DraftState`` (draft_tokens / draft_probs);
-    the rolling carry window (positions / tokens / hidden, ``mtp_kv``) lives in the
-    drafter's ``MTPState``. ``on_prefill_done`` seeds the drafter with the request's
-    terminal window (``client.init``); ``schedule_next_batch`` sends the committed rows
-    since the last step and blocks on the draft reply (``client.step``); ``process``
-    buffers committed rows in ``_pending_carry`` for the next step and notifies the
-    drafter on finish / abort. On non-primary TP ranks ``client`` is a
-    ``BroadcastDrafterClient`` and results arrive via rank0's broadcast.
-    """
-
     def __init__(
         self,
         config        : SchedulerConfig,
@@ -45,7 +50,6 @@ class VerifyManager(ARManagerBase):
         eos_token_id  : int,
         client        : DrafterClientBase,
         vocab_size    : int,
-        broadcast     : tuple[DraftBroadcastSend | None, DraftBroadcastRecv | None] | None = None,
     ) -> None:
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
         self.page_table = table_manager.page_table
@@ -53,10 +57,7 @@ class VerifyManager(ARManagerBase):
         self.window_size = config.speculator_window_size
         self.client = client
         self.vocab_size = vocab_size
-        self._broadcast = broadcast if broadcast is not None else (None, None)
-        self._state_table: dict[int, DraftState] = {}
-        # committed rows since the last step, keyed by uid -> (positions, tokens, hidden)
-        self._pending_carry: dict[int, tuple[list[int], list[int], torch.Tensor]] = {}
+        self._state_table: dict[int, VerifyState] = {}
 
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
         inflight: bool = uid in self.inflight_uids[1]
@@ -67,7 +68,6 @@ class VerifyManager(ARManagerBase):
         else:
             req.aborted = True
             self._state_table.pop(req.table_idx, None)
-            self._pending_carry.pop(uid, None)
             self.client.remove(uid)
             return req, inflight
 
@@ -79,20 +79,17 @@ class VerifyManager(ARManagerBase):
         positions = list(range(C + 1 - window_len, C + 1))
         tokens = self.token_pool[req.table_idx, positions].tolist()
         hidden = req_hidden[-window_len:].contiguous()
-        self.client.init(
-            req.uid, req.table_idx, positions, tokens, hidden, req.sampling_params
-        )
-        # MTP verify reserve: allocate the K+1 reserve slots once and set the baseline to
-        # the prefill terminal state (state after position C-1). Pure index bookkeeping.
+        self.client.init(req.uid, req.table_idx, positions, tokens, hidden, req.sampling_params)
+
         if self.cache_manager.state_pool is not None:
             begin = self.cache_manager.draft_state
             slots = self.cache_manager._allocate(needed_states = self.num_spec_tokens + 1)[1]
-            self.cache_manager.state_table[req.table_idx, begin: begin + self.num_spec_tokens + 1] = slots
-            req.baseline_slot = int(
-                self.cache_manager.state_table[req.table_idx, (C - 1) // self.page_size]
-            )
+            state = self.cache_manager.state_table[req.table_idx]
+            state[begin: begin + self.num_spec_tokens + 1] = slots
+            req.baseline_slot = int(state[(C - 1) // self.page_size])
+
         self.running_reqs[req.uid] = req
-        self._state_table[req.table_idx] = DraftState()
+        self._state_table[req.table_idx] = VerifyState()
 
     def schedule_next_batch(self) -> Batch | None:
         K = self.num_spec_tokens
@@ -115,20 +112,18 @@ class VerifyManager(ARManagerBase):
                 remain = req.remain_len
                 n_drafts = min(K, remain - 1) if remain > 0 else 0
                 req.device_len = C + n_drafts + 1
-                pc = self._pending_carry.pop(uid, None)
-                ap = pc[0] if pc is not None else []
-                at = pc[1] if pc is not None else []
+                toks, pos, hids = self._state_table[req.table_idx].get_carry()
                 step_reqs.append(
                     DraftStepReq(
                         uid=uid,
                         n_drafts=n_drafts,
-                        append_positions=ap,
-                        append_tokens=at,
+                        append_positions=pos,
+                        append_tokens=toks,
                         sampling=not req.sampling_params.is_greedy,
                     )
                 )
-                if pc is not None:
-                    hidden_rows.append(pc[2])
+                if hids is not None:
+                    hidden_rows.append(hids)
 
         if not reqs:
             return None
@@ -136,14 +131,7 @@ class VerifyManager(ARManagerBase):
         appended_hidden = torch.cat(hidden_rows, dim=0) if hidden_rows else None
         has_sampling = any(sr.sampling for sr in step_reqs)
 
-        send_bc, recv_bc = self._broadcast
-        if self.client is not None:
-            reply, probs = self.client.step(step_reqs, appended_hidden, has_sampling)
-            if send_bc is not None:
-                send_bc(reply, probs)
-        else:
-            assert recv_bc is not None, "non-primary verify rank needs a draft broadcast"
-            reply, probs = recv_bc(self.vocab_size)
+        reply, probs = self.client.step(step_reqs, appended_hidden, has_sampling)
 
         reply_by_uid = {r.uid: r for r in reply.reqs}
         probs_by_uid: dict[int, torch.Tensor] = {}
@@ -151,19 +139,8 @@ class VerifyManager(ARManagerBase):
             off = 0
             for sr in step_reqs:
                 if sr.sampling:
-                    probs_by_uid[sr.uid] = probs[off : off + sr.n_drafts]
+                    probs_by_uid[sr.uid] = probs[off: off + sr.n_drafts]
                     off += sr.n_drafts
-
-        for req in reqs:
-            st = self._state_table[req.table_idx]
-            C = req.cached_len
-            st.draft_tokens = reply_by_uid[req.uid].draft_tokens
-            if req.uid in probs_by_uid:
-                st.draft_probs = probs_by_uid[req.uid]
-            if st.draft_tokens:
-                self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
-                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
-                )
 
         batch = Batch(reqs=reqs, phase="verify")
         bs = len(reqs)
@@ -171,19 +148,26 @@ class VerifyManager(ARManagerBase):
         draft_probs: torch.Tensor | None = None
         for i, req in enumerate(reqs):
             st = self._state_table[req.table_idx]
-            if st.draft_tokens:
-                draft_tokens[i, : len(st.draft_tokens)].copy_(
-                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
-                )
-            if st.draft_probs is not None:
+            C = req.cached_len
+            st.draft_tokens = reply_by_uid[req.uid].draft_tokens
+            if req.uid in probs_by_uid:
+                st.draft_probs = probs_by_uid[req.uid]
                 if draft_probs is None:
                     draft_probs = torch.zeros(
                         bs, K, self.vocab_size, dtype=torch.float32, device=self.device
                     )
                 n = st.draft_probs.shape[0]
                 draft_probs[i, :n] = st.draft_probs
+            if st.draft_tokens:
+                self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
+                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
+                )
+                draft_tokens[i, : len(st.draft_tokens)].copy_(
+                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
+                )
         batch.draft_tokens = draft_tokens
         batch.draft_probs = draft_probs
+
         return batch
 
     def process(
@@ -227,11 +211,9 @@ class VerifyManager(ARManagerBase):
             # commit the accepted states: pure index ops on the reserve (pin/swap/refill)
             self.cache_manager.state_commit_verify(req, C, num_sampled)
             self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
-            # buffer the committed rows (positions C+1..C+num_sampled, their token ids and
-            # main-model hidden) for the drafter's next update_carry.
-            self._pending_carry[req.uid] = (
-                list(range(C + 1, C + 1 + num_sampled)),
+            st.set_carry(
                 sampled_token,
+                list(range(C + 1, C + 1 + num_sampled)),
                 full_hidden[row_start: row_start + num_sampled],
             )
             committed[i] = (C, num_sampled, sampled_token, n_drafts)
@@ -279,5 +261,4 @@ class VerifyManager(ARManagerBase):
     def _finish_req(self, req: Request) -> None:
         self.running_reqs.pop(req.uid, None)
         self._state_table.pop(req.table_idx, None)
-        self._pending_carry.pop(req.uid, None)
         self.client.remove(req.uid)

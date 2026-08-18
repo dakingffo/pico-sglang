@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 import torch
 
-from picosgl.kernel.pynccl import init_pynccl_p2p
+from picosgl.kernel import init_pynccl_drafter_target_separation
 
 
 class DataPlaneSizes(NamedTuple):
@@ -32,7 +32,7 @@ class DataPlane(ABC):
         """Target → drafter: the appended carry-hidden rows (or a request's init window)."""
 
     @abstractmethod
-    def recv_hidden(self, num_rows: int, hidden_size: int) -> torch.Tensor:
+    def recv_hidden(self, num_rows: int) -> torch.Tensor:
         """Drafter side of the same collective; returns the target's rows on its device."""
 
     @abstractmethod
@@ -40,7 +40,7 @@ class DataPlane(ABC):
         """Drafter → target: the draft_probs rows for this step's sampling requests."""
 
     @abstractmethod
-    def recv_probs(self, num_rows: int, vocab_size: int) -> torch.Tensor:
+    def recv_probs(self, num_rows: int) -> torch.Tensor:
         """Target side of the same collective; returns the drafter's rows on its device."""
 
     def destroy(self) -> None:
@@ -48,16 +48,6 @@ class DataPlane(ABC):
 
 
 class NCCLDataPlane(DataPlane):
-    """Production data plane: a standalone 2-rank NCCL communicator.
-
-    Implements each leg with the all_gather-as-P2P trick on the 2-rank comm, whose output
-    is [rank0_input | rank1_input]. Leg A (hidden target→drafter): rank0 fills its half
-    with hidden, drafter contributes zeros, both read out[0:S). Leg B (probs drafter→
-    target): drafter fills its half, rank0 zeros, both read out[S:2S). Both sides issue
-    A then B in the same order so the collectives pair; the drafter's draft work happens
-    between the two legs on its side, which is what makes rank0's ``recv_probs`` block.
-    """
-
     def __init__(
         self,
         device     : torch.device,
@@ -76,11 +66,15 @@ class NCCLDataPlane(DataPlane):
         self._probs_out: torch.Tensor | None = None
 
     def init_rank0(self, nccl_uid: bytes, sizes: DataPlaneSizes) -> None:
-        self._nccld = init_pynccl_p2p(rank=0, world_size=self.world_size, nccl_uid=nccl_uid)
+        self._nccld = init_pynccl_drafter_target_separation(
+            rank=0, world_size=self.world_size, nccl_uid=nccl_uid
+        )
         self._alloc_bufs(sizes)
 
     def init_rank1(self, nccl_uid: bytes, sizes: DataPlaneSizes) -> None:
-        self._nccld = init_pynccl_p2p(rank=1, world_size=self.world_size, nccl_uid=nccl_uid)
+        self._nccld = init_pynccl_drafter_target_separation(
+            rank=1, world_size=self.world_size, nccl_uid=nccl_uid
+        )
         self._alloc_bufs(sizes)
 
     def _alloc_bufs(self, sizes: DataPlaneSizes) -> None:
@@ -104,7 +98,7 @@ class NCCLDataPlane(DataPlane):
         self._hidden_in[:rows].copy_(hidden)  # rest stale; receiver only reads [:rows]
         self._nccld.all_gather(self._hidden_out, self._hidden_in)
 
-    def recv_hidden(self, num_rows: int, hidden_size: int) -> torch.Tensor:
+    def recv_hidden(self, num_rows: int) -> torch.Tensor:
         self._nccld.all_gather(self._hidden_out, self._hidden_in)
         return self._hidden_out[:num_rows].clone()
 
@@ -114,7 +108,7 @@ class NCCLDataPlane(DataPlane):
         self._probs_in[:rows].copy_(probs)
         self._nccld.all_gather(self._probs_out, self._probs_in)
 
-    def recv_probs(self, num_rows: int, vocab_size: int) -> torch.Tensor:
+    def recv_probs(self, num_rows: int) -> torch.Tensor:
         S = self._probs_out.shape[0] // 2
         self._nccld.all_gather(self._probs_out, self._probs_in)
         return self._probs_out[S : S + num_rows].clone()

@@ -13,7 +13,6 @@ Usage:
 """
 import argparse
 import json
-import multiprocessing as mp
 import os
 import sys
 
@@ -28,7 +27,6 @@ from picosgl.distributed import DistributedInfo
 from picosgl.message import UserMsg
 from picosgl.scheduler.config import SchedulerConfig
 from picosgl.scheduler.scheduler import Scheduler
-from picosgl.speculator import PipeDataPlane, launch_drafter_worker
 
 MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 
@@ -60,26 +58,16 @@ TIE_MARGIN = 0.2
 class OfflineScheduler(Scheduler):
     """Scheduler with an in-process message queue instead of ZMQ.
 
-    When speculative decoding is on, the drafter runs in a separate process (zmq
-    control plane + pipe data plane injected here; NCCL cannot bootstrap 2 ranks on
-    WSL2). ``spawn_drafter`` blocks until the worker has bound its sockets, so the
-    scheduler's client handshake cannot deadlock.
+    DT separation is off locally (single GPU), so the drafter runs in-process: the
+    scheduler builds the standalone ``Qwen3_5MTPDrafter`` + ``MTPEngine`` directly
+    (``scheduler._make_inprocess_client``), with no separate drafter process, no zmq
+    control plane, and no data plane. This is the non-DT production path.
     """
 
     def __init__(self, config, msgs):
         self._pending = list(msgs)
         self.results: list = []
-        self._drafter_proc = None
-        drafter_data_plane = None
-        if config.enable_mtp:
-            drafter_data_plane, self._drafter_proc = spawn_drafter(config)
-        super().__init__(config, drafter_data_plane=drafter_data_plane)
-
-    def shutdown(self) -> None:
-        super().shutdown()
-        if self._drafter_proc is not None:
-            self._drafter_proc.terminate()
-            self._drafter_proc.join(timeout=10)
+        super().__init__(config)
 
     def offline_receive_msg(self, blocking: bool = False) -> list:
         out, self._pending = self._pending, []
@@ -87,22 +75,6 @@ class OfflineScheduler(Scheduler):
 
     def offline_send_result(self, reply) -> None:
         self.results.extend(reply)
-
-
-def spawn_drafter(config) -> tuple[object, mp.Process]:
-    """Spawn the drafter worker and return (target-side data plane, process)."""
-    mp.set_start_method("spawn", force=True)
-    target_dp, drafter_dp = PipeDataPlane.make_pair(torch.device("cuda:0"))
-    ack: mp.Queue = mp.Queue()
-    proc = mp.Process(
-        target=launch_drafter_worker,
-        kwargs={"args": config, "data_plane": drafter_dp, "ack_queue": ack},
-        daemon=False,
-        name="test-drafter",
-    )
-    proc.start()
-    ack.get()  # worker has bound its zmq sockets; safe for the scheduler to handshake
-    return target_dp, proc
 
 
 def make_config(enable_mtp: bool, num_pages: int = 256) -> SchedulerConfig:

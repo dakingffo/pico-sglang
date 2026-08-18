@@ -59,18 +59,11 @@ class Scheduler(SchedulerIOMixin):
         self.drafter_client = None
         if config.enable_mtp:
             self.drafter_client = self._make_drafter_client()
-            if config.tp_info.size > 1:
-                if config.tp_info.is_primary():
-                    broadcast = (self._send_draft_to_ranks, None)
-                else:
-                    broadcast = (None, self._recv_draft_from_rank0)
-            else:
-                broadcast = None
             self.ar_manager = VerifyManager(
                 config, self.device,
                 self.cache_manager, self.table_manager,
                 self.eos_token_id, self.drafter_client,
-                config.model_config.vocab_size, broadcast=broadcast,
+                config.model_config.vocab_size,
             )
         else:
             self.ar_manager = DecodeManager(
@@ -93,7 +86,8 @@ class Scheduler(SchedulerIOMixin):
             )
         if self.config.enable_dt_separation:
             return RemoteDrafterClient(
-                self.config, self.device, mc.vocab_size, mc.hidden_size
+                self.config, self.device, mc.vocab_size, mc.hidden_size,
+                scheduler_io=self
             )
         else:
             from picosgl.distributed import DistributedInfo, tp_override
@@ -107,7 +101,7 @@ class Scheduler(SchedulerIOMixin):
                 )
             return LocalDrafterClient(
                 self.config, self.device, mc.vocab_size, mc.hidden_size,
-                engine=engine
+                engine=engine, scheduler_io=self
             )
 
     def run_when_idle(self) -> None:

@@ -76,18 +76,57 @@ class DrafterClientBase(ABC):
         ...
 
 
-class LocalDrafterClient(DrafterClientBase):
+class MainDrafterClient(DrafterClientBase):
+    """Primary-rank side: drafts, then broadcasts the result to the other TP ranks."""
+
     def __init__(
         self,
         config      : SchedulerConfig,
         device      : torch.device,
         vocab_size  : int,
         hidden_size : int,
-        window_size : int | None       = None,
-        engine      : MTPEngine | None = None,
+        window_size : int | None              = None,
+        scheduler_io: SchedulerIOMixin | None = None,
     ):
         super().__init__(config, device, vocab_size, hidden_size, window_size)
-        self.direct = True
+        self._io = scheduler_io
+
+    def step(
+        self,
+        reqs           : list,
+        appended_hidden: torch.Tensor | None,
+        has_sampling   : bool,
+    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+        reply, probs = self._draft(reqs, appended_hidden, has_sampling)
+        if self._io is not None and self.config.tp_info.size > 1:
+            self._io._send_draft_to_ranks(reply, probs)
+        return reply, probs
+
+    @abstractmethod
+    def _draft(
+        self,
+        reqs           : list,
+        appended_hidden: torch.Tensor | None,
+        has_sampling   : bool,
+    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+        ...
+
+
+class LocalDrafterClient(MainDrafterClient):
+    def __init__(
+        self,
+        config      : SchedulerConfig,
+        device      : torch.device,
+        vocab_size  : int,
+        hidden_size : int,
+        window_size : int | None              = None,
+        engine      : MTPEngine | None        = None,
+        scheduler_io: SchedulerIOMixin | None = None,
+    ):
+        super().__init__(
+            config, device, vocab_size, hidden_size,
+            window_size=window_size, scheduler_io=scheduler_io
+        )
         self.engine = engine
         self.states: dict[int, MTPState] = {}
 
@@ -102,39 +141,33 @@ class LocalDrafterClient(DrafterClientBase):
     ) -> None:
         self.states[uid] = MTPState(
             sampling_params=sampling_params,
-            carry_positions=list(carry_positions),
-            carry_tokens=list(carry_tokens),
-            carry_hidden=hidden,
+            window_positions=list(carry_positions),
+            window_tokens=list(carry_tokens),
+            window_hidden=hidden,
             window_size=self.window_size,
         )
 
-    def step(
+    def _draft(
         self,
         reqs           : list,
         appended_hidden: torch.Tensor | None,
         has_sampling   : bool,
     ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
-        total_rows = sum(len(r.append_positions) for r in reqs)
-        if total_rows > 0:
-            off = 0
-            for r in reqs:
-                if n:= len(r.append_positions):
-                    st = self.states[r.uid]
-                    st.update_carry(
-                        r.append_positions, r.append_tokens, appended_hidden[off : off + n]
-                    )
-                    off += n
-            assert off == total_rows
-        for st, r in zip((self.states[r.uid] for r in reqs), reqs):
-            st.n_drafts = r.n_drafts
-
-        self.engine.draft([self.states[r.uid] for r in reqs])
+        off = 0
+        for req in reqs:
+            st = self.states[req.uid]
+            st.n_drafts = req.n_drafts
+            if n := len(req.append_positions):
+                st.update_window(
+                    req.append_positions, req.append_tokens, appended_hidden[off : off + n]
+                )
+                off += n
+        self.engine.draft([self.states[req.uid] for req in reqs])
 
         probs: torch.Tensor | None = None
-        sampling_reqs = [r for r in reqs if r.sampling]
-        if sampling_reqs:
+        if sampling_reqs := [req for req in reqs if req.sampling]:
             probs = torch.cat(
-                [self.states[r.uid].draft_probs[: r.n_drafts] for r in sampling_reqs],
+                [self.states[req.uid].draft_probs[: req.n_drafts] for req in sampling_reqs],
                 dim=0,
             )
         reply = DraftReplyMsg(
@@ -152,17 +185,20 @@ class LocalDrafterClient(DrafterClientBase):
         return
 
 
-class RemoteDrafterClient(DrafterClientBase):
+class RemoteDrafterClient(MainDrafterClient):
     def __init__(
         self,
         config      : SchedulerConfig,
         device      : torch.device,
         vocab_size  : int,
         hidden_size : int,
-        window_size : int | None       = None,
+        window_size : int | None              = None,
+        scheduler_io: SchedulerIOMixin | None = None,
     ):
-        super().__init__(config, device, vocab_size, hidden_size, window_size)
-        self.direct = False
+        super().__init__(
+            config, device, vocab_size, hidden_size,
+            window_size=window_size, scheduler_io=scheduler_io
+        )
         self.data_plane = NCCLDataPlane(device, rank=0, dtype=config.dtype)
         self.sender = ZmqPushQueue(
             config.zmq_drafter_addr, create=True, encoder=BaseDrafterMsg.encoder
@@ -213,19 +249,19 @@ class RemoteDrafterClient(DrafterClientBase):
         )
         self.data_plane.send_hidden(hidden)
 
-    def step(
+    def _draft(
         self,
         reqs           : list,
         appended_hidden: torch.Tensor | None,
         has_sampling   : bool,
     ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
         self.sender.put(DraftStepMsg(reqs=reqs))
-        if appended_hidden is not None and appended_hidden.shape[0] > 0:
+        if appended_hidden is not None:
             self.data_plane.send_hidden(appended_hidden)
         probs: torch.Tensor | None = None
         if has_sampling:
             rows = sum(r.n_drafts for r in reqs if r.sampling)
-            probs = self.data_plane.recv_probs(rows, self.vocab_size)
+            probs = self.data_plane.recv_probs(rows)
         reply = self.receiver.get()
         return reply, probs
 

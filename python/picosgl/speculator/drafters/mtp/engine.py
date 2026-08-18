@@ -57,12 +57,12 @@ class MTPEngine(EngineBase):
         params = st.sampling_params
         start = 0 if st.mtp_kv is None else st.mtp_kv[0].shape[1]  # carried KV rows
 
-        carry_tok = torch.tensor(st.carry_tokens[start:], dtype=torch.int32, device=self.device)
-        carry_pos = torch.tensor(
-            st.carry_positions[start:], dtype=torch.int64, device=self.device
+        window_tok = torch.tensor(st.window_tokens[start:], dtype=torch.int32, device=self.device)
+        window_pos = torch.tensor(
+            st.window_positions[start:], dtype=torch.int64, device=self.device
         )
         _, logits, h, st.mtp_kv = self.drafter.draft(
-            carry_tok, carry_pos, st.carry_hidden[start:], st.mtp_kv
+            window_tok, window_pos, st.window_hidden[start:], st.mtp_kv
         )
         st.draft_tokens.append(self.sampler.draft_token(logits[-1], params))
         if sampling:
@@ -70,7 +70,7 @@ class MTPEngine(EngineBase):
         mtp_hidden = h[-1]
         mtp_kv = st.mtp_kv
 
-        first_pos = st.carry_positions[-1]
+        first_pos = st.window_positions[-1]
         for j in range(1, n_drafts):
             draft_tok = torch.tensor([st.draft_tokens[-1]], dtype=torch.int32, device=self.device)
             draft_pos = torch.tensor([first_pos + j], dtype=torch.int64, device=self.device)

@@ -96,7 +96,7 @@ def _nccl_uid_to_ffi(nccl_uid: bytes) -> list[int]:
     return [v if v < 128 else v - 256 for v in nccl_uid]
 
 
-def init_pynccl_p2p(
+def init_pynccl_drafter_target_separation(
     *,
     rank          : int,
     world_size    : int,

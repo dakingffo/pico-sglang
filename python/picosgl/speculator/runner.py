@@ -3,7 +3,6 @@ from __future__ import annotations
 import torch
 
 from picosgl.message import (
-    BaseDrafterMsg,
     DraftHandshakeAckMsg,
     DraftHandshakeMsg,
     DraftInitMsg,
@@ -50,7 +49,6 @@ class DrafterRunner:
             handshake.max_hidden_rows, handshake.hidden_size,
             handshake.max_prob_rows, handshake.vocab_size,
         )
-        # Don't gate on the target's ack: ncclCommInitRank blocks until both ranks arrive.
         self.data_plane.init_rank1(handshake.nccl_uid, sizes)
         self.reply.put(DraftHandshakeAckMsg())
         logger.info(
@@ -73,32 +71,26 @@ class DrafterRunner:
             pass
 
     def _on_init(self, msg: DraftInitMsg) -> None:
-        hidden = self.data_plane.recv_hidden(len(msg.carry_positions), self.hidden_size)
+        hidden = self.data_plane.recv_hidden(len(msg.carry_positions))
         self.states[msg.uid] = MTPState(
             sampling_params=msg.sampling_params,
-            carry_positions=msg.carry_positions,
-            carry_tokens=msg.carry_tokens,
-            carry_hidden=hidden,
+            window_positions=msg.carry_positions,
+            window_tokens=msg.carry_tokens,
+            window_hidden=hidden,
             window_size=self.window_size,
         )
 
     def _on_step(self, msg: DraftStepMsg) -> None:
         total_rows = sum(len(r.append_positions) for r in msg.reqs)
         if total_rows > 0:
-            hidden = self.data_plane.recv_hidden(total_rows, self.hidden_size)
-            off = 0
-            for r in msg.reqs:
-                n = len(r.append_positions)
-                if n:
-                    st = self.states[r.uid]
-                    st.update_carry(
-                        r.append_positions, r.append_tokens, hidden[off : off + n]
-                    )
-                    off += n
-            assert off == total_rows
-        # Every request needs n_drafts; the first round's empty append_positions skips the loop above.
-        for st, r in zip((self.states[r.uid] for r in msg.reqs), msg.reqs):
+            hidden = self.data_plane.recv_hidden(total_rows)
+        off = 0
+        for r in msg.reqs:
+            st = self.states[r.uid]
             st.n_drafts = r.n_drafts
+            if n := len(r.append_positions):
+                st.update_window(r.append_positions, r.append_tokens, hidden[off : off + n])
+                off += n
 
         self.engine.draft([self.states[r.uid] for r in msg.reqs])
 
