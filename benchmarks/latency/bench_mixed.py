@@ -15,7 +15,7 @@ to the server's ``--enable-dt-separation``. Examples:
   # DT separation: target tp=1 on one card, drafter on the other
   python benchmarks/latency/bench_mixed.py --model-path <model> --tensor-parallel-size 1 \
       --dt --num-prompts 1,4,8,16,32,64,128,256 \
-      --short-len 128 --short-out 64 --long-len 8192 --long-out 512 --long-frac 0.2
+      --short-len 128 --short-out 64 --long-len 2048 --long-out 512 --long-frac 0.2
 
   # No DT separation: target tp=2 (drafter shares rank0's card)
   python benchmarks/latency/bench_mixed.py --model-path <model> --tensor-parallel-size 2 \
@@ -68,7 +68,7 @@ def main() -> int:
         extra={
             "--short-len": {"type": int, "default": 128, "help": "short prompt length in tokens"},
             "--short-out": {"type": int, "default": 64, "help": "short generation length in tokens"},
-            "--long-len": {"type": int, "default": 8192, "help": "long prompt length in tokens"},
+            "--long-len": {"type": int, "default": 2048, "help": "long prompt length in tokens"},
             "--long-out": {"type": int, "default": 512, "help": "long generation length in tokens"},
             "--long-frac": {"type": float, "default": 0.2,
                             "help": "fraction of prompts that are long (default 0.2)"},

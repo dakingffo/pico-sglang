@@ -75,7 +75,7 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool)
-        self.prefill_budget = config.max_prefill_length
+        self.prefill_budget = config.max_prefill_tokens
 
     def _make_drafter_client(self) -> DrafterClientBase:
         mc = self.engine.config.model_config

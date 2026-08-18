@@ -213,7 +213,15 @@ class Engine:
         if config.model_config.is_hybrid:
             cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
             reserve_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
-            reserve_state = config.max_running_req * reserve_per_req
+            # Reserve covers the verify batch (decode_budget//K reqs/step, each K+1
+            # slots = max_running_req//2 for the default budget), not all running reqs.
+            reserve_state = (
+                min(
+                    config.max_running_req,
+                    config.decode_batch_budget // config.speculative_num_draft_tokens,
+                )
+                * reserve_per_req
+            )
             reserve_bytes = reserve_state * cache_per_state
 
         num_pages = config.num_page_override

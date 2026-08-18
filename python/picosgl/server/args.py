@@ -126,17 +126,17 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--max-prefill-length",
+        "--max-prefill-tokens",
         type=int,
-        dest="max_prefill_length",
-        default=ServerArgs.max_prefill_length,
+        dest="max_prefill_tokens",
+        default=ServerArgs.max_prefill_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
     )
 
     parser.add_argument(
-        "--max-decode-length",
+        "--max-decode-tokens",
         type=int,
-        dest="max_decode_length",
+        dest="max_decode_tokens",
         default=None,
         help=(
             "Max total tokens (positions) in a single decode/verify batch. "
@@ -242,10 +242,10 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
-    # resolve the auto --max-decode-length default (token budget, not a req count)
-    if kwargs["max_decode_length"] is None:
+    # resolve the auto --max-decode-tokens default (token budget, not a req count)
+    if kwargs["max_decode_tokens"] is None:
         base = max(1, kwargs["max_running_req"] // 2)
-        kwargs["max_decode_length"] = (
+        kwargs["max_decode_tokens"] = (
             base * kwargs["speculative_num_draft_tokens"]
             if kwargs["speculative_algorithm"] is not None else base
         )
