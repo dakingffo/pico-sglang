@@ -38,9 +38,6 @@ class EngineConfig:
 
     @property
     def enable_mtp(self) -> bool:
-        """Speculative decoding is on (any algorithm). Kept as a property so existing
-        readers (engine page-reserve sizing, graph skip, scheduler manager selection)
-        stay unchanged while the CLI moves to ``--speculative-algorithm``."""
         return self.speculative_algorithm is not None
 
     @cached_property

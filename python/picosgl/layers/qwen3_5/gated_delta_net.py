@@ -391,7 +391,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         table_idx = req.table_idx
         ctx = get_global_ctx()
         state_table = ctx.state_table
-        rb = ctx.draft_state
+        rb = ctx.draft_offset
         assert rb is not None
         baseline_slot = req.baseline_slot
         reserve_slots = [

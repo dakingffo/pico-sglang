@@ -48,10 +48,11 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
-            num_states=getattr(self.engine, "num_states", 0),
+            num_states=self.engine.num_states,
+            num_draft_states=self.engine.num_draft_states,
             state_table=getattr(self.engine, "state_table", None),
             state_pool=getattr(self.engine, "linear_state", None),
-            draft_state=getattr(self.engine, "draft_state", None),
+            draft_offset=getattr(self.engine, "draft_offset", None),
         )
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id

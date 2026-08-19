@@ -80,14 +80,6 @@ class VerifyManager(ARManagerBase):
         tokens = self.token_pool[req.table_idx, positions].tolist()
         hidden = req_hidden[-window_len:].contiguous()
         self.client.init(req.uid, req.table_idx, positions, tokens, hidden, req.sampling_params)
-
-        if self.cache_manager.state_pool is not None:
-            begin = self.cache_manager.draft_state
-            slots = self.cache_manager._allocate(needed_states = self.num_spec_tokens + 1)[1]
-            state = self.cache_manager.state_table[req.table_idx]
-            state[begin: begin + self.num_spec_tokens + 1] = slots
-            req.baseline_slot = int(state[(C - 1) // self.page_size])
-
         self.running_reqs[req.uid] = req
         self._state_table[req.table_idx] = VerifyState()
 

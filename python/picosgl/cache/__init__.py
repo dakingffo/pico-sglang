@@ -63,6 +63,8 @@ def _local_linear_head_counts(model_config: ModelConfig) -> tuple[int, int]:
 def linear_state_slot_bytes_for_config(model_config: ModelConfig, dtype: torch.dtype) -> int:
     """Bytes of one per-rank state slot for a model, using the same conv_dim formula
     as the pool (local head counts under TP)."""
+    if not model_config.is_hybrid:
+        return 0
     num_k_heads, num_v_heads = _local_linear_head_counts(model_config)
     conv_dim = (
         num_k_heads * model_config.linear_key_head_dim * 2

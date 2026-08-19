@@ -26,9 +26,7 @@ from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
 
-# Smallest KV cache we will ever build. When the worst-case MTP state reserve is too
-# large to leave room for this many pages, the reserve is capped instead of refusing
-# to start (runtime eviction absorbs the deficit).
+# Smallest KV cache we will ever build; the MTP draft-state pool must fit alongside it.
 _MIN_KV_PAGES = 2
 
 
@@ -80,7 +78,7 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
-        self.num_pages, num_tokens, num_states = self._determine_num_pages(init_free_memory, config)
+        self.num_pages, num_tokens, self.num_draft_states = self._determine_num_pages(init_free_memory, config)
         # ======================= KV cache initialization ========================
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
@@ -91,11 +89,12 @@ class Engine:
         )
 
         # ======================= Linear attention state pool ========================
+        self.num_states = 0
         if config.model_config.is_hybrid:
-            self.num_states = num_states
+            self.num_states = self.num_pages
             self.ctx.linear_state = self.linear_state = create_linear_state_pool(
                 model_config=config.model_config,
-                num_slots=self.num_states,
+                num_slots=self.num_states + self.num_draft_states,
                 device=self.device,
                 dtype=self.dtype,
             )
@@ -120,8 +119,8 @@ class Engine:
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.ctx.draft_state = self.draft_state = (
-                page_cols if reserve_cols else None
+            self.ctx.draft_offset = self.draft_offset = (
+                page_cols if reserve_cols !=0 else None
             )
 
         # ======================= Attention & MoE backend initialization ========================
@@ -207,39 +206,28 @@ class Engine:
         )
         # For hybrid models every KV page also owns one linear-state slot, and each MTP
         # request additionally owns a K+1 slot reserve. Both are inside the memory budget.
-        reserve_bytes = 0
-        reserve_state = 0
-        cache_per_state = 0
-        if config.model_config.is_hybrid:
-            cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
-            reserve_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
-            # Reserve covers the verify batch (decode_budget//K reqs/step, each K+1
-            # slots = max_running_req//2 for the default budget), not all running reqs.
-            reserve_state = (
-                min(
-                    config.max_running_req,
-                    config.decode_batch_budget // config.speculative_num_draft_tokens,
-                )
-                * reserve_per_req
-            )
-            reserve_bytes = reserve_state * cache_per_state
+        cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
+        num_draft_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
+        num_draft_states = min(
+            config.max_running_req,
+            config.decode_batch_budget // config.speculative_num_draft_tokens, # real concurrency
+        ) * num_draft_per_req if config.enable_mtp else 0
+        draft_bytes = num_draft_states * cache_per_state
 
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             if config.model_config.is_hybrid:
-                # The K+1 verify reserve is a worst case (max_running_req concurrent MTP
-                # requests). Cap it so it can never starve the KV cache below MIN_KV_PAGES;
-                # if more requests verify concurrently than slots were reserved, runtime
-                # eviction frees page state slots to absorb the deficit.
                 min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
-                reserve_state = min(
-                    reserve_state,
-                    max(0, (available_memory - min_pages_bytes) // cache_per_state),
+                available_states = (available_memory - min_pages_bytes) // cache_per_state
+                assert num_draft_states <= available_states, (
+                    f"Not enough memory for {num_draft_states} MTP draft states: "
+                    f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum KV pages. "
+                    f"Raise --memory-ratio / --max-running-req, or pin --num-pages."
                 )
-                reserve_bytes = reserve_state * cache_per_state
-                available_memory -= reserve_bytes
+                draft_bytes = num_draft_states * cache_per_state
+                available_memory -= draft_bytes
                 num_pages = max(
                     _MIN_KV_PAGES,
                     available_memory // (cache_per_page + cache_per_state),
@@ -250,18 +238,17 @@ class Engine:
         assert num_pages > 1, (
             "Not enough memory for KV cache, try reducing --num-pages. "
             f"(hybrid: cache_per_page={mem_GB(cache_per_page)}, cache_per_state="
-            f"{mem_GB(cache_per_state)}, reserve_bytes={mem_GB(reserve_bytes)})"
+            f"{mem_GB(cache_per_state)}, reserve_bytes={mem_GB(draft_bytes)})"
         )
         num_tokens = num_pages * config.page_size
         logger.info(f"Allocating {num_tokens} tokens for KV cache,\
                      K + V = {mem_GB(num_pages * cache_per_page)}")
         if config.model_config.is_hybrid:
-            reserve_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
             logger.info(
-                f"Allocating {num_pages + reserve_state}"
-                f" linear state slots = {mem_GB(num_pages * cache_per_state + reserve_bytes)}"
+                f"Allocating {num_pages + num_draft_states}"
+                f" linear state slots = {mem_GB(num_pages * cache_per_state + draft_bytes)}"
             )
-            return num_pages, num_tokens, num_pages + reserve_state
+            return num_pages, num_tokens, num_draft_states
         else:
             return num_pages, num_tokens, None
 
@@ -280,17 +267,12 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:
-        """Uniform prep for decode / prefill / verify batches -> ForwardInput.
-
-        Order matches the old scheduler._prepare_batch exactly: pad -> page allocation
-        (verify skips: its schedule already allocated exactly the missing region) ->
-        positions -> input tuple -> write tuple (empty for verify) -> out_loc -> metadata
-        -> sampler.prepare.
-        """
         self.graph_runner.pad_batch(batch)
         cache_manager.allocate_paged(batch.reqs)
-        if not batch.is_verify:  # verify writes to the MTP reserve, not page slots
+        if not batch.is_verify:
             cache_manager.allocate_state(batch.reqs)
+        else:
+            cache_manager.allocate_draft_state(batch.reqs)
         batch.positions = self._make_positions(batch, self.device)
         input_mapping = self._make_input_tuple(batch, self.device)
         write_mapping = self._make_write_tuple(batch, self.device)
@@ -420,6 +402,10 @@ def _adjust_config(config: EngineConfig):
         )
         assert config.speculative_num_draft_tokens >= 1, (
             "--speculative-num-draft-tokens must be >= 1"
+        )
+        assert config.decode_batch_budget >= config.speculative_num_draft_tokens, (
+            "--max-decode-tokens must be >= --speculative-num-draft-tokens, "
+            "or the draft-state region is empty"
         )
         if config.enable_dt_separation:
             import torch as _torch

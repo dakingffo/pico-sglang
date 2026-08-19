@@ -102,10 +102,7 @@ class Batch:
     # step, used for the residual rejection sampling (needs the full distribution).
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
-    # full-position hidden attached by engine.forward_batch for MTP prefill batches
-    # (prefill->verify carry handoff). Tied to THIS batch, unlike engine.last_full_hidden
-    # which a subsequent verify forward would overwrite before _process_last_data runs.
-    full_hidden: torch.Tensor | None = field(init=False, default=None)
+    full_hidden : torch.Tensor | None = field(init=False, default=None)
 
     @property
     def is_prefill(self) -> bool:
@@ -138,7 +135,7 @@ class Context:
     linear_state: LinearStatePool = field(init=False)   # linear attention
 
     state_table : torch.Tensor | None = field(default=None, init=False)
-    draft_state : int | None          = field(default=None, init=False)
+    draft_offset : int | None         = field(default=None, init=False)
 
     _batch      : Batch | None        = field(default=None, init=False)
 

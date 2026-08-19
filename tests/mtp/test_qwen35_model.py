@@ -249,7 +249,7 @@ def test3_full_model(mcfg, loaded=None):
     # (the prompt is ~15 tokens < 64); the prefill chunk callback writes page 0 for each
     # request's row, decode reads/writes page 0 too.
     ctx.state_table = torch.full((8, 16), -1, dtype=torch.int32, device=device)
-    ctx.draft_state = 16  # no verify batches in this test
+    ctx.draft_offset = 16  # no verify batches in this test
     slot = iter(range(ctx.linear_state.conv_state.shape[0]))
     for tidx in (3, 4):
         ctx.state_table[tidx, 0] = next(slot)

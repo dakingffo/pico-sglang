@@ -122,7 +122,7 @@ def main():
     rb = page_cols
     st = torch.full((8, page_cols + D), -1, dtype=torch.int32, device=device)
     ctx.state_table = st
-    ctx.draft_state = rb
+    ctx.draft_offset = rb
     set_global_ctx(ctx)
     ctx.attn_backend = create_attention_backend("fi", mcfg)
 
@@ -130,7 +130,7 @@ def main():
         num_pages=8, page_size=PS, num_states=64,
         page_table=torch.zeros((8, 16), dtype=torch.int32, device=device),
         type="hybrid_radix", state_table=st, state_pool=pool,
-        draft_state=rb,
+        draft_offset=rb,
     )
     # one state slot per page each row's prefill + decode will write
     for tidx, pages in ((4, (0, 1)), (5, (0, 1, 2))):
