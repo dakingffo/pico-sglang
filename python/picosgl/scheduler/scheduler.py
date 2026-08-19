@@ -12,12 +12,7 @@ from picosgl.message import (
     ExitMsg,
     UserMsg,
 )
-from picosgl.speculator import (
-    BroadcastDrafterClient,
-    DrafterClientBase,
-    LocalDrafterClient,
-    RemoteDrafterClient,
-)
+from picosgl.speculator import make_drafter_client
 from picosgl.utils import init_logger, load_tokenizer, div_ceil
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
@@ -57,9 +52,9 @@ class Scheduler(SchedulerIOMixin):
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
-        self.drafter_client = None
+        self.drafter_client = make_drafter_client(self, config) if config.enable_mtp else None
+
         if config.enable_mtp:
-            self.drafter_client = self._make_drafter_client()
             self.ar_manager = VerifyManager(
                 config, self.device,
                 self.cache_manager, self.table_manager,
@@ -77,33 +72,6 @@ class Scheduler(SchedulerIOMixin):
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool)
         self.prefill_budget = config.max_prefill_tokens
-
-    def _make_drafter_client(self) -> DrafterClientBase:
-        mc = self.engine.config.model_config
-        if not self.config.tp_info.is_primary():
-            return BroadcastDrafterClient(
-                self.config, self.device, mc.vocab_size, mc.hidden_size,
-                scheduler_io=self
-            )
-        if self.config.enable_dt_separation:
-            return RemoteDrafterClient(
-                self.config, self.device, mc.vocab_size, mc.hidden_size,
-                scheduler_io=self
-            )
-        else:
-            from picosgl.distributed import DistributedInfo, tp_override
-            from picosgl.models.drafters import Qwen3_5MTPDrafter
-            from picosgl.speculator import MTPEngine
-            with tp_override(DistributedInfo(0, 1)):
-                drafter = Qwen3_5MTPDrafter(mc)
-                drafter.load_weights(self.config.speculative_draft_model_path, self.device)
-                engine = MTPEngine(
-                    drafter, self.device, mc.vocab_size, self.config.speculative_num_draft_tokens
-                )
-            return LocalDrafterClient(
-                self.config, self.device, mc.vocab_size, mc.hidden_size,
-                engine=engine, scheduler_io=self
-            )
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")

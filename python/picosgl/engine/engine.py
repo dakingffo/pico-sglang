@@ -77,6 +77,15 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        self.drafter = None
+        if (
+            self.config.enable_mtp
+            and not self.config.enable_dt_separation
+            and self.config.tp_info.is_primary()
+        ):
+            from picosgl.speculator import make_local_drafter  # lazy: speculator imports picosgl.engine
+
+            self.drafter = make_local_drafter(self.device, self.config)
 
         self.num_pages, num_tokens, self.num_draft_states = self._determine_num_pages(init_free_memory, config)
         # ======================= KV cache initialization ========================

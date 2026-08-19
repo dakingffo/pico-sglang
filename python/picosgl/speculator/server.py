@@ -13,11 +13,15 @@ from picosgl.utils import ZmqPullQueue, ZmqPushQueue
 from .data_plane import NCCLDataPlane
 from .drafters.mtp import MTPEngine
 from .runner import DrafterRunner
+from .client import BroadcastDrafterClient, DrafterClientBase, LocalDrafterClient, RemoteDrafterClient
 
 if TYPE_CHECKING:
+    from picosgl.engine.config import EngineConfig
     from picosgl.scheduler.config import SchedulerConfig
+    from picosgl.scheduler.scheduler import Scheduler
 
 
+# independent drafter process
 @torch.inference_mode()
 def drafter_worker(
     *,
@@ -52,3 +56,35 @@ def drafter_worker(
         if ack_queue is not None:
             ack_queue.put("Drafter is ready")
         runner.run_forever()
+
+
+# called by engine
+def make_local_drafter(device: torch.device, config: EngineConfig):
+    with tp_override(DistributedInfo(0, 1)):
+        mc = config.model_config
+        drafter = Qwen3_5MTPDrafter(mc)
+        drafter.load_weights(config.speculative_draft_model_path, device)
+    return drafter
+
+
+# called by scheduler
+def make_drafter_client(sche: Scheduler, config: SchedulerConfig) -> DrafterClientBase:
+    mc = config.model_config
+    if not config.tp_info.is_primary():
+        return BroadcastDrafterClient(
+            config, sche.device, mc.vocab_size, mc.hidden_size,
+            scheduler_io=sche
+        )
+    if config.enable_dt_separation:
+        return RemoteDrafterClient(
+            config, sche.device, mc.vocab_size, mc.hidden_size,
+            scheduler_io=sche
+        )
+    else:
+        engine = MTPEngine(
+            sche.engine.drafter, sche.device, mc.vocab_size, config.speculative_num_draft_tokens
+        )
+        return LocalDrafterClient(
+            config, sche.device, mc.vocab_size, mc.hidden_size,
+            engine=engine, scheduler_io=sche
+        )
