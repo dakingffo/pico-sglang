@@ -69,7 +69,7 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[1]
+        init_free_memory = self._sync_get_memory()[0]  # min across ranks (tightest rank anchors budget)
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
@@ -204,7 +204,9 @@ class Engine:
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int, int | None]:
-        new_free_memory = self._sync_get_memory()[1]
+        # min free across ranks: the non-DT in-process drafter lives only on rank0, so
+        # its bytes must shrink the budget (max would ignore the tightest rank).
+        new_free_memory = self._sync_get_memory()[0]
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
