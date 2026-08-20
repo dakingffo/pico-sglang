@@ -301,7 +301,7 @@ class BroadcastDrafterClient(DrafterClientBase):
         appended_hidden: torch.Tensor | None,
         has_sampling   : bool,
     ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
-        return self._io.recv_draft_from_rank0(self.vocab_size)
+        return self._io._recv_draft_from_rank0(self.vocab_size)
 
     def init(self, *args, **kwargs) -> None:
         pass
