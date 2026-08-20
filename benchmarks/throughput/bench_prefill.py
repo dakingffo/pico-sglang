@@ -10,12 +10,15 @@ Examples:
       --input-len 2048 --num-prompts 64
 """
 import asyncio
+import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from bench_common import (
     launch_server,
     make_prompts,
     parse_full,
+    parse_int_list,
     print_stats,
     resolve_port,
     run_online_bench,
@@ -32,31 +35,33 @@ def main() -> int:
             "--output-len": {"type": int, "default": 8, "help": "generation length in tokens"},
         },
     )
-    prompts, in_lens = make_prompts(
-        server_args.model_path, bench.input_len, bench.num_prompts, bench.seed
-    )
-    out_lens = [bench.output_len] * bench.num_prompts
     port = resolve_port(server_argv, server_args)
     proc = launch_server(server_argv, port=port, enable_mtp=False, num_spec_tokens=0)
     try:
         base = wait_server_ready(port)
-        stats = asyncio.run(
-            run_online_bench(
-                base,
-                server_args.model_path,
-                prompts,
-                in_lens,
-                out_lens,
-                mtp=False,
-                warmup=not bench.no_warmup,
-                pbar=not bench.no_pbar,
+        for c in parse_int_list(bench.num_prompts, 32):
+            prompts, in_lens = make_prompts(
+                server_args.model_path, bench.input_len, c, bench.seed
             )
-        )
-        assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
-        print_stats(
-            f"bench_prefill tp={server_args.tp_info.size} in={bench.input_len} out={bench.output_len}",
-            stats,
-        )
+            out_lens = [bench.output_len] * c
+            stats = asyncio.run(
+                run_online_bench(
+                    base,
+                    server_args.model_path,
+                    prompts,
+                    in_lens,
+                    out_lens,
+                    mtp=False,
+                    warmup=not bench.no_warmup,
+                    pbar=not bench.no_pbar,
+                )
+            )
+            assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
+            print_stats(
+                f"bench_prefill tp={server_args.tp_info.size} "
+                f"in={bench.input_len} out={bench.output_len} conc={c}",
+                stats,
+            )
         return 0
     finally:
         kill_server(proc)

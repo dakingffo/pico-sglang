@@ -55,7 +55,7 @@ def make_cm(st, nslots):
         num_pages=10, page_size=64,
         page_table=torch.zeros((8, 512), dtype=torch.int32),
         type="hybrid_radix", num_states=nslots,
-        state_table=st, state_pool=pool, draft_state=8,
+        state_table=st, state_pool=pool, draft_offset=8,
     )
     return cm, pool
 

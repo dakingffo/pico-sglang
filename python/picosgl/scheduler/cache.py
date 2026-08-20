@@ -15,14 +15,15 @@ if TYPE_CHECKING:
 class CacheManager:
     def __init__(
         self,
-        num_pages  : int,
-        page_size  : int,
-        page_table : torch.Tensor,
-        type       : str,
-        num_states : int                 = 0,
-        state_table: torch.Tensor | None = None,
-        state_pool : object              = None,
-        draft_state: int | None          = None,
+        num_pages       : int,
+        page_size       : int,
+        page_table      : torch.Tensor,
+        type            : str,
+        num_states      : int                 = 0,
+        num_draft_states: int                 = 0,
+        state_table     : torch.Tensor | None = None,
+        state_pool      : object              = None,
+        draft_offset    : int | None          = None,
     ):
         device = page_table.device
         # The `_free_pages` follows a page-aligned manner. For example, if page_size = 2,
@@ -36,9 +37,10 @@ class CacheManager:
         self.page_size = page_size
         # hybrid linear-state wiring (None for non-hybrid models)
         self.num_states = num_states
+        self.num_draft_states = num_draft_states
         self.state_table = state_table
         self.state_pool = state_pool
-        self.draft_state = draft_state
+        self.draft_offset = draft_offset
 
     def match_req(self, req: PendingRequest) -> MatchResult:
         input_len = req.input_len
@@ -88,6 +90,19 @@ class CacheManager:
             allocated = self._allocate(needed_states=len(allocation_info))[1]
             for (tidx, page), slot in zip(allocation_info, allocated.tolist()):
                 self.state_table[tidx, page] = slot
+
+    def allocate_draft_state(self, reqs: list[Request]) -> None:
+        if self.state_pool is None or self.state_table is None:
+            return
+        offset = self.num_states
+        for req in reqs:
+            begin = self.draft_offset
+            end = begin + req.extend_len
+            state = self.state_table[req.table_idx]
+            state[begin: end] = torch.arange(offset, offset + req.extend_len, dtype=torch.int32, device=self.device)
+            if req.baseline_slot == -1:  # first verify round; state_commit_verify owns it after
+                req.baseline_slot = int(state[(req.cached_len - 1) // self.page_size])
+            offset += req.extend_len
 
     def cache_req(self, req: Request, *, finished: bool) -> None:
         # ==================================== valid cache region ====================================
@@ -142,13 +157,11 @@ class CacheManager:
         self._free_state_columns(
             uid, old_handle.cached_len // self.page_size, prefix_len // self.page_size
         )
-        # 2) free the tail (partially-consumed pages) and the MTP reserve if finished
+        # 2) free the tail (partially-consumed pages) if finished
         if finished:
             self._free_state_columns(
                 uid, insert_len // self.page_size, div_ceil(req.cached_len, self.page_size)
             )
-            if self.draft_state is not None:
-                self._free_state_columns(uid, self.draft_state, self.state_table.shape[1])
             # 3) wipe the whole row: the tree already owns [0, insert_len//ps) so their
             #    slots stay alive, and wiping guarantees a reused table_idx never inherits
             #    a stale reference (which a later batch would write into or double-free).
@@ -173,7 +186,7 @@ class CacheManager:
             return
         uid = req.table_idx
         ps = self.page_size
-        begin = self.draft_state
+        begin = self.draft_offset
         assert begin is not None
         C_end = C + num_sampled
         P = (C - 1) // ps
@@ -281,7 +294,7 @@ class CacheManager:
         if self.page_size == 1:
             return pages
         # [X * page_size] -> [X * page_size, ..., X * page_size + page_size - 1]
-        offsets = torch.arange(self.page_size, device=self.device, dtype=torch.int32)
+        offsets = torch.arange(self.page_size, dtype=torch.int32, device=self.device)
         return (pages.unsqueeze(1) + offsets).flatten()
 
     def _write_page_table(

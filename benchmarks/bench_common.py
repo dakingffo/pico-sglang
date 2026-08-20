@@ -28,10 +28,11 @@ import sys
 import time
 from typing import Any
 
-_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "python"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
+if os.path.isdir("/home/daking/.conda/envs/daking"):
+    os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
 
 # -------------------------------------------------------------------------------------
@@ -42,7 +43,8 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 # --page-size, --num-pages, --max-running-requests, --memory-ratio, --enable-mtp,
 # --num-spec-tokens, ...) is parsed by the library's picosgl.server.args.parse_args.
 BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
-    "--num-prompts": {"type": int, "default": 32, "help": "number of concurrent requests"},
+    "--num-prompts": {"type": str, "default": None,
+                      "help": "comma-separated concurrent request counts (default 32)"},
     "--input-len": {"type": int, "default": None, "help": "prompt length in tokens"},
     "--output-len": {"type": int, "default": None, "help": "generation length in tokens"},
     "--seed": {"type": int, "default": 0, "help": "RNG seed for prompt generation (A/B uses one batch)"},
@@ -69,6 +71,14 @@ def parse_full(argv: list[str], extra: dict[str, dict[str, Any]] | None = None):
 
     server_args, _ = parse_args(server_argv)
     return server_args, bench_ns, server_argv
+
+
+def parse_int_list(s: str | None, default: int) -> list[int]:
+    """Comma-separated bench flag value -> list of ints (None/empty -> [default])."""
+    if s is None:
+        return [default]
+    vals = [int(x) for x in s.split(",") if x.strip()]
+    return vals if vals else [default]
 
 
 # -------------------------------------------------------------------------------------
@@ -105,6 +115,22 @@ def make_prompts(model_path: str, input_len: int, num_prompts: int, seed: int):
     return prompts, lens
 
 
+def make_mixed_prompts(model_path: str, segments: list[tuple[int, int]], seed: int):
+    """One seeded mixed-length batch. ``segments`` is [(input_len, count), ...]; returns
+    (prompts, lens) in segment order so group indices are just running offsets."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    random.seed(seed)
+    prompts, lens = [], []
+    for in_len, count in segments:
+        for _ in range(count):
+            p = generate_prompt(tokenizer, in_len)
+            prompts.append(p)
+            lens.append(len(tokenizer.encode(p, add_special_tokens=False)))
+    return prompts, lens
+
+
 # -------------------------------------------------------------------------------------
 # server lifecycle: launch / ready / kill
 # -------------------------------------------------------------------------------------
@@ -122,36 +148,58 @@ def resolve_port(server_argv: list[str], server_args: Any) -> int:
     return get_free_port()
 
 
-def make_server_cmd(server_argv: list[str], *, port: int, enable_mtp: bool, num_spec_tokens: int) -> list[str]:
+_MTP_VALUE_FLAGS = (
+    "--port", "--num-spec-tokens", "--speculative-algorithm",
+    "--speculative-num-draft-tokens", "--speculative-draft-model-path",
+)
+_MTP_BOOL_FLAGS = ("--enable-mtp", "--enable-dt-separation")
+
+
+def _flag_value(argv: list[str], name: str) -> str | None:
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def make_server_cmd(server_argv: list[str], *, port: int, enable_mtp: bool, num_spec_tokens: int, enable_dt: bool = False) -> list[str]:
     """Rebuild the child cmd from the library-parsed argv, pinning what the bench controls.
 
-    --port, --num-spec-tokens and --enable-mtp are stripped and set deterministically so
-    tp / MTP comparisons differ by exactly the flag under test.
+    --port and every speculative/MTP flag are stripped and set deterministically so tp /
+    MTP / DT comparisons differ by exactly the flag under test.
     """
     argv: list[str] = []
     i = 0
     while i < len(server_argv):
         a = server_argv[i]
-        if a in ("--port", "--num-spec-tokens"):
+        if a in _MTP_VALUE_FLAGS:
             i += 2  # skip flag + value
             continue
-        if a.startswith("--port=") or a.startswith("--num-spec-tokens="):
-            i += 1
+        if a in _MTP_BOOL_FLAGS:
+            i += 1  # store_true
             continue
-        if a == "--enable-mtp":
+        if any(a.startswith(f + "=") for f in _MTP_VALUE_FLAGS + _MTP_BOOL_FLAGS):
             i += 1
             continue
         argv.append(a)
         i += 1
     argv += ["--port", str(port)]
     if enable_mtp:
-        argv += ["--enable-mtp", "--num-spec-tokens", str(num_spec_tokens)]
+        model_path = _flag_value(server_argv, "--model-path")
+        assert model_path, "MTP bench needs --model-path"
+        argv += ["--speculative-algorithm", "MTP",
+                 "--speculative-num-draft-tokens", str(num_spec_tokens),
+                 "--speculative-draft-model-path", model_path]
+        if enable_dt:
+            argv += ["--enable-dt-separation"]
     return [sys.executable, "-m", "picosgl"] + argv
 
 
-def launch_server(server_argv: list[str], *, port: int, enable_mtp: bool, num_spec_tokens: int):
+def launch_server(server_argv: list[str], *, port: int, enable_mtp: bool, num_spec_tokens: int, enable_dt: bool = False):
     """Spawn the pico-sglang server in its own process group. Returns (Popen, log path)."""
-    cmd = make_server_cmd(server_argv, port=port, enable_mtp=enable_mtp, num_spec_tokens=num_spec_tokens)
+    cmd = make_server_cmd(server_argv, port=port, enable_mtp=enable_mtp, num_spec_tokens=num_spec_tokens, enable_dt=enable_dt)
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.join(_REPO, "python") + os.pathsep + env.get("PYTHONPATH", "")
     log_path = f"/tmp/picosgl_bench_{port}.log"
@@ -255,7 +303,7 @@ async def stream_one(client: Any, base: str, model: str, prompt: str, output_len
     return tics
 
 
-async def run_online_bench(
+async def run_online_bench_tics(
     base: str,
     model: str,
     prompts: list[str],
@@ -265,7 +313,8 @@ async def run_online_bench(
     mtp: bool = False,
     warmup: bool = True,
     pbar: bool = True,
-) -> dict:
+) -> tuple[dict, list[list[float]]]:
+    """Drive the workload, returning (summary, per-request tics) for split reporting."""
     import httpx
 
     # bounded connect so a dead server fails fast; unbounded read for long streams
@@ -286,7 +335,43 @@ async def run_online_bench(
         await client.aclose()
     if progress.on:
         print(file=sys.stderr, flush=True)
-    return summarize(tics_all, input_lengths, output_lengths, mtp=mtp)
+    return summarize(tics_all, input_lengths, output_lengths, mtp=mtp), tics_all
+
+
+async def run_online_bench(
+    base: str,
+    model: str,
+    prompts: list[str],
+    input_lengths: list[int],
+    output_lengths: list[int],
+    *,
+    mtp: bool = False,
+    warmup: bool = True,
+    pbar: bool = True,
+) -> dict:
+    summary, _ = await run_online_bench_tics(
+        base, model, prompts, input_lengths, output_lengths,
+        mtp=mtp, warmup=warmup, pbar=pbar,
+    )
+    return summary
+
+
+def summarize_group(
+    tics_all: list[list[float]],
+    input_lengths: list[int],
+    output_lengths: list[int],
+    indices: list[int],
+    *,
+    mtp: bool = False,
+) -> dict:
+    """Summarize a subset of requests (by index) -- short/long split reporting."""
+    sub = [tics_all[i] for i in indices]
+    return summarize(
+        sub,
+        [input_lengths[i] for i in indices],
+        [output_lengths[i] for i in indices],
+        mtp=mtp,
+    )
 
 
 def _pct(xs: list[float], p: float) -> float:
@@ -395,6 +480,17 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
     if s.get("avg_accept"):
         print(f"  verify rounds: {s['rounds']}  avg_accept: {s['avg_accept']:.2f} tok/round")
     print("=" * 64)
+
+
+def print_conc_summary(rows: list[tuple[int, dict]]) -> None:
+    print("=" * 66)
+    print("  concurrency sweep")
+    print(f"  {'conc':>6} {'decode':>10} {'total':>10} {'req/s':>8} "
+          f"{'TTFT p50':>10} {'TPOT p50':>10}")
+    for conc, s in rows:
+        print(f"  {conc:>6} {s['decode_tok_per_s']:>10.1f} {s['total_tok_per_s']:>10.1f} "
+              f"{s['req_per_s']:>8.2f} {s['ttft_ms'][1]:>10.2f} {s['tpot_ms'][1]:>10.2f}")
+    print("=" * 66)
 
 
 def print_compare(a: dict, b: dict) -> None:

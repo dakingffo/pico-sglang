@@ -277,7 +277,7 @@ def run():
         for p in (0, 1):
             st[0, p] = p
         ctx.state_table = st
-        ctx.draft_state = 8
+        ctx.draft_offset = 8
         set_global_ctx(ctx)
         return ctx
 

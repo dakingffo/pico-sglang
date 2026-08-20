@@ -4,7 +4,8 @@ Loads the non-MTP pico-sglang run JSON (tests/mtp/test_mtp_e2e.py --mtp 0) and a
 transformers greedy decode of the same 5 prompts, then compares token-for-token.
 
 Qwen3-1.7B is dense (num_linear_layers=0), so the depth-D linear state pool is inert and
-VerifyManager is not created without --enable-mtp. This test proves the non-MTP path still
+VerifyManager is not created without --speculative-algorithm. This test proves the
+non-MTP path still
 produces a byte-identical greedy stream to the reference HF implementation — i.e. the MTP
 refactor did not perturb it.
 

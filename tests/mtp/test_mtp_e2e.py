@@ -56,7 +56,13 @@ TIE_MARGIN = 0.2
 
 
 class OfflineScheduler(Scheduler):
-    """Scheduler with an in-process message queue instead of ZMQ."""
+    """Scheduler with an in-process message queue instead of ZMQ.
+
+    DT separation is off locally (single GPU), so the drafter runs in-process: the
+    scheduler builds the standalone ``Qwen3_5MTPDrafter`` + ``MTPEngine`` directly
+    (``scheduler._make_inprocess_client``), with no separate drafter process, no zmq
+    control plane, and no data plane. This is the non-DT production path.
+    """
 
     def __init__(self, config, msgs):
         self._pending = list(msgs)
@@ -85,13 +91,14 @@ def make_config(enable_mtp: bool, num_pages: int = 256) -> SchedulerConfig:
         num_page_override=num_pages,
         cache_type="naive",  # hybrid is force-upgraded to hybrid_radix by the engine
         cuda_graph_max_bs=0,
-        enable_mtp=enable_mtp,
-        num_spec_tokens=K,
+        speculative_algorithm="MTP" if enable_mtp else None,
+        speculative_draft_model_path=MODEL if enable_mtp else None,
+        speculative_num_draft_tokens=K,
         offline_mode=True,
     )
 
 
-def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
+def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) -> dict:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
@@ -102,7 +109,7 @@ def run(enable_mtp: bool, debug_logits: bool = False) -> dict:
             UserMsg(
                 uid=uid,
                 input_ids=ids.to(torch.int32),
-                sampling_params=SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS),
+                sampling_params=SamplingParams(temperature=temperature, max_tokens=MAX_TOKENS),
             )
         )
     sched = OfflineScheduler(make_config(enable_mtp), msgs)
@@ -279,6 +286,9 @@ def main() -> None:
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--compare", nargs=2, metavar=("NON_MTP", "MTP"))
     ap.add_argument("--debug-logits", action="store_true")
+    ap.add_argument("--sampling-temp", type=float, default=0.0,
+                    help="temperature for all prompts (0 = greedy; >0 exercises the "
+                         "drafter's draft_probs data-plane leg)")
     args = ap.parse_args()
 
     if args.compare:
@@ -355,7 +365,8 @@ def main() -> None:
         sys.exit(0 if "fail" not in verdict.values() else 1)
 
     assert args.mtp is not None and args.out is not None
-    result = run(bool(args.mtp), debug_logits=args.debug_logits)
+    result = run(bool(args.mtp), debug_logits=args.debug_logits,
+                 temperature=args.sampling_temp)
     with open(args.out, "w") as f:
         json.dump(result, f)
     print(json.dumps({k: v for k, v in result.items() if k != "tokens"}, indent=1))

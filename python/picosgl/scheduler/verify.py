@@ -1,52 +1,62 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.engine import VerifyOutput, Sampler
+from picosgl.engine import VerifyOutput
 from picosgl.core import Batch, Request, Context
-from picosgl.message import DetokenizeMsg
+from picosgl.message import DetokenizeMsg, DraftReplyMsg, DraftStepReq
+from picosgl.speculator import DraftState
 from picosgl.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
 
 if TYPE_CHECKING:
+    from picosgl.speculator import DrafterClientBase
+
     from .cache import CacheManager
     from .config import SchedulerConfig
     from .table import TableManager
 
 
 @dataclass
-class VerifyState:
-    draft_tokens     : list[int]
-    draft_probs      : torch.Tensor | None
-    carry_positions  : list[int]
-    carry_hidden     : torch.Tensor  # (window_len, hidden) main-model hidden, leading-token
-    mtp_kv           : tuple[torch.Tensor, torch.Tensor] | None = None
+class VerifyState(DraftState):
+    carry_tokens   : list[int] = field(default_factory=list, init=False)
+    carry_positions: list[int] = field(default_factory=list, init=False)
+    carry_hidden   : torch.Tensor | None = None
+
+    def set_carry(self, tokens, positions, hidden):
+        self.carry_tokens = tokens
+        self.carry_positions = positions
+        self.carry_hidden = hidden
+
+    def get_carry(self):
+        return (
+            self.carry_tokens,
+            self.carry_positions,
+            self.carry_hidden
+        )
 
 
 class VerifyManager(ARManagerBase):
     def __init__(
         self,
-        config         : SchedulerConfig,
-        device         : torch.device,
-        sampler        : Sampler,
-        mtp            : torch.nn.Module,
-        cache_manager  : CacheManager,
-        table_manager  : TableManager,
-        eos_token_id   : int,
-        num_spec_tokens: int,
-        window_size    : int = 128,
+        config        : SchedulerConfig,
+        device        : torch.device,
+        cache_manager : CacheManager,
+        table_manager : TableManager,
+        eos_token_id  : int,
+        client        : DrafterClientBase,
+        vocab_size    : int,
     ) -> None:
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
         self.page_table = table_manager.page_table
-        self.num_spec_tokens = num_spec_tokens
-        self.window_size = window_size
-        self.sampler = sampler
-        self.mtp = mtp
-        self.vocab_size = self.sampler.vocab_size
+        self.num_spec_tokens = config.speculative_num_draft_tokens
+        self.window_size = config.speculator_window_size
+        self.client = client
+        self.vocab_size = vocab_size
         self._state_table: dict[int, VerifyState] = {}
 
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
@@ -58,30 +68,20 @@ class VerifyManager(ARManagerBase):
         else:
             req.aborted = True
             self._state_table.pop(req.table_idx, None)
+            self.client.remove(uid)
             return req, inflight
 
     def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
         req_hidden = full_hidden[mapping == req.table_idx]
         C = req.cached_len
         window_len = min(self.window_size, req_hidden.shape[0])
-        st = VerifyState(
-            draft_tokens=[],
-            draft_probs=None,
-            # window ends at the bonus position C (token_pool[C] = bonus)
-            carry_positions=list(range(C + 1 - window_len, C + 1)),
-            carry_hidden=req_hidden[-window_len:].contiguous(),
-        )
-        # MTP verify reserve: allocate the K+1 reserve slots once and set the baseline to
-        # the prefill terminal state (state after position C-1). Pure index bookkeeping.
-        if self.cache_manager.state_pool is not None:
-            begin = self.cache_manager.draft_state
-            slots = self.cache_manager._allocate(needed_states = self.num_spec_tokens + 1)[1]
-            self.cache_manager.state_table[req.table_idx, begin: begin + self.num_spec_tokens + 1] = slots
-            req.baseline_slot = int(
-                self.cache_manager.state_table[req.table_idx, (C - 1) // self.page_size]
-            )
+        # window ends at the bonus position C (token_pool[C] = bonus)
+        positions = list(range(C + 1 - window_len, C + 1))
+        tokens = self.token_pool[req.table_idx, positions].tolist()
+        hidden = req_hidden[-window_len:].contiguous()
+        self.client.init(req.uid, req.table_idx, positions, tokens, hidden, req.sampling_params)
         self.running_reqs[req.uid] = req
-        self._state_table[req.table_idx] = st
+        self._state_table[req.table_idx] = VerifyState()
 
     def schedule_next_batch(self) -> Batch | None:
         K = self.num_spec_tokens
@@ -91,6 +91,8 @@ class VerifyManager(ARManagerBase):
 
         scheduled_token = 0
         reqs = []
+        step_reqs = []
+        hidden_rows = []
         for uid, req in self.running_reqs.items():
             if scheduled_token >= self.token_budget:
                 break
@@ -98,36 +100,66 @@ class VerifyManager(ARManagerBase):
                 self.inflight_uids[1].add(uid)
                 reqs.append(req)
                 scheduled_token += K
-                st = self._state_table[req.table_idx]
                 C = req.cached_len
-                n_drafts = self._draft(req, st)
+                remain = req.remain_len
+                n_drafts = min(K, remain - 1) if remain > 0 else 0
                 req.device_len = C + n_drafts + 1
-                if st.draft_tokens:
-                    self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
-                        torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
+                toks, pos, hids = self._state_table[req.table_idx].get_carry()
+                step_reqs.append(
+                    DraftStepReq(
+                        uid=uid,
+                        n_drafts=n_drafts,
+                        append_positions=pos,
+                        append_tokens=toks,
+                        sampling=not req.sampling_params.is_greedy,
                     )
+                )
+                if hids is not None:
+                    hidden_rows.append(hids)
 
         if not reqs:
             return None
-        
+
+        appended_hidden = torch.cat(hidden_rows, dim=0) if hidden_rows else None
+        has_sampling = any(sr.sampling for sr in step_reqs)
+
+        reply, probs = self.client.step(step_reqs, appended_hidden, has_sampling)
+
+        reply_by_uid = {r.uid: r for r in reply.reqs}
+        probs_by_uid: dict[int, torch.Tensor] = {}
+        if probs is not None:
+            off = 0
+            for sr in step_reqs:
+                if sr.sampling:
+                    probs_by_uid[sr.uid] = probs[off: off + sr.n_drafts]
+                    off += sr.n_drafts
+
         batch = Batch(reqs=reqs, phase="verify")
         bs = len(reqs)
         draft_tokens = torch.full((bs, K), -1, dtype=torch.int32, device=self.device)
         draft_probs: torch.Tensor | None = None
         for i, req in enumerate(reqs):
             st = self._state_table[req.table_idx]
-            if st.draft_tokens:
-                draft_tokens[i, : len(st.draft_tokens)].copy_(
-                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
-                )
-            if st.draft_probs is not None:
+            C = req.cached_len
+            st.draft_tokens = reply_by_uid[req.uid].draft_tokens
+            if req.uid in probs_by_uid:
+                st.draft_probs = probs_by_uid[req.uid]
                 if draft_probs is None:
                     draft_probs = torch.zeros(
                         bs, K, self.vocab_size, dtype=torch.float32, device=self.device
                     )
-                draft_probs[i, :K] = st.draft_probs
+                n = st.draft_probs.shape[0]
+                draft_probs[i, :n] = st.draft_probs
+            if st.draft_tokens:
+                self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
+                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
+                )
+                draft_tokens[i, : len(st.draft_tokens)].copy_(
+                    torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
+                )
         batch.draft_tokens = draft_tokens
         batch.draft_probs = draft_probs
+
         return batch
 
     def process(
@@ -171,7 +203,11 @@ class VerifyManager(ARManagerBase):
             # commit the accepted states: pure index ops on the reserve (pin/swap/refill)
             self.cache_manager.state_commit_verify(req, C, num_sampled)
             self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
-            self._update_carry(st, full_hidden, row_start, C, num_sampled)
+            st.set_carry(
+                sampled_token,
+                list(range(C + 1, C + 1 + num_sampled)),
+                full_hidden[row_start: row_start + num_sampled],
+            )
             committed[i] = (C, num_sampled, sampled_token, n_drafts)
 
         reply: list[DetokenizeMsg] = []
@@ -217,67 +253,4 @@ class VerifyManager(ARManagerBase):
     def _finish_req(self, req: Request) -> None:
         self.running_reqs.pop(req.uid, None)
         self._state_table.pop(req.table_idx, None)
-
-    def _update_carry(
-        self,
-        st         : VerifyState,
-        full_hidden: torch.Tensor,
-        row_start  : int,
-        C          : int,
-        num_sampled: int,
-    ) -> None:
-        st.carry_positions.extend(range(C + 1, C + 1 + num_sampled))
-        new_hidden = full_hidden[row_start: row_start + num_sampled]
-        st.carry_hidden = (
-            torch.cat([st.carry_hidden, new_hidden], dim=0)
-            if st.carry_hidden is not None else new_hidden
-        )
-
-        reserved_len = max(0, len(st.carry_positions) - self.window_size)
-        st.carry_positions = st.carry_positions[reserved_len:]
-        st.carry_hidden = st.carry_hidden[reserved_len:]
-        if st.mtp_kv is not None:
-            k, v = st.mtp_kv
-            st.mtp_kv = (k[:, reserved_len:].contiguous(), v[:, reserved_len:].contiguous())
-
-    def _draft(self, req: Request, st: VerifyState) -> int:
-        K = self.num_spec_tokens
-        remain = req.remain_len
-        n_drafts = min(K, remain - 1) if remain > 0 else 0
-        sampling = not req.sampling_params.is_greedy
-        st.draft_tokens = []
-        st.draft_probs = (
-            torch.zeros(K, self.vocab_size, dtype=torch.float32, device=self.device)
-            if sampling else None
-        )
-        if n_drafts == 0:
-            return 0
-
-        params = req.sampling_params
-        start = 0 if st.mtp_kv is None else st.mtp_kv[0].shape[1] # shape = (num_head, seq_len, head_dim)
-
-        carry_tok = self.token_pool[req.table_idx, st.carry_positions[start:]]
-        carry_pos = torch.tensor(
-            st.carry_positions[start:], dtype=torch.int64, device=self.device
-        )
-        _, logits, h, st.mtp_kv = self.mtp.draft(
-            carry_tok, carry_pos, st.carry_hidden[start:], st.mtp_kv
-        )
-        st.draft_tokens.append(self.sampler.draft_token(logits[-1], params))
-        if sampling:
-            st.draft_probs[0] = self.sampler._target_dist(logits[-1], params)
-        mtp_hidden = h[-1]
-        mtp_kv = st.mtp_kv
-
-        first_pos = st.carry_positions[-1]
-        for j in range(1, n_drafts):
-            draft_tok = torch.tensor([st.draft_tokens[-1]], dtype=torch.int32, device=self.device)
-            draft_pos = torch.tensor([first_pos + j], dtype=torch.int64, device=self.device)
-            _, logits, h, mtp_kv = self.mtp.draft(
-                draft_tok, draft_pos, mtp_hidden.unsqueeze(0), mtp_kv
-            )
-            st.draft_tokens.append(self.sampler.draft_token(logits[-1], params))
-            if sampling:
-                st.draft_probs[j] = self.sampler._target_dist(logits[-1], params)
-            mtp_hidden = h[-1]
-        return n_drafts
+        self.client.remove(req.uid)

@@ -126,22 +126,22 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--max-prefill-length",
+        "--max-prefill-tokens",
         type=int,
-        dest="max_prefill_length",
-        default=ServerArgs.max_prefill_length,
+        dest="max_prefill_tokens",
+        default=ServerArgs.max_prefill_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
     )
 
     parser.add_argument(
-        "--max-decode-length",
+        "--max-decode-tokens",
         type=int,
-        dest="max_decode_length",
+        dest="max_decode_tokens",
         default=None,
         help=(
             "Max total tokens (positions) in a single decode/verify batch. "
-            "Default: max_running_req // 2, scaled by --num-spec-tokens when "
-            "--enable-mtp is set (each verify req occupies num_spec_tokens+1 positions)."
+            "Default: max_running_req // 2, scaled by --speculative-num-draft-tokens when "
+            "--speculative-algorithm is set (each verify req occupies K+1 positions)."
         ),
     )
 
@@ -199,17 +199,35 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--enable-mtp",
-        action="store_true",
-        dest="enable_mtp",
-        help="Enable MTP speculative decoding (requires a model with an MTP head).",
+        "--speculative-algorithm",
+        type=str,
+        dest="speculative_algorithm",
+        default=None,
+        choices=["MTP", "DFLASH"],
+        help="The speculative decoding algorithm. Only MTP is implemented; DFLASH is reserved.",
     )
 
     parser.add_argument(
-        "--num-spec-tokens",
+        "--speculative-draft-model-path",
+        type=str,
+        dest="speculative_draft_model_path",
+        default=ServerArgs.speculative_draft_model_path,
+        help="Path of the drafter weights. Under MTP this must equal --model-path.",
+    )
+
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
         type=int,
-        default=ServerArgs.num_spec_tokens,
+        dest="speculative_num_draft_tokens",
+        default=ServerArgs.speculative_num_draft_tokens,
         help="Number of speculative draft tokens (K) per verify round.",
+    )
+
+    parser.add_argument(
+        "--enable-dt-separation",
+        action="store_true",
+        dest="enable_dt_separation",
+        help="Run the drafter on a separate device (requires tp_size + 1 GPUs).",
     )
 
     # Parse arguments
@@ -224,11 +242,12 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
-    # resolve the auto --max-decode-length default (token budget, not a req count)
-    if kwargs["max_decode_length"] is None:
+    # resolve the auto --max-decode-tokens default (token budget, not a req count)
+    if kwargs["max_decode_tokens"] is None:
         base = max(1, kwargs["max_running_req"] // 2)
-        kwargs["max_decode_length"] = (
-            base * kwargs["num_spec_tokens"] if kwargs["enable_mtp"] else base
+        kwargs["max_decode_tokens"] = (
+            base * kwargs["speculative_num_draft_tokens"]
+            if kwargs["speculative_algorithm"] is not None else base
         )
 
     if kwargs["model_path"].startswith("~"):

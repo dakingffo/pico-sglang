@@ -11,7 +11,10 @@ from .config import SchedulerConfig
 from .scheduler import Scheduler
 
 @torch.inference_mode()
-def schedule_worker(args: SchedulerConfig, ack_queue: mp.Queue[str]) -> None:
+def schedule_worker(
+    args      : SchedulerConfig,
+    ack_queue : mp.Queue[str],
+) -> None:
     scheduler = Scheduler(args)
     scheduler.sync_all_ranks()
 

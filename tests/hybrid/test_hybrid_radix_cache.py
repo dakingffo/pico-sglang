@@ -24,7 +24,7 @@ import torch
 
 from picosgl.core import Context, Request, SamplingParams, set_global_ctx
 from picosgl.scheduler.cache import CacheManager
-from picosgl.scheduler.utils import PendingRequest
+from picosgl.scheduler.prefill import PendingRequest
 from picosgl.cache.linear.state_pool import LinearStatePool
 from picosgl.cache.radix_prefix_cache import HybridRadixPrefixCache
 
@@ -54,7 +54,7 @@ def make_cm(state_table, pool, num_pages=20, page_size=64, reserve_off=8, num_st
         num_pages=num_pages, page_size=page_size,
         page_table=torch.zeros((4, 512), dtype=torch.int32),
         type="hybrid_radix", num_states=num_states,
-        state_table=state_table, state_pool=pool, draft_state=reserve_off,
+        state_table=state_table, state_pool=pool, draft_offset=reserve_off,
     )
 
 

@@ -12,6 +12,7 @@ from picosgl.message import (
     ExitMsg,
     UserMsg,
 )
+from picosgl.speculator import make_drafter_client
 from picosgl.utils import init_logger, load_tokenizer, div_ceil
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
@@ -42,19 +43,23 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
-            num_states=getattr(self.engine, "num_states", 0),
+            num_states=self.engine.num_states,
+            num_draft_states=self.engine.num_draft_states,
             state_table=getattr(self.engine, "state_table", None),
             state_pool=getattr(self.engine, "linear_state", None),
-            draft_state=getattr(self.engine, "draft_state", None),
+            draft_offset=getattr(self.engine, "draft_offset", None),
         )
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
+        self.drafter_client = make_drafter_client(self, config) if config.enable_mtp else None
+
         if config.enable_mtp:
             self.ar_manager = VerifyManager(
-                config, self.device, self.engine.sampler, self.engine.model.mtp,
+                config, self.device,
                 self.cache_manager, self.table_manager,
-                self.eos_token_id, config.num_spec_tokens,
+                self.eos_token_id, self.drafter_client,
+                config.model_config.vocab_size,
             )
         else:
             self.ar_manager = DecodeManager(
@@ -66,8 +71,7 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool)
-        self.prefill_budget = config.max_prefill_length
-
+        self.prefill_budget = config.max_prefill_tokens
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
@@ -101,6 +105,8 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        if self.drafter_client is not None:
+            self.drafter_client.destroy()
         self.sync_all_ranks()
         self.engine.shutdown()
 

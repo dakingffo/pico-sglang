@@ -112,6 +112,85 @@ class Qwen3_5Attention(BaseOP):
         o = self.o_proj.forward(o.reshape(-1, self.num_qo_heads * self.head_dim))
         return o, (k, v)
 
+    def forward_with_kv_batch(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        valid_mask: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past_valid_mask: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]:
+        """Dense batched MTP attention.
+
+        ``x`` is ``(B, T, hidden)`` and KV is stored as ``(B, heads, L, head_dim)``.
+        ``valid_mask`` separates left-padded carry windows and inactive rows from real
+        tokens. This path intentionally remains independent of the global paged-attention
+        context used by the target model.
+        """
+        assert not self.paged
+        assert x.ndim == 3 and positions.shape == valid_mask.shape == x.shape[:2]
+        batch_size, seq_len = x.shape[:2]
+
+        q_gate = self.q_proj.forward(x).view(
+            batch_size, seq_len, self.num_qo_heads, self.head_dim * 2
+        )
+        query, gate = q_gate.chunk(2, dim=-1)
+        key = self.k_proj.forward(x).view(
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
+        )
+        value = self.v_proj.forward(x).view(
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
+        )
+
+        query = self.q_norm.forward(query)
+        key = self.k_norm.forward(key)
+        query, key = self.rotary.forward(positions, query, key)
+
+        n_rep = self.num_qo_heads // self.num_kv_heads
+        if n_rep > 1:
+            key = key.repeat_interleave(n_rep, dim=2)
+            value = value.repeat_interleave(n_rep, dim=2)
+
+        q = query.transpose(1, 2)  # (B, heads, T, head_dim)
+        new_k = key.transpose(1, 2)
+        new_v = value.transpose(1, 2)
+        if past_kv is None:
+            assert past_valid_mask is None
+            k, v = new_k, new_v
+            key_valid = valid_mask
+            past_len = 0
+        else:
+            assert past_valid_mask is not None
+            past_k, past_v = past_kv
+            assert past_k.shape[:2] == (batch_size, self.num_qo_heads)
+            assert past_valid_mask.shape == (batch_size, past_k.shape[2])
+            k = torch.cat([past_k, new_k], dim=2)
+            v = torch.cat([past_v, new_v], dim=2)
+            key_valid = torch.cat([past_valid_mask, valid_mask], dim=1)
+            past_len = past_k.shape[2]
+
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scaling
+        key_len = k.shape[2]
+        q_idx = torch.arange(seq_len, device=x.device).view(1, 1, seq_len, 1)
+        k_idx = torch.arange(key_len, device=x.device).view(1, 1, 1, key_len)
+        causal = k_idx <= past_len + q_idx
+        allowed = causal & key_valid[:, None, None, :]
+
+        # A padded query can otherwise have no finite key. Let it attend to its own
+        # padded slot; its output is ignored, while this keeps the tensor free of NaNs.
+        padded_self = (~valid_mask)[:, None, :, None] & (k_idx == past_len + q_idx)
+        allowed |= padded_self
+        attn = attn.masked_fill(~allowed, float("-inf"))
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query.dtype)
+        o = torch.matmul(attn, v).transpose(1, 2)
+        o = o * torch.sigmoid(gate)
+        o = self.o_proj.forward(o.reshape(batch_size, seq_len, -1))
+        return o, (k, v), key_valid
+
     def _eager_attention(
         self,
         query: torch.Tensor,

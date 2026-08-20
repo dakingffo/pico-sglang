@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 
@@ -32,3 +33,14 @@ def get_tp_info() -> DistributedInfo:
 
 def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
+
+
+@contextmanager
+def tp_override(tp_info: DistributedInfo):
+    global _TP_INFO
+    saved = _TP_INFO
+    _TP_INFO = tp_info
+    try:
+        yield
+    finally:
+        _TP_INFO = saved
