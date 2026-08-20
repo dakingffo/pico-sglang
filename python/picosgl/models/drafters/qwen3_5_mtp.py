@@ -143,3 +143,42 @@ class Qwen3_5MTPDrafter(BaseOP):
 
         logits = self.get_logits(h)
         return logits.argmax(dim=-1), logits, h, kv
+
+    def draft_batch(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        valid_mask: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past_valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Run one dense batched MTP step without consulting the global engine context."""
+        assert input_ids.ndim == 2
+        assert hidden_states.shape[:2] == input_ids.shape
+        batch_size, seq_len = input_ids.shape
+        # The custom embedding kernel consumes a flat token vector.
+        emb = self._embed_tokens.forward(input_ids.reshape(-1)).view(
+            batch_size, seq_len, -1
+        )
+        emb = self.pre_fc_norm_embedding.forward(emb)
+        h = self.pre_fc_norm_hidden.forward(hidden_states)
+        h = torch.cat([emb, h], dim=-1)
+        h = self.fc.forward(h)
+
+        layer = self.layers.op_list[0]
+        residual = h
+        h = layer.input_layernorm.forward(h)
+        h, kv, key_valid = layer.self_attn.forward_with_kv_batch(
+            h, positions, valid_mask, past_kv, past_valid_mask
+        )
+        h = residual + h
+        residual = h
+        h = layer.post_attention_layernorm.forward(h)
+        h = layer.mlp.forward(h)
+        h = self.norm.forward(residual + h)
+
+        # Every carry window is left-padded, so the predicting row is always the last
+        # one. Avoid materializing the prohibitively large (B, T, vocab) tensor.
+        logits = self.get_logits(h[:, -1])
+        return logits, h, kv, key_valid

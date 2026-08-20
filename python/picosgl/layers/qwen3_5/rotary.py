@@ -52,8 +52,8 @@ class Qwen3_5RotaryEmbedding(StateLessOP):
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cache = self._get_cache(query.device)
-        cos = cache[positions, : self.rotary_dim].unsqueeze(1)  # (T, 1, rotary_dim)
-        sin = cache[positions, self.rotary_dim :].unsqueeze(1)
+        cos = cache[positions, : self.rotary_dim].unsqueeze(-2)
+        sin = cache[positions, self.rotary_dim :].unsqueeze(-2)
         q_rot, q_pass = query[..., : self.rotary_dim], query[..., self.rotary_dim :]
         k_rot, k_pass = key[..., : self.rotary_dim], key[..., self.rotary_dim :]
         q_embed = (q_rot * cos + _rotate_half(q_rot) * sin).to(query.dtype)
