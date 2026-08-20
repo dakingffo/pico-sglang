@@ -40,6 +40,8 @@ def main() -> int:
             "--output-len": {"type": int, "default": 256, "help": "generation length in tokens"},
             "--mode": {"type": str, "choices": ["both", "nonmtp", "mtp"], "default": "both"},
             "--out": {"type": str, "default": None, "help": "write per-mode stats JSON"},
+            "--dt": {"action": "store_true",
+                     "help": "enable drafter/target separation for the MTP run"},
         },
     )
 
@@ -59,6 +61,7 @@ def main() -> int:
             port=port,
             enable_mtp=enable_mtp,
             num_spec_tokens=server_args.speculative_num_draft_tokens,
+            enable_dt=bench.dt and enable_mtp,
         )
         try:
             base = wait_server_ready(port)
