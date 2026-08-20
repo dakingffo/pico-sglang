@@ -103,6 +103,8 @@ def generate_prompt(tokenizer: Any, n: int) -> str:
 
 def make_prompts(model_path: str, input_len: int, num_prompts: int, seed: int):
     """One seeded batch of prompts + their exact token lengths. Reused across A/B runs."""
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     random.seed(seed)
     prompts, lens = [], []
