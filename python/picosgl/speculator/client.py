@@ -17,7 +17,7 @@ from picosgl.message import (
     DraftReplyMsg,
     DraftStepMsg,
 )
-from picosgl.utils import ZmqPullQueue, ZmqPushQueue
+from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
 
 from .data_plane import DataPlaneSizes, NCCLDataPlane
 from .drafters.mtp import MTPEngine, MTPState
