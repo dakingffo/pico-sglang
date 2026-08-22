@@ -100,7 +100,12 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+def load_weight(
+    model_path   : str,
+    device       : torch.device,
+    *,
+    skip_prefixes: tuple[str, ...] = (),
+) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
@@ -125,14 +130,19 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for name in f.keys():
+            for checkpoint_name in f.keys():
                 # Skip vision/projector weights (multimodal wrapper or Qwen3.5 vision tower)
-                if name.startswith(("vision_tower.", "multi_modal_projector.", "model.visual.")):
+                if checkpoint_name.startswith(
+                    ("vision_tower.", "multi_modal_projector.", "model.visual.")
+                ):
                     continue
-                raw = f.get_tensor(name)
+                name = checkpoint_name
                 name = name.removeprefix("language_model.")
                 # Qwen3.5: text weights live under model.language_model.*, strip the middle prefix
                 name = name.replace("model.language_model.", "model.", 1)
+                if name.startswith(skip_prefixes):
+                    continue
+                raw = f.get_tensor(checkpoint_name)
                 tensor = _shard_tensor(
                     name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, qkv_regions
                 )
@@ -163,3 +173,14 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
+
+
+def load_target_weight(
+    model_path: str,
+    device    : torch.device,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    yield from load_weight(
+        model_path,
+        device,
+        skip_prefixes=("mtp.", "model.mtp."),
+    )

@@ -3,11 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 from picosgl.core import get_global_ctx
 from picosgl.layers import (
     BaseOP,
-    LinearColumnParallel,
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -50,93 +48,6 @@ class Qwen3_5Model(BaseOP):
         return self.norm.forward(x)
 
 
-class Qwen3_5MultiTokenPredictor(BaseOP):
-    """MTP head. Reuses the main model's embed_tokens and lm_head. Not wired into the
-    speculative-decoding scheduler: it only needs to load weights and forward standalone."""
-
-    def __init__(self, config: ModelConfig, embed_tokens, lm_head):
-        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # Input is the cat([embedding; hidden]) — full width on every rank — so the
-        # fc must be output-split (LinearColumnParallel) and all-reduce back to full
-        # hidden. LinearRowParallel would expect a per-rank input shard and break at tp>1.
-        self.fc = LinearColumnParallel(config.hidden_size * 2, config.hidden_size, has_bias=False)
-        self.layers = OPList(
-            [
-                Qwen3_5DecoderLayer(
-                    config, 0, block_type="full_attention", paged=False
-                )
-            ]
-        )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._embed_tokens = embed_tokens
-        self._lm_head = lm_head
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        emb = self._embed_tokens.forward(input_ids)
-        emb = self.pre_fc_norm_embedding.forward(emb)
-        h = self.pre_fc_norm_hidden.forward(hidden_states)
-        h = torch.cat([emb, h], dim=-1)
-        h = self.fc.forward(h)
-        h = self.layers.op_list[0].forward(h, positions)
-        return self.norm.forward(h)
-
-    def get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project MTP output to vocab logits via the shared lm_head.
-
-        The lm_head is vocab-parallel (each rank holds vocab/tp rows), so the per-rank
-        logits must be all-gathered into full-vocab logits before the draft argmax /
-        p_draft (draft_probs is sized to the full vocab). Mirrors ParallelLMHead.forward
-        but standalone: draft runs outside a forward batch, so it must not read ctx.batch.
-        """
-        module = self._lm_head.tied_embedding or self._lm_head
-        logits = F.linear(hidden_states, module.weight, self._lm_head.bias)
-        if self._lm_head.tp_size > 1:
-            input_shape = logits.shape
-            gathered = self._lm_head._comm.all_gather(logits)
-            gathered = gathered.view((self._lm_head.tp_size,) + input_shape)
-            gathered = gathered.permute(1, 0, 2).contiguous()
-            logits = gathered.reshape(
-                input_shape[:1] + (self._lm_head.tp_size * input_shape[1],)
-            )[:, : module.num_embeddings]
-        return logits
-
-    def draft(self, input_ids, positions, hidden_states, past_kv=None):
-        """Single MTP draft step, returns (next_token, logits, hidden, kv).
-
-        Step-0 (past_kv=None): feed the carry window (last W accepted tokens + their target
-        hidden); the last row's logits predict the next token -> draft_0, and the window's
-        KV is returned for carry. Step-j (j>=1): feed [draft_{j-1}] + this predictor's own
-        hidden from step j-1, attending to the carried KV -> draft_j.
-
-        next_token is greedy (argmax); p_draft is recovered from ``logits`` by the caller.
-        """
-        emb = self._embed_tokens.forward(input_ids)
-        emb = self.pre_fc_norm_embedding.forward(emb)
-        h = self.pre_fc_norm_hidden.forward(hidden_states)
-        h = torch.cat([emb, h], dim=-1)
-        h = self.fc.forward(h)
-
-        layer = self.layers.op_list[0]
-        residual = h
-        h = layer.input_layernorm.forward(h)
-        h, kv = layer.self_attn.forward_with_kv(h, positions, past_kv)
-        h = residual + h
-        residual = h
-        h = layer.post_attention_layernorm.forward(h)
-        h = layer.mlp.forward(h)
-        h = residual + h
-        h = self.norm.forward(h)
-
-        logits = self.get_logits(h)
-        return logits.argmax(dim=-1), logits, h, kv
-
-
 class Qwen3_5ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig, paged: bool = True):
         self.model = Qwen3_5Model(config, paged=paged)
@@ -146,10 +57,6 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
-        if config.mtp_num_hidden_layers > 0:
-            self.mtp = Qwen3_5MultiTokenPredictor(
-                config, self.model.embed_tokens, self.lm_head
-            )
         super().__init__()
 
     def forward(self) -> torch.Tensor:

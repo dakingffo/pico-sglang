@@ -75,10 +75,10 @@ def main():
     from picosgl.cache.linear.state_pool import LinearStatePool
     from picosgl.layers.attention_backend import create_attention_backend
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
-    from picosgl.models.weight import load_weight
+    from picosgl.models.weight import load_target_weight
     from picosgl.scheduler.cache import CacheManager
 
-    loaded = {k: v for k, v in load_weight(MODEL_PATH, "cpu")}
+    loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
         model = Qwen3_5ForCausalLM(mcfg, paged=True)
     model.load_state_dict(dict(loaded))
