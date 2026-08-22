@@ -58,9 +58,6 @@ package-dir = {"" = "python"}
 [tool.setuptools.packages.find]
 where = ["python"]
 
-[tool.setuptools.package-data]
-"*" = ["csrc/**/*"]
-
 [tool.black]
 line-length = 100
 target-version = ['py310']

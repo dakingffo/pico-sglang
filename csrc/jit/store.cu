@@ -1,0 +1,136 @@
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+
+#include <tvm/ffi/container/tensor.h>
+
+#include <picosgl/tensor.hpp>
+#include <picosgl/utils.hpp>
+#include <picosgl/warp.hpp>
+
+namespace picosgl {
+
+struct StoreKernelParams {
+  void *__restrict__       k_cache;
+  void *__restrict__       v_cache;
+  const void *__restrict__ indices;
+  const void *__restrict__ k;
+  const void *__restrict__ v;
+  std::size_t              cache_stride;
+  std::size_t              input_stride;
+  std::size_t              length;
+};
+
+template <
+  std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL,
+  std::size_t kElementSize, std::integral IndexType
+>
+__global__ __launch_bounds__(kNumThreads, kMaxOccupancy)
+void store_cache_kernel(
+  const __grid_constant__ StoreKernelParams params
+) {
+  using namespace device;
+
+  constexpr auto kWarpsPerBlock =
+      static_cast<unsigned>(kNumThreads / kWarpThreads);
+  static_assert(kNumThreads % kWarpThreads == 0);
+
+  const auto &[k_cache, v_cache, indices_raw, k, v, cache_stride,
+               input_stride, length] = params;
+  const auto warp_id =
+      threadIdx.x / kWarpThreads + blockIdx.x * kWarpsPerBlock;
+
+  PDL::wait<kUsePDL>();
+  if (warp_id < length) {
+    const auto position = static_cast<const IndexType *>(indices_raw)[warp_id];
+    const auto destination_k =
+        pointer::offset(k_cache, position * cache_stride);
+    const auto source_k = pointer::offset(k, warp_id * input_stride);
+    warp::copy<kElementSize>(destination_k, source_k);
+
+    const auto destination_v =
+        pointer::offset(v_cache, position * cache_stride);
+    const auto source_v = pointer::offset(v, warp_id * input_stride);
+    warp::copy<kElementSize>(destination_v, source_v);
+  }
+  PDL::launch<kUsePDL>();
+}
+
+template <
+  std::size_t element_size,          // depends on data type and embedding dim
+  std::size_t num_threads     = 128, // number of threads per block
+  std::size_t max_concurrency = 1,   // max blocks per SM
+  bool        use_pdl         = false
+>
+struct StoreKernel {
+  static void run(
+    const tvm::ffi::TensorView k_cache, // [N, H, D]
+    const tvm::ffi::TensorView v_cache, // [N, H, D]
+    const tvm::ffi::TensorView indices, // [T]
+    const tvm::ffi::TensorView k,       // [T, H, D]
+    const tvm::ffi::TensorView v        // [T, H, D]
+  ) {
+    using namespace host;
+
+    auto row_size      = SymbolicSize{"D"};
+    auto length        = SymbolicSize{"L"};
+    auto cache_stride  = SymbolicSize{"cache_stride"};
+    auto input_stride  = SymbolicSize{"input_stride"};
+    auto indices_dtype = SymbolicDType{};
+    auto dtype         = SymbolicDType{};
+    auto device        = SymbolicDevice{};
+
+    TensorMatcher({-1, row_size})
+        .with_strides({cache_stride, 1})
+        .with_device<kDLCUDA>(device)
+        .with_dtype(dtype)
+        .verify(k_cache)
+        .verify(v_cache);
+    TensorMatcher({length, row_size})
+        .with_strides({input_stride, 1})
+        .with_device<kDLCUDA>(device)
+        .with_dtype(dtype)
+        .verify(k)
+        .verify(v);
+    TensorMatcher({length})
+        .with_device<kDLCUDA>(device)
+        .with_dtype<std::int32_t, std::int64_t>(indices_dtype)
+        .verify(indices);
+
+    const auto dtype_size = dtype_bytes(dtype.unwrap());
+    runtime_assert(
+      element_size == dtype_size * row_size.unwrap(),
+      "StoreKernel element_size mismatch"
+    );
+
+    if (length.unwrap() == 0) {
+      return;
+    }
+
+    const auto params = StoreKernelParams{
+      .k_cache      = k_cache.data_ptr(),
+      .v_cache      = v_cache.data_ptr(),
+      .indices      = indices.data_ptr(),
+      .k            = k.data_ptr(),
+      .v            = v.data_ptr(),
+      .cache_stride = static_cast<std::size_t>(cache_stride.unwrap()) * dtype_size,
+      .input_stride = static_cast<std::size_t>(input_stride.unwrap()) * dtype_size,
+      .length       = static_cast<std::size_t>(length.unwrap()),
+    };
+
+    constexpr auto kWarpsPerBlock =
+        num_threads / picosgl::device::kWarpThreads;
+    static_assert(num_threads % picosgl::device::kWarpThreads == 0);
+    const auto num_blocks = div_ceil(params.length, kWarpsPerBlock);
+    const auto use_int32  = indices_dtype.unwrap().bits == 32;
+    const auto kernel =
+        use_int32 ? store_cache_kernel<num_threads, max_concurrency, use_pdl,
+                                       element_size, std::int32_t>
+                  : store_cache_kernel<num_threads, max_concurrency, use_pdl,
+                                       element_size, std::int64_t>;
+    LaunchKernel(num_blocks, num_threads, device.unwrap())
+        .with_attr(use_pdl)(kernel, params);
+  }
+};
+
+} // namespace picosgl

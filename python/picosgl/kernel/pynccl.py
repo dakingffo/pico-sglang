@@ -9,6 +9,7 @@ from .utils import load_aot
 
 if TYPE_CHECKING:
     from abc import abstractmethod
+    from ctypes import c_void_p
 
     import torch
     from tvm_ffi import Module
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
         @abstractmethod
         def all_gather(self, output: torch.Tensor, input: torch.Tensor) -> None: ...
         @abstractmethod
-        def get_buffer(self) -> int: ...
+        def get_buffer(self) -> c_void_p: ...
 
 else:
     PyNCCLCommunicator = Any
@@ -114,4 +115,4 @@ def init_pynccl_drafter_target_separation(
     module = _load_nccl_module()
     cls = _get_pynccl_wrapper_cls()
     # bypass type checking for the FFI object
-    return cls(rank, world_size, max_size_bytes, _nccl_uid_to_ffi(nccl_uid))  # type: ignore
+    return cls(rank, world_size, max_size_bytes, _nccl_uid_to_ffi(nccl_uid))

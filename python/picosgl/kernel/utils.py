@@ -1,28 +1,38 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, List, NamedTuple, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, NamedTuple, TypeAlias, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
-KERNEL_PATH = pathlib.Path(__file__).parent / "csrc"
-DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
+
+_KERNEL_FILE = pathlib.Path(__file__).resolve()
+_CSRC_CANDIDATES = (
+    _KERNEL_FILE.parents[3] / "csrc",  # source checkout
+    _KERNEL_FILE.parents[1] / "csrc",  # installed wheel
+)
+CPPIMPL_PATH = next((path for path in _CSRC_CANDIDATES if path.is_dir()), _CSRC_CANDIDATES[0])
+DEFAULT_INCLUDE = [str(CPPIMPL_PATH / "include")]
+DEFAULT_SRC = CPPIMPL_PATH / "src"
+DEFAULT_JIT = CPPIMPL_PATH / "jit"
+
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_CUDA_CFLAGS = DEFAULT_CFLAGS + ["--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
+
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 
 
-class CppArgList(list[str]):
+class CppArglist(list[str]):
     def __str__(self) -> str:
         return ", ".join(self)
 
 
 class KernelConfig(NamedTuple):
-    num_threads: int
+    num_threads  : int
     max_occupancy: int
-    use_pdl: bool
+    use_pdl      : bool
 
     @property
     def template_args(self) -> str:
@@ -34,12 +44,12 @@ def _make_name(*args: str) -> str:
     return "picosgl__" + "_".join(str(arg) for arg in args)
 
 
-def _make_wrapper(tup: Tuple[str, str]) -> str:
+def _make_wrapper(tup: tuple[str, str]) -> str:
     export_name, kernel_name = tup
-    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, (picosgl::{kernel_name}));"
 
 
-def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CppArgList:
+def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CppArglist:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
             return "true" if arg else "false"
@@ -47,18 +57,18 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CppArgList:
             return str(arg)
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
-    return CppArgList(_convert(arg) for arg in args)
+    return CppArglist(_convert(arg) for arg in args)
 
 
 def load_aot(
-    *args: str,
-    cpp_files: List[str] | None = None,
-    cuda_files: List[str] | None = None,
-    extra_cflags: List[str] | None = None,
-    extra_cuda_cflags: List[str] | None = None,
-    extra_ldflags: List[str] | None = None,
-    extra_include_paths: List[str] | None = None,
-    build_directory: str | None = None,
+    *args              : str,
+    cpp_files          : list[str]  | None = None,
+    cuda_files         : list[str]  | None = None,
+    extra_cflags       : list[str]  | None = None,
+    extra_cuda_cflags  : list[str]  | None = None,
+    extra_ldflags      : list[str]  | None = None,
+    extra_include_paths: list[str]  | None = None,
+    build_directory    : str | None = None,
 ) -> Module:
     from tvm_ffi.cpp import load
 
@@ -69,8 +79,8 @@ def load_aot(
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 
-    cpp_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cpp_files]
-    cuda_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cuda_files]
+    cpp_files = [str((DEFAULT_SRC / f).resolve()) for f in cpp_files]
+    cuda_files = [str((DEFAULT_SRC / f).resolve()) for f in cuda_files]
 
     return load(
         _make_name(*args),
@@ -85,16 +95,16 @@ def load_aot(
 
 
 def load_jit(
-    *args: str,
-    cpp_files: List[str] | None = None,
-    cuda_files: List[str] | None = None,
-    cpp_wrappers: List[Tuple[str, str]] | None = None,
-    cuda_wrappers: List[Tuple[str, str]] | None = None,
-    extra_cflags: List[str] | None = None,
-    extra_cuda_cflags: List[str] | None = None,
-    extra_ldflags: List[str] | None = None,
-    extra_include_paths: List[str] | None = None,
-    build_directory: str | None = None,
+    *args              : str,
+    cpp_files          : list[str]             | None = None,
+    cuda_files         : list[str]             | None = None,
+    cpp_wrappers       : list[tuple[str, str]] | None = None,
+    cuda_wrappers      : list[tuple[str, str]] | None = None,
+    extra_cflags       : list[str]             | None = None,
+    extra_cuda_cflags  : list[str]             | None = None,
+    extra_ldflags      : list[str]             | None = None,
+    extra_include_paths: list[str]             | None = None,
+    build_directory    : str | None = None,
 ) -> Module:
     from tvm_ffi.cpp import load_inline
 
@@ -107,13 +117,11 @@ def load_jit(
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 
-    # include cpp files
-    cpp_paths = [(KERNEL_PATH / "jit" / f).resolve() for f in cpp_files]
+    cpp_paths = [(DEFAULT_JIT / f).resolve() for f in cpp_files]
     cpp_sources = [f'#include "{path}"' for path in cpp_paths]
     cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
 
-    # include cuda files
-    cuda_paths = [(KERNEL_PATH / "jit" / f).resolve() for f in cuda_files]
+    cuda_paths = [(DEFAULT_JIT / f).resolve() for f in cuda_files]
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 

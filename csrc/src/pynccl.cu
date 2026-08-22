@@ -1,14 +1,3 @@
-#include <picosgl/nccl227.h>
-#include <picosgl/tensor.h>
-#include <picosgl/utils.cuh>
-#include <picosgl/utils.h>
-
-#include <dlpack/dlpack.h>
-#include <tvm/ffi/container/array.h>
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/function.h>
-#include <tvm/ffi/reflection/registry.h>
-
 #include <bit>
 #include <cstdint>
 #include <memory>
@@ -16,25 +5,37 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace {
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/reflection/registry.h>
+
+#include <picosgl/nccl227.h>
+#include <picosgl/tensor.hpp>
+#include <picosgl/utils.hpp>
+
+namespace picosgl {
 
 using NCCLIDList = tvm::ffi::Array<char>;
 
-auto NCCL_CHECK(::ncclResult_t result) -> void {
+void NCCL_CHECK(::ncclResult_t result) {
   if (result != ::ncclSuccess) {
-    host::RuntimeCheck(false, ::ncclGetErrorString(result));
+    host::runtime_assert(false, ::ncclGetErrorString(result));
   }
 }
 
-auto get_uid(const NCCLIDList &wrapper) -> ncclUniqueId {
-  host::RuntimeCheck(wrapper.size() == NCCL_UNIQUE_ID_BYTES,
-                     "Invalid NCCL ID wrapper size");
+ncclUniqueId get_uid(const NCCLIDList& wrapper) {
+  host::runtime_assert(
+    wrapper.size() == NCCL_UNIQUE_ID_BYTES,
+    "Invalid NCCL ID wrapper size"
+  );
   ncclUniqueId id;
   std::copy(wrapper.begin(), wrapper.end(), id.internal);
   return id;
 }
 
-auto create_uid() -> NCCLIDList {
+NCCLIDList create_uid() {
   ncclUniqueId id;
   NCCL_CHECK(::ncclGetUniqueId(&id));
   return NCCLIDList(id.internal, id.internal + NCCL_UNIQUE_ID_BYTES);
@@ -46,13 +47,13 @@ const auto kNCCLReduceOPMap = std::unordered_map<std::string_view, ncclRedOp_t>{
 };
 
 struct DLDataTypeHash {
-  auto operator()(const DLDataType &dtype) const noexcept -> std::size_t {
+  std::size_t operator()(const DLDataType& dtype) const noexcept {
     return std::bit_cast<std::uint32_t>(dtype);
   }
 };
 
 template <typename = void>
-auto operator==(const DLDataType &a, const DLDataType &b) -> bool {
+bool operator==(const DLDataType& a, const DLDataType& b) {
   return a.code == b.code && a.bits == b.bits && a.lanes == b.lanes;
 }
 
@@ -63,39 +64,39 @@ const auto kNCCLDtypeMap =
         {{DLDataTypeCode::kDLFloat, 32, 1}, ncclFloat},  // draft_probs are fp32
     };
 
-using std::shared_ptr;
+template <typename T>
+using shared_obj = std::shared_ptr<std::remove_pointer_t<T>>;
 
-template <typename T> using shared_obj = shared_ptr<std::remove_pointer_t<T>>;
 template <auto Fn>
 inline constexpr auto template_fn =
-    [](auto &&...args) { return Fn(std::forward<decltype(args)>(args)...); };
+    [](auto&&...args) { return Fn(std::forward<decltype(args)>(args)...); };
 
 struct NCCLWrapper : public tvm::ffi::Object {
 public:
   NCCLWrapper(int rank, int world_size, const size_t max_bytes, NCCLIDList uid)
-      : m_rank(rank), m_world_size(world_size), m_max_bytes(max_bytes) {
+      : rank_(rank), world_size_(world_size), max_bytes_(max_bytes) {
     ncclUniqueId id = get_uid(uid);
     ncclComm_t comm;
-    NCCL_CHECK(::ncclCommInitRank(&comm, m_world_size, id, m_rank));
-    m_comm = {comm, template_fn<::ncclCommDestroy>};
+    NCCL_CHECK(::ncclCommInitRank(&comm, world_size_, id, rank_));
+    comm_ = {comm, template_fn<::ncclCommDestroy>};
 
-    void *buf;
+    void* buf;
     NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
-    m_sym_mem = {buf, template_fn<::ncclMemFree>};
+    sym_mem_ = {buf, template_fn<::ncclMemFree>};
 
     ncclWindow_t win;
     NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
                                         NCCL_WIN_COLL_SYMMETRIC));
-    m_win = {win, [comm = m_comm](ncclWindow_t w) {
+    win_ = {win, [comm = comm_](ncclWindow_t w) {
                return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
              }};
   }
 
-  auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
+  void all_reduce(tvm::ffi::TensorView t, std::string op) const {
     using namespace host;
-    RuntimeCheck(t.device().device_type == kDLCUDA,
+    runtime_assert(t.device().device_type == kDLCUDA,
                  "Tensor must be on CUDA device");
-    RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
+    runtime_assert(t.is_contiguous(), "Tensor must be contiguous");
     const auto size_dim = static_cast<size_t>(t.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(t.dtype());
     const auto size_bytes = size_dim * (t.dtype().bits / 8);
@@ -103,8 +104,8 @@ public:
     const auto reduce_op = kNCCLReduceOPMap.at(op);
     const auto stream = LaunchKernel::resolve_device(t.device());
 
-    if (size_bytes <= m_max_bytes) { // use internal buffer
-      const auto buf_ptr = m_sym_mem.get();
+    if (size_bytes <= max_bytes_) { // use internal buffer
+      const auto buf_ptr = sym_mem_.get();
       const auto need_memcpy = (buf_ptr != data_ptr);
       if (need_memcpy) {
         CUDA_CHECK(::cudaMemcpyAsync(buf_ptr, data_ptr, size_bytes,
@@ -116,35 +117,48 @@ public:
           /*count=*/size_dim,
           /*datatype=*/dtype,
           /*op=*/reduce_op,
-          /*comm=*/m_comm.get(),
+          /*comm=*/comm_.get(),
           /*stream=*/stream));
       if (need_memcpy) {
         CUDA_CHECK(::cudaMemcpyAsync(data_ptr, buf_ptr, size_bytes,
                                      ::cudaMemcpyDeviceToDevice, stream));
       }
-    } else {
+    }
+    else {
       NCCL_CHECK(::ncclAllReduce(
           /*sendbuff=*/data_ptr,
           /*recvbuff=*/data_ptr,
           /*count=*/size_dim,
           /*datatype=*/dtype,
           /*op=*/reduce_op,
-          /*comm=*/m_comm.get(),
+          /*comm=*/comm_.get(),
           /*stream=*/stream));
     }
   }
 
-  auto all_gather(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) const
-      -> void {
+  void all_gather(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) const {
     using namespace host;
-    RuntimeCheck(src.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
-    RuntimeCheck(src.is_contiguous(), "Tensor must be contiguous");
-    RuntimeCheck(dst.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
-    RuntimeCheck(dst.is_contiguous(), "Tensor must be contiguous");
-    RuntimeCheck(dst.size(0) == src.size(0) * m_world_size,
-                 "Destination tensor has incorrect size");
+    runtime_assert(
+      src.device().device_type == kDLCUDA,
+      "Tensor must be on CUDA device"
+    );
+    runtime_assert(
+      src.is_contiguous(),
+      "Tensor must be contiguous"
+    );
+    runtime_assert(
+      dst.device().device_type == kDLCUDA,
+      "Tensor must be on CUDA device"
+    );
+    runtime_assert(
+      dst.is_contiguous(),
+      "Tensor must be contiguous"
+    );
+    runtime_assert(
+      dst.size(0) == src.size(0) * world_size_,
+      "Destination tensor has incorrect size"
+    );
+
     const auto size_dim = static_cast<size_t>(src.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(src.dtype());
     const auto src_ptr = src.data_ptr();
@@ -152,27 +166,33 @@ public:
     const auto stream = LaunchKernel::resolve_device(src.device());
     // do not use internal buffer for all_gather, directly gather to output
     // tensor
-    NCCL_CHECK(::ncclAllGather(
+    NCCL_CHECK(
+      ::ncclAllGather(
         /*sendbuff=*/src_ptr,
         /*recvbuff=*/dst_ptr,
         /*sendcount=*/size_dim,
         /*datatype=*/dtype,
-        /*comm=*/m_comm.get(),
-        /*stream=*/stream));
+        /*comm=*/comm_.get(),
+        /*stream=*/stream
+      )
+    );
   }
 
-  auto get_buffer() const -> void * { return m_sym_mem.get(); }
+  void* get_buffer() const {
+    return sym_mem_.get();
+  }
 
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("picosgl.NCCLWrapper", NCCLWrapper,
-                                    tvm::ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
+    "picosgl.NCCLWrapper", NCCLWrapper, tvm::ffi::Object
+  );
 
 private:
-  int m_rank;
-  int m_world_size;
-  size_t m_max_bytes;
-  shared_obj<ncclComm_t> m_comm;
-  shared_ptr<void> m_sym_mem;
-  shared_obj<ncclWindow_t> m_win;
+  int                      rank_;
+  int                      world_size_;
+  size_t                   max_bytes_;
+  shared_obj<ncclComm_t>   comm_;
+  std::shared_ptr<void>    sym_mem_;
+  shared_obj<ncclWindow_t> win_;
 };
 
 TVM_FFI_STATIC_INIT_BLOCK() {
@@ -186,4 +206,4 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create_nccl_uid, &create_uid);
 
-} // namespace
+} // namespace picosgl

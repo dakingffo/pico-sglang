@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 from .utils import KernelConfig, load_jit, make_cpp_args
 
@@ -9,15 +9,20 @@ if TYPE_CHECKING:
     import torch
     from tvm_ffi import Module
 
-DEFAULT_INDEX_KERNEL_CONFIG = KernelConfig(num_threads=128, max_occupancy=1, use_pdl=False)
+
+DEFAULT_INDEX_KERNEL_CONFIG = KernelConfig(
+    num_threads=128,
+    max_occupancy=1,
+    use_pdl=False
+)
 
 
 @functools.cache
 def _jit_index_module(
     element_size: int,
     *,
-    num_splits: int = 1,
-    config: KernelConfig = DEFAULT_INDEX_KERNEL_CONFIG,
+    num_splits  : int = 1,
+    config      : KernelConfig = DEFAULT_INDEX_KERNEL_CONFIG,
 ) -> Module:
     args = make_cpp_args(element_size, num_splits, *config)
     return load_jit(
@@ -29,22 +34,24 @@ def _jit_index_module(
 
 
 def indexing(
-    weights: torch.Tensor,
-    indices: torch.Tensor,
+    weights    : torch.Tensor, # [V / tp_size, D]
+    indices    : torch.Tensor, # [L]
     *,
-    output: torch.Tensor | None = None,
-    vocab_range: Tuple[int, int] | None = None,  # (start, length)
+    output     : torch.Tensor    | None = None,  # [L, D]
+    vocab_range: tuple[int, int] | None = None,  # (start, length)
 ) -> torch.Tensor:
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 
     element_size = weights.shape[1] * weights.element_size()
-    if element_size % 2048 == 0:
-        num_splits = 4
-    elif element_size % 1024 == 0:
-        num_splits = 2
-    else:
-        num_splits = 1
-    module = _jit_index_module(element_size, num_splits=num_splits)
+
+    module = _jit_index_module(
+        element_size,
+        num_splits=(
+            4 if element_size % 2048 == 0 else
+            2 if element_size % 1024 == 0 else
+            1
+        )
+    )
     module.launch(weights, indices, output, vocab_range)
     return output
