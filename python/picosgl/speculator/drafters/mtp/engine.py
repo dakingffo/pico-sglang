@@ -104,11 +104,12 @@ class MTPEngine(EngineBase):
             input_ids, positions, hidden
         )
 
+        slots = self.pool.append_persistent_batch(table_indices, pending_counts)
+        self.pool.store(slots, key, value)
+
         last_rows = []
         offset = 0
         for st, count in zip(active_states, pending_counts):
-            slots = self.pool.append_persistent(st.table_idx, count)
-            self.pool.store(slots, key[offset : offset + count], value[offset : offset + count])
             last_rows.append(offset + count - 1)
             offset += count
             st.clear_pending()

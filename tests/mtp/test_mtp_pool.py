@@ -57,3 +57,15 @@ def test_store_preserves_native_kv_heads() -> None:
 
     assert torch.equal(pool.k[slots.to(torch.int64)], key)
     assert torch.equal(pool.v[slots.to(torch.int64)], value)
+
+
+def test_batched_append_matches_request_major_order() -> None:
+    pool = _make_pool()
+    slots = pool.append_persistent_batch([2, 0], [3, 2])
+
+    assert torch.equal(
+        slots,
+        torch.cat([pool.persistent_table[2, :3], pool.persistent_table[0, :2]]),
+    )
+    assert torch.equal(pool.persistent_indices(2), pool.persistent_table[2, :3])
+    assert torch.equal(pool.persistent_indices(0), pool.persistent_table[0, :2])

@@ -76,6 +76,34 @@ class MTPKVPool:
         if count == 0:
             return self.persistent_table[table_idx, :0]
 
+        columns = self._append_columns(table_idx, count)
+        column_tensor = torch.tensor(columns, dtype=torch.int64, device=self.device)
+        return self.persistent_table[table_idx].index_select(0, column_tensor)
+
+    def append_persistent_batch(
+        self,
+        table_indices: list[int],
+        counts       : list[int],
+    ) -> torch.Tensor:
+        """Reserve canonical slots for a batch in flattened request-major order."""
+        assert len(table_indices) == len(counts)
+        rows: list[int] = []
+        columns: list[int] = []
+        for table_idx, count in zip(table_indices, counts):
+            self._check_table_idx(table_idx)
+            assert 0 <= count <= self.window_size
+            rows.extend([table_idx] * count)
+            columns.extend(self._append_columns(table_idx, count))
+
+        row_tensor = torch.tensor(rows, dtype=torch.int64, device=self.device)
+        column_tensor = torch.tensor(columns, dtype=torch.int64, device=self.device)
+        return self.persistent_table[row_tensor, column_tensor]
+
+    def _append_columns(self, table_idx: int, count: int) -> list[int]:
+        """Advance one ring and return its reserved logical columns."""
+        if count == 0:
+            return []
+
         head   = self._heads[table_idx]
         length = self._lengths[table_idx]
         columns: list[int] = []
@@ -90,8 +118,7 @@ class MTPKVPool:
 
         self._heads[table_idx]   = head
         self._lengths[table_idx] = length
-        column_tensor = torch.tensor(columns, dtype=torch.int64, device=self.device)
-        return self.persistent_table[table_idx].index_select(0, column_tensor)
+        return columns
 
     def persistent_indices(self, table_idx: int) -> torch.Tensor:
         """Return one request's valid persistent slots in chronological order."""
@@ -126,23 +153,43 @@ class MTPKVPool:
         assert batch_size <= self.max_batch_size
         assert 0 <= scratch_depth <= self.num_spec_tokens
 
-        persistent = [self.persistent_indices(idx) for idx in table_indices]
-        lengths     = [row.numel() + scratch_depth for row in persistent]
-        max_length  = max(lengths)
-        indices = torch.zeros(
-            batch_size, max_length, dtype=torch.int32, device=self.device
+        persistent_lens = [self._lengths[idx] for idx in table_indices]
+        max_persistent  = max(persistent_lens)
+        table_idx_tensor = torch.tensor(
+            table_indices, dtype=torch.int64, device=self.device
         )
-        valid = torch.zeros(
-            batch_size, max_length, dtype=torch.bool, device=self.device
+        head_tensor = torch.tensor(
+            [self._heads[idx] for idx in table_indices],
+            dtype=torch.int64,
+            device=self.device,
         )
-        for i, row in enumerate(persistent):
-            length = row.numel()
-            indices[i, :length] = row
-            if scratch_depth:
-                indices[i, length : length + scratch_depth] = self.scratch_table[
-                    batch_rows[i], :scratch_depth
-                ]
-            valid[i, : lengths[i]] = True
+        persistent_columns = (
+            head_tensor[:, None]
+            + torch.arange(max_persistent, dtype=torch.int64, device=self.device)[None, :]
+        ) % self.window_size
+        persistent = self.persistent_table[table_idx_tensor[:, None], persistent_columns]
+
+        lengths = torch.tensor(
+            persistent_lens, dtype=torch.int64, device=self.device
+        )
+        if scratch_depth:
+            indices = torch.empty(
+                batch_size,
+                max_persistent + scratch_depth,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            indices[:, :max_persistent] = persistent
+            scratch_positions = lengths[:, None] + torch.arange(
+                scratch_depth, dtype=torch.int64, device=self.device
+            )[None, :]
+            scratch = self.scratch_table.index_select(0, batch_rows)[:, :scratch_depth]
+            indices.scatter_(1, scratch_positions, scratch)
+        else:
+            indices = persistent
+
+        total_lens = lengths + scratch_depth
+        valid = torch.arange(indices.shape[1], device=self.device)[None, :] < total_lens[:, None]
         return indices, valid
 
     def store(self, slots: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
