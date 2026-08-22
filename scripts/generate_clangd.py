@@ -1,10 +1,18 @@
-assert __name__ == "__main__"
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
 
 
-def generate_clangd():
-    import os
-    import subprocess
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PYTHON_ROOT = REPO_ROOT / "python"
 
+if str(PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(PYTHON_ROOT))
+
+
+def generate_clangd() -> None:
     from picosgl.kernel.utils import DEFAULT_INCLUDE
     from picosgl.utils import init_logger
     from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
@@ -16,8 +24,9 @@ def generate_clangd():
         args=["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
         capture_output=True,
         check=True,
+        text=True,
     )
-    compute_cap = status.stdout.decode("utf-8").strip().split("\n")[0]
+    compute_cap = status.stdout.strip().splitlines()[0]
     major, minor = compute_cap.split(".")
     compile_flags = ",\n    ".join(
         [
@@ -35,13 +44,14 @@ CompileFlags:
     {compile_flags}
   ]
 """
-    if os.path.exists(".clangd"):
+    clangd_path = Path.cwd() / ".clangd"
+    if clangd_path.exists():
         logger.warning(".clangd file already exists, nothing done.")
         logger.warning(f"suggested content: {clangd_content}")
     else:
-        with open(".clangd", "w") as f:
-            f.write(clangd_content)
-        logger.info(".clangd file generated.")
+        clangd_path.write_text(clangd_content)
+        logger.info(f"{clangd_path} generated.")
 
 
-generate_clangd()
+if __name__ == "__main__":
+    generate_clangd()
