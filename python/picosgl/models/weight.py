@@ -7,7 +7,7 @@ from typing import Dict, Iterator, Tuple
 import safetensors
 import torch
 from picosgl.distributed import get_tp_info
-from picosgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
+from picosgl.utils import div_ceil, load_model_config, resolve_model_path
 from tqdm import tqdm
 
 _SPLIT_DIM_0 = [
@@ -110,8 +110,8 @@ def load_weight(
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
 
-    model_folder = download_hf_weight(model_path)
-    config = ModelConfig.from_hf(cached_load_hf_config(model_path))
+    model_folder = resolve_model_path(model_path)
+    config = ModelConfig.from_pretrained(load_model_config(model_folder))
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()

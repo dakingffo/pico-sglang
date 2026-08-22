@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from picosgl.distributed import DistributedInfo
-from picosgl.utils import cached_load_hf_config
+from picosgl.utils import load_model_config
 from picosgl.models import ModelConfig
 
 if TYPE_CHECKING:
@@ -41,12 +41,12 @@ class EngineConfig:
         return self.speculative_algorithm is not None
 
     @cached_property
-    def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+    def pretrained_config(self):
+        return load_model_config(self.model_path)
 
     @cached_property
     def model_config(self) -> ModelConfig:
-        return ModelConfig.from_hf(self.hf_config)
+        return ModelConfig.from_pretrained(self.pretrained_config)
 
     @property
     def max_seq_len(self) -> int:

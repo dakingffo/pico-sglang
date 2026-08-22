@@ -31,7 +31,7 @@ sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
 import torch
 
-from picosgl.utils import cached_load_hf_config, torch_dtype
+from picosgl.utils import load_model_config, torch_dtype
 
 
 def setup():
@@ -40,7 +40,7 @@ def setup():
     set_tp_info(DistributedInfo(rank=0, size=1))
     from picosgl.models.config import ModelConfig
 
-    return ModelConfig.from_hf(cached_load_hf_config(MODEL_PATH))
+    return ModelConfig.from_pretrained(load_model_config(MODEL_PATH))
 
 
 def to_device(module, device):

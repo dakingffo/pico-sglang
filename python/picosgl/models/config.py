@@ -66,7 +66,7 @@ class ModelConfig:
         return 0
 
     @classmethod
-    def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+    def from_pretrained(cls, config: PretrainedConfig) -> ModelConfig:
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
