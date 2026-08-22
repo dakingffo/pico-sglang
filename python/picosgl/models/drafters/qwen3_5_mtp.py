@@ -181,3 +181,42 @@ class Qwen3_5MTPDrafter(BaseOP):
         # one. Avoid materializing the prohibitively large (B, T, vocab) tensor.
         logits = self.get_logits(h[:, -1])
         return logits, h, kv, key_valid
+
+    def prepare_cache_rows(
+        self,
+        input_ids    : torch.Tensor,
+        positions    : torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare arbitrary canonical or speculative rows for pooled MTP attention."""
+        assert input_ids.ndim == positions.ndim == 1
+        assert hidden_states.shape == (input_ids.shape[0], self.fc.full_output_size)
+        emb = self._embed_tokens.forward(input_ids)
+        emb = self.pre_fc_norm_embedding.forward(emb)
+        h = self.pre_fc_norm_hidden.forward(hidden_states)
+        h = torch.cat([emb, h], dim=-1)
+        residual = self.fc.forward(h)
+
+        layer = self.layers.op_list[0]
+        h = layer.input_layernorm.forward(residual)
+        query, gate, key, value = layer.self_attn.project_for_cache(h, positions)
+        return residual, query, gate, key, value
+
+    def finish_cache_rows(
+        self,
+        residual        : torch.Tensor,
+        gate            : torch.Tensor,
+        attention_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Finish one predicting row per request after its K/V has entered the pool."""
+        layer = self.layers.op_list[0]
+        h = attention_output * torch.sigmoid(gate)
+        h = layer.self_attn.o_proj.forward(
+            h.reshape(-1, layer.self_attn.num_qo_heads * layer.self_attn.head_dim)
+        )
+        h = residual + h
+        residual = h
+        h = layer.post_attention_layernorm.forward(h)
+        h = layer.mlp.forward(h)
+        h = self.norm.forward(residual + h)
+        return self.get_logits(h), h

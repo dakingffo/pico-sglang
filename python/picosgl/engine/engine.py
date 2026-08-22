@@ -224,11 +224,37 @@ class Engine:
             config.decode_batch_budget // config.speculative_num_draft_tokens, # real concurrency
         ) * num_draft_per_req if config.enable_mtp else 0
         draft_bytes = num_draft_states * cache_per_state
+        draft_concurrency = min(
+            config.max_running_req,
+            config.decode_batch_budget // config.speculative_num_draft_tokens,
+        )
+        mtp_kv_slots = (
+            config.max_running_req * config.speculator_window_size
+            + draft_concurrency * config.speculative_num_draft_tokens
+        )
+        mtp_kv_bytes = (
+            2
+            * mtp_kv_slots
+            * config.model_config.num_kv_heads
+            * config.model_config.head_dim
+            * self.dtype.itemsize
+            if config.enable_mtp and not config.enable_dt_separation else 0
+        )
+        mtp_workspace_bytes = (
+            32 * 1024 * 1024
+            if mtp_kv_bytes and config.attention_backend.rsplit(",", 1)[-1] in ("auto", "fi")
+            else 0
+        )
 
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            available_memory = (
+                int(config.memory_ratio * old_free_memory)
+                - model_memory
+                - mtp_kv_bytes
+                - mtp_workspace_bytes
+            )
             if config.model_config.is_hybrid:
                 min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
                 available_states = (available_memory - min_pages_bytes) // cache_per_state
@@ -254,6 +280,11 @@ class Engine:
         num_tokens = num_pages * config.page_size
         logger.info(f"Allocating {num_tokens} tokens for KV cache,\
                      K + V = {mem_GB(num_pages * cache_per_page)}")
+        if mtp_kv_bytes:
+            logger.info(
+                f"Reserving {mtp_kv_slots} MTP KV slots = {mem_GB(mtp_kv_bytes)}, "
+                f"attention workspace = {mem_GB(mtp_workspace_bytes)}"
+            )
         if config.model_config.is_hybrid:
             logger.info(
                 f"Allocating {num_pages + num_draft_states}"

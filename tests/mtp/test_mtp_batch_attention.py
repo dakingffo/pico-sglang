@@ -99,3 +99,58 @@ def test_batch_attention_cached_step_matches_individual() -> None:
             next_x[i], next_pos[i], kv
         )
         torch.testing.assert_close(batch_out[i], expected)
+
+
+def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
+    from picosgl.speculator.drafters.mtp.attention import MTPAttentionBackend
+    from picosgl.speculator.drafters.mtp.pool import MTPKVPool
+
+    attention = _make_attention()
+    lengths = [2, 4, 3]
+    offsets = [0, 2, 6]
+    total = sum(lengths)
+    generator = torch.Generator().manual_seed(31)
+    x = torch.randn(total, 32, generator=generator)
+    positions = torch.cat([torch.arange(length) for length in lengths])
+
+    query, gate, key, value = attention.project_for_cache(x, positions)
+    pool = MTPKVPool(
+        max_running_req=3,
+        window_size=max(lengths),
+        max_batch_size=3,
+        num_spec_tokens=1,
+        num_kv_heads=attention.num_kv_heads,
+        head_dim=attention.head_dim,
+        dtype=key.dtype,
+        device=torch.device("cpu"),
+    )
+    pool.k[:total].copy_(key)
+    pool.v[:total].copy_(value)
+    indices = torch.zeros(3, max(lengths), dtype=torch.int32)
+    valid = torch.zeros(3, max(lengths), dtype=torch.bool)
+    last_rows = []
+    for i, (offset, length) in enumerate(zip(offsets, lengths)):
+        indices[i, :length] = torch.arange(offset, offset + length, dtype=torch.int32)
+        valid[i, :length] = True
+        last_rows.append(offset + length - 1)
+
+    last_rows = torch.tensor(last_rows)
+    backend = MTPAttentionBackend(
+        "auto",
+        attention.num_qo_heads,
+        attention.num_kv_heads,
+        attention.head_dim,
+        key.dtype,
+        torch.device("cpu"),
+    )
+    pooled = backend.forward(query[last_rows], pool, indices, valid, lengths)
+    pooled = pooled * torch.sigmoid(gate[last_rows])
+    pooled = attention.o_proj.forward(pooled.reshape(len(lengths), -1))
+    expected = []
+    for offset, length in zip(offsets, lengths):
+        row = x[offset : offset + length]
+        pos = positions[offset : offset + length]
+        output, _ = attention.forward_with_kv(row, pos)
+        expected.append(output[-1])
+
+    torch.testing.assert_close(pooled, torch.stack(expected))

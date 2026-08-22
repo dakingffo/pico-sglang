@@ -140,6 +140,7 @@ class LocalDrafterClient(MainDrafterClient):
         sampling_params : SamplingParams,
     ) -> None:
         self.states[uid] = MTPState(
+            table_idx=table_idx,
             sampling_params=sampling_params,
             window_positions=list(carry_positions),
             window_tokens=list(carry_tokens),

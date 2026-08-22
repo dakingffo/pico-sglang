@@ -74,6 +74,7 @@ class DrafterRunner:
     def _on_init(self, msg: DraftInitMsg) -> None:
         hidden = self.data_plane.recv_hidden(len(msg.carry_positions))
         self.states[msg.uid] = MTPState(
+            table_idx=msg.table_idx,
             sampling_params=msg.sampling_params,
             window_positions=msg.carry_positions,
             window_tokens=msg.carry_tokens,

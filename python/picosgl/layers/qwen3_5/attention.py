@@ -191,6 +191,29 @@ class Qwen3_5Attention(BaseOP):
         o = self.o_proj.forward(o.reshape(batch_size, seq_len, -1))
         return o, (k, v), key_valid
 
+    def project_for_cache(
+        self,
+        x        : torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project normalized MTP rows without materializing an attention result.
+
+        Returned K/V retain their native KV-head count and can be written directly to
+        ``MTPKVPool``.  Query and gate are returned separately because the engine only
+        evaluates the final canonical row while caching every newly accepted row.
+        """
+        assert not self.paged
+        assert x.ndim == 2 and positions.shape == (x.shape[0],)
+        q_gate = self.q_proj.forward(x).view(-1, self.num_qo_heads, self.head_dim * 2)
+        query, gate = q_gate.chunk(2, dim=-1)
+        key = self.k_proj.forward(x).view(-1, self.num_kv_heads, self.head_dim)
+        value = self.v_proj.forward(x).view(-1, self.num_kv_heads, self.head_dim)
+
+        query = self.q_norm.forward(query)
+        key = self.k_norm.forward(key)
+        query, key = self.rotary.forward(positions, query, key)
+        return query, gate, key, value
+
     def _eager_attention(
         self,
         query: torch.Tensor,

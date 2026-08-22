@@ -9,6 +9,7 @@ from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.message import BaseDrafterMsg, DraftStepMsg
 from picosgl.models.drafters import Qwen3_5MTPDrafter
 from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
+from picosgl.utils import torch_dtype
 
 from .data_plane import NCCLDataPlane
 from .drafters.mtp import MTPEngine
@@ -41,10 +42,19 @@ def drafter_worker(
     # (LinearColumnParallel etc.) read the global TP info, which the main engine sets for
     # itself — this process must set it before constructing the model.
     with tp_override(DistributedInfo(0, 1)):
-        model = Qwen3_5MTPDrafter(args.model_config)
+        with torch_dtype(args.dtype):
+            model = Qwen3_5MTPDrafter(args.model_config)
         model.load_weights(args.speculative_draft_model_path, device)
+        K = args.speculative_num_draft_tokens
         engine = MTPEngine(
-            model, device, args.model_config.vocab_size, args.speculative_num_draft_tokens
+            model,
+            device,
+            args.model_config.vocab_size,
+            K,
+            args.max_running_req,
+            args.speculator_window_size,
+            min(args.max_running_req, args.decode_batch_budget // K),
+            args.attention_backend,
         )
         runner = DrafterRunner(
             engine,
@@ -62,7 +72,8 @@ def drafter_worker(
 def make_local_drafter(device: torch.device, config: EngineConfig):
     with tp_override(DistributedInfo(0, 1)):
         mc = config.model_config
-        drafter = Qwen3_5MTPDrafter(mc)
+        with torch_dtype(config.dtype):
+            drafter = Qwen3_5MTPDrafter(mc)
         drafter.load_weights(config.speculative_draft_model_path, device)
     return drafter
 
@@ -81,8 +92,16 @@ def make_drafter_client(sche: Scheduler, config: SchedulerConfig) -> DrafterClie
             scheduler_io=sche
         )
     else:
+        K = config.speculative_num_draft_tokens
         engine = MTPEngine(
-            sche.engine.drafter, sche.device, mc.vocab_size, config.speculative_num_draft_tokens
+            sche.engine.drafter,
+            sche.device,
+            mc.vocab_size,
+            K,
+            config.max_running_req,
+            config.speculator_window_size,
+            min(config.max_running_req, config.decode_batch_budget // K),
+            config.attention_backend,
         )
         return LocalDrafterClient(
             config, sche.device, mc.vocab_size, mc.hidden_size,
