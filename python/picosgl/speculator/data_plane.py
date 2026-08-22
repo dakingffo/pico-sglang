@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 import torch
 
-from picosgl.kernel import init_pynccl_drafter_target_separation
+from picosgl.distributed import init_pynccl_drafter_target_separation
 
 
 class DataPlaneSizes(NamedTuple):

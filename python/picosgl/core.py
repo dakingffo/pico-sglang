@@ -185,7 +185,7 @@ def clear_global_ctx(key: str | None = None) -> None:
     if key is not None:
         assert isinstance(_GLOBAL_CTX, dict), "Global context is not a dict"
         value = _GLOBAL_CTX.get(key, -1)
-        assert value is not -1, f"Global context does not have '{key=}'"
+        assert value != -1, f"Global context does not have '{key=}'"
         _GLOBAL_CTX[key] = None
     else:
         _GLOBAL_CTX = None

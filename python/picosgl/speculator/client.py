@@ -5,8 +5,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from picosgl.kernel.pynccl import create_nccl_uid_bytes
 from picosgl.core import SamplingParams
+from picosgl.distributed import create_nccl_uid_bytes
 from picosgl.message import (
     BaseDrafterMsg,
     DraftHandshakeAckMsg,

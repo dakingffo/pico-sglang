@@ -3,7 +3,9 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
-from .utils import KernelConfig, load_jit, make_cpp_args
+from picosgl.tvm import load_jit, make_cpp_args
+
+from .utils import KernelConfig
 
 if TYPE_CHECKING:
     import torch
@@ -42,6 +44,8 @@ def store_cache(
     num_tokens = k_cache.shape[0]
     k_cache = k_cache.view(num_tokens, -1)
     v_cache = v_cache.view(num_tokens, -1)
+    k = k.view(k.shape[0], -1)
+    v = v.view(v.shape[0], -1)
     element_size = k_cache.shape[1] * k_cache.element_size()
     module = _jit_store_module(element_size)
     module.launch(k_cache, v_cache, indices, k, v)

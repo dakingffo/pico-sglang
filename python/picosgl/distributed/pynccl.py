@@ -1,29 +1,22 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from picosgl.env import ENV
-
-from .utils import load_aot
+from picosgl.tvm import load_aot
 
 if TYPE_CHECKING:
-    from abc import abstractmethod
     from ctypes import c_void_p
 
     import torch
     from tvm_ffi import Module
 
-    class PyNCCLCommunicator:
-        @abstractmethod
-        def all_reduce(self, input: torch.Tensor, op: Literal["sum"]) -> None: ...
-        @abstractmethod
-        def all_gather(self, output: torch.Tensor, input: torch.Tensor) -> None: ...
-        @abstractmethod
-        def get_buffer(self) -> c_void_p: ...
 
-else:
-    PyNCCLCommunicator = Any
+class PyNCCLCommunicator(Protocol):
+    def all_reduce(self, input: torch.Tensor, op: Literal["sum"]) -> None: ...
+    def all_gather(self, output: torch.Tensor, input: torch.Tensor) -> None: ...
+    def get_buffer(self) -> c_void_p: ...
 
 
 @functools.cache
@@ -75,8 +68,7 @@ def init_pynccl(
     nccl_id = id_list[0]
     assert not nccl_id is None, f"Failed to get NCCL unique ID on {tp_rank = }"
 
-    # bypass type checking for the FFI object
-    return cls(tp_rank, tp_size, max_size_bytes, nccl_id)  # type: ignore
+    return cast(PyNCCLCommunicator, cls(tp_rank, tp_size, max_size_bytes, nccl_id))
 
 
 def create_nccl_uid_bytes() -> bytes:
@@ -114,5 +106,7 @@ def init_pynccl_drafter_target_separation(
 
     module = _load_nccl_module()
     cls = _get_pynccl_wrapper_cls()
-    # bypass type checking for the FFI object
-    return cls(rank, world_size, max_size_bytes, _nccl_uid_to_ffi(nccl_uid))
+    return cast(
+        PyNCCLCommunicator,
+        cls(rank, world_size, max_size_bytes, _nccl_uid_to_ffi(nccl_uid)),
+    )

@@ -9,7 +9,8 @@ import torch.distributed as dist
 
 if TYPE_CHECKING:
     from picosgl.distributed import DistributedInfo
-    from picosgl.kernel import PyNCCLCommunicator
+
+    from .pynccl import PyNCCLCommunicator
 
 
 @dataclass
@@ -66,7 +67,7 @@ def enable_pynccl_distributed(
     tp_cpu_group: dist.ProcessGroup,
     max_bytes   : int
 ) -> None:
-    from picosgl.kernel import init_pynccl
+    from .pynccl import init_pynccl
 
     # Wrap the raw PyNCCL FFI object so its all_reduce(x, "sum") signature matches the
     # DistributedImpl protocol (callers invoke impl.all_reduce(x)).

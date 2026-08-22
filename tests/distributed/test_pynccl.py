@@ -1,8 +1,7 @@
 import os
 import time
 import torch
-from picosgl.distributed import set_tp_info
-import picosgl.kernel as kernel
+from picosgl.distributed import DistributedInfo, init_pynccl, set_tp_info
 from tqdm import tqdm
 
 from picosgl.utils import init_logger
@@ -16,7 +15,7 @@ def run(tp_size: int, tp_rank: int):
     torch.cuda.set_device(tp_rank)
     torch.cuda.set_stream(torch.cuda.Stream(tp_rank))  # type: ignore
     stream = torch.cuda.current_stream()
-    set_tp_info(tp_rank, tp_size)
+    set_tp_info(DistributedInfo(tp_rank, tp_size))
 
     # cpu group
     torch.distributed.init_process_group(
@@ -33,7 +32,7 @@ def run(tp_size: int, tp_rank: int):
     K = 512
     USE_SYMM = 0
 
-    comm = kernel.init_pynccl(
+    comm = init_pynccl(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_cpu_group=tp_cpu_group,

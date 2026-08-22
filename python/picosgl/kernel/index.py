@@ -3,7 +3,9 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
-from .utils import KernelConfig, load_jit, make_cpp_args
+from picosgl.tvm import load_jit, make_cpp_args
+
+from .utils import KernelConfig
 
 if TYPE_CHECKING:
     import torch

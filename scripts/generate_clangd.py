@@ -13,7 +13,7 @@ if str(PYTHON_ROOT) not in sys.path:
 
 
 def generate_clangd() -> None:
-    from picosgl.kernel.utils import DEFAULT_INCLUDE
+    from picosgl.tvm import DEFAULT_INCLUDE
     from picosgl.utils import init_logger
     from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
