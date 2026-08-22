@@ -66,7 +66,7 @@ class ModelConfig:
         return 0
 
     @classmethod
-    def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+    def from_pretrained(cls, config: PretrainedConfig) -> ModelConfig:
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
@@ -84,8 +84,7 @@ class ModelConfig:
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
-        # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict;
-        # Qwen3.5: inside rope_parameters dict.
+        # Llama/Qwen: rope_theta is a direct attr; Qwen3.5: inside rope_parameters dict.
         rope_scaling = getattr(config, "rope_scaling", None)
         rope_params = getattr(config, "rope_parameters", None) or {}
         rope_theta = (

@@ -8,7 +8,7 @@ import torch
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.message import BaseDrafterMsg, DraftStepMsg
 from picosgl.models.drafters import Qwen3_5MTPDrafter
-from picosgl.utils import ZmqPullQueue, ZmqPushQueue
+from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
 
 from .data_plane import NCCLDataPlane
 from .drafters.mtp import MTPEngine

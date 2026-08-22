@@ -15,7 +15,7 @@ from picosgl.cache import (
     linear_state_slot_bytes_for_config,
 )
 from picosgl.layers import set_rope_device
-from picosgl.models import create_model, load_weight
+from picosgl.models import create_model, load_target_weight
 from picosgl.utils import (
     align_ceil, div_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 )
@@ -200,7 +200,7 @@ class Engine:
             param_dtypes = {k: v.dtype for k, v in self.model.state_dict().items()}
             return {
                 k: v.to(param_dtypes.get(k, self.dtype))
-                for k, v in load_weight(config.model_path, self.device)
+                for k, v in load_target_weight(config.model_path, self.device)
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int, int | None]:

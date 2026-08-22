@@ -20,11 +20,10 @@ if TYPE_CHECKING:
 
 
 class Qwen3_5MTPDrafter(BaseOP):
-    """Standalone MTP drafter, extracted from the target model.
+    """Standalone MTP drafter with its own embedding and LM head.
 
-    Verbatim port of the old in-model ``Qwen3_5MultiTokenPredictor``, but owns its own
-    embedding / LM head (the checkpoint stores no ``mtp.*`` embed/lm_head keys; those are
-    the target's ``model.embed_tokens.weight``, loaded by ``load_weights``).
+    The checkpoint stores no ``mtp.*`` embed/lm_head keys; those are the target's
+    ``model.embed_tokens.weight``, loaded by ``load_weights``.
 
     Weight keys keep the ``mtp.*`` prefix so the drafter loads exactly the ``mtp.*``
     slice of a Qwen3.5 checkpoint (``load_state_dict(..., prefix="mtp")``). Runs at tp=1

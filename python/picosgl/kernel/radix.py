@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
-from .utils import load_aot
+from picosgl.tvm import load_aot
 
 if TYPE_CHECKING:
     import torch

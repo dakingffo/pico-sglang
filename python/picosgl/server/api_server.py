@@ -27,7 +27,8 @@ from picosgl.message import (
     TokenizeMsg,
     UserReply,
 )
-from picosgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
+from picosgl.message.queue import ZmqAsyncPullQueue, ZmqAsyncPushQueue
+from picosgl.utils import init_logger
 from .args import ServerArgs
 
 logger = init_logger(__name__, "FrontendAPI")

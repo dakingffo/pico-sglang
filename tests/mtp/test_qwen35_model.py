@@ -7,7 +7,6 @@ Tests:
   2. GatedDeltaNet standalone math: prefill (chunked rule) == step-by-step decode
      (recurrent rule), and chunked continuation (use_state=True) == full prefill.
   3. Full model (paged flashinfer path): prefill-vs-decode logits consistency.
-  4. MTP head: 15 tensors loaded, forward + get_logits shapes.
 """
 import os
 import sys
@@ -23,7 +22,7 @@ MODEL_PATH = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwe
 
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
-from picosgl.utils import cached_load_hf_config, torch_dtype
+from picosgl.utils import load_model_config, torch_dtype
 
 
 def setup():
@@ -32,16 +31,16 @@ def setup():
     set_tp_info(DistributedInfo(rank=0, size=1))
     from picosgl.models.config import ModelConfig
 
-    mcfg = ModelConfig.from_hf(cached_load_hf_config(MODEL_PATH))
+    mcfg = ModelConfig.from_pretrained(load_model_config(MODEL_PATH))
     return mcfg
 
 
 def load_model(mcfg, paged=True, loaded=None):
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
-    from picosgl.models.weight import load_weight
+    from picosgl.models.weight import load_target_weight
 
     if loaded is None:
-        loaded = {k: v for k, v in load_weight(MODEL_PATH, "cpu")}
+        loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
         model = Qwen3_5ForCausalLM(mcfg, paged=paged)
     # load_state_dict pops keys from the passed dict; pass a copy to keep `loaded` intact
@@ -61,16 +60,14 @@ def test1_weight_loading(mcfg, model, loaded):
     print(f"  unexpected (in model, not in ckpt): {unexpected}")
     assert not missing, f"missing keys: {missing}"
     assert not unexpected, f"unexpected keys: {unexpected}"
-    # spot-check shapes on a linear layer and an mtp key
+    # spot-check shapes on representative target-model layers
     lt = "model.layers.0.linear_attn"
     at = "model.layers.3.self_attn"
     for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkv.weight", f"{at}.q_proj.weight",
-              f"{at}.q_norm.weight", "mtp.fc.weight", "model.norm.weight"):
+              f"{at}.q_norm.weight", "model.norm.weight"):
         assert k in sd, f"missing {k}"
         print(f"  {k}: {tuple(sd[k].shape)} {sd[k].dtype}")
-    mtp_keys = sorted(k for k in sd if k.startswith("mtp."))
-    assert len(mtp_keys) == 15, f"expected 15 mtp keys, got {len(mtp_keys)}"
-    print(f"  mtp keys: {len(mtp_keys)} ✓")
+    assert not any(k.startswith(("mtp.", "model.mtp.")) for k in sd)
     print("  PASS")
 
 
@@ -336,48 +333,6 @@ def test3_full_model(mcfg, loaded=None):
     print(f"    worst = {worst:.4g} < {DECODE_TOL}  ✓")
     print("  PASS")
 
-    # keep for MTP test
-    return model, ctx, device, tokens
-
-
-def test4_mtp(mcfg, model, device, tokens):
-    print("=" * 60)
-    print("Test 4: MTP head forward")
-    from picosgl.core import Request, get_global_ctx
-    from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
-
-    mtp_keys = sorted(k for k in model.state_dict() if k.startswith("mtp."))
-    assert len(mtp_keys) == 15
-    ids = tokens.input_ids[0].to(device)  # (S,)
-    S = ids.shape[0]
-    positions = torch.arange(S, device=device)
-
-    # run main model prefill to get hidden states
-    req = Request(
-        input_ids=ids.cpu(), table_idx=4, cached_len=0,
-        output_len=2, uid=3, sampling_params=None,  # type: ignore
-        cache_handle=None,  # type: ignore
-    )
-    from picosgl.core import Batch
-    batch = Batch(reqs=[req], phase="prefill")
-    batch.input_ids = ids
-    batch.positions = positions
-    batch.padded_reqs = [req]
-    batch.out_loc = get_global_ctx().page_table[4, :S]
-    get_global_ctx().attn_backend.prepare_metadata(batch)
-    with get_global_ctx().forward_batch(batch):
-        hidden = model.model.forward(ids)  # (S, hidden)
-
-    # MTP: predict next token from current position
-    h = model.mtp.forward(ids[1:], positions[1:], hidden[1:])
-    logits = model.mtp.get_logits(h)
-    assert h.shape == (S - 1, mcfg.hidden_size), h.shape
-    assert logits.shape == (S - 1, mcfg.vocab_size), logits.shape
-    print(f"  mtp.forward -> hidden {tuple(h.shape)}, logits {tuple(logits.shape)} ✓")
-    # sanity: the logits should be finite
-    assert torch.isfinite(logits).all()
-    print("  PASS")
-
 
 if __name__ == "__main__":
     mcfg = setup()
@@ -385,8 +340,7 @@ if __name__ == "__main__":
     test1_weight_loading(mcfg, model, loaded)
     test2_gated_delta_net_math(mcfg)
     if torch.cuda.is_available():
-        model, ctx, device, tokens = test3_full_model(mcfg, loaded=loaded)
-        test4_mtp(mcfg, model, device, tokens)
+        test3_full_model(mcfg, loaded=loaded)
     else:
-        print("No CUDA available; skipping tests 3/4")
+        print("No CUDA available; skipping test 3")
     print("\nALL TESTS PASSED")

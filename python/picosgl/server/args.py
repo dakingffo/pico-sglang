@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 from dataclasses import dataclass
 
 import torch
@@ -44,7 +43,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         "--model",
         type=str,
         required=True,
-        help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        help="A local model directory or a Hugging Face/ModelScope model ID.",
     )
 
     parser.add_argument(
@@ -250,31 +249,36 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
             if kwargs["speculative_algorithm"] is not None else base
         )
 
-    if kwargs["model_path"].startswith("~"):
-        kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+    from picosgl.utils import resolve_model_path
 
-    if kwargs["model_source"] == "modelscope":
-        model_path = kwargs["model_path"]
-        if not os.path.isdir(model_path):
-            from modelscope import snapshot_download
-
-            ignore_patterns = []
-            if kwargs["use_dummy_weight"]:
-                ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
-            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
-            kwargs["model_path"] = model_path
-    del kwargs["model_source"]
+    model_source = kwargs.pop("model_source")
+    unresolved_model_path = kwargs["model_path"]
+    kwargs["model_path"] = resolve_model_path(
+        unresolved_model_path,
+        model_source,
+        download_weights=not kwargs["use_dummy_weight"],
+    )
+    if draft_path := kwargs["speculative_draft_model_path"]:
+        kwargs["speculative_draft_model_path"] = (
+            kwargs["model_path"]
+            if draft_path == unresolved_model_path else
+            resolve_model_path(
+                draft_path,
+                model_source,
+                download_weights=not kwargs["use_dummy_weight"],
+            )
+        )
 
     if (dtype_str := kwargs["dtype"]) == "auto":
-        from picosgl.utils import cached_load_hf_config
+        from picosgl.utils import load_model_config
 
         # `dtype` is the transformers alias of `torch_dtype`. The raw-config fallback
         # (unregistered architectures like Qwen3.5) mirrors only fields present in
         # config.json, where torch_dtype may be null -> default to bf16.
-        hf_config = cached_load_hf_config(kwargs["model_path"])
+        pretrained_config = load_model_config(kwargs["model_path"])
         dtype_str = (
-            getattr(hf_config, "dtype", None)
-            or getattr(hf_config, "torch_dtype", None)
+            getattr(pretrained_config, "dtype", None)
+            or getattr(pretrained_config, "torch_dtype", None)
             or "bfloat16"
         )
 

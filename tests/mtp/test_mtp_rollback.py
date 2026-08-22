@@ -31,7 +31,7 @@ sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
 import torch
 
-from picosgl.utils import cached_load_hf_config, torch_dtype
+from picosgl.utils import load_model_config, torch_dtype
 
 
 def setup():
@@ -40,7 +40,7 @@ def setup():
     set_tp_info(DistributedInfo(rank=0, size=1))
     from picosgl.models.config import ModelConfig
 
-    return ModelConfig.from_hf(cached_load_hf_config(MODEL_PATH))
+    return ModelConfig.from_pretrained(load_model_config(MODEL_PATH))
 
 
 def to_device(module, device):
@@ -75,10 +75,10 @@ def main():
     from picosgl.cache.linear.state_pool import LinearStatePool
     from picosgl.layers.attention_backend import create_attention_backend
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
-    from picosgl.models.weight import load_weight
+    from picosgl.models.weight import load_target_weight
     from picosgl.scheduler.cache import CacheManager
 
-    loaded = {k: v for k, v in load_weight(MODEL_PATH, "cpu")}
+    loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
         model = Qwen3_5ForCausalLM(mcfg, paged=True)
     model.load_state_dict(dict(loaded))

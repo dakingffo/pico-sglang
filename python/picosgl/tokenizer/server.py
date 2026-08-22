@@ -18,7 +18,8 @@ from picosgl.message import (
     UserMsg,
     UserReply,
 )
-from picosgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenizer
+from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
+from picosgl.utils import init_logger, load_tokenizer
 
 from .tokenizer import TokenizeManager, DetokenizeManager
 

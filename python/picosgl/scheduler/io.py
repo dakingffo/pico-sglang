@@ -6,8 +6,15 @@ import msgpack
 import numpy as np
 import torch
 
-from picosgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg, DraftReplyMsg
-from picosgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
+from picosgl.message import (
+    BaseBackendMsg,
+    BaseTokenizerMsg,
+    BatchTokenizerMsg,
+    DetokenizeMsg,
+    DraftReplyMsg,
+)
+from picosgl.message.queue import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue
+from picosgl.utils import init_logger
 
 if TYPE_CHECKING:
     from .config import SchedulerConfig
