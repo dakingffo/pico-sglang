@@ -50,7 +50,9 @@ class VerifyOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
     full_hidden    : torch.Tensor
 
+
 ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
+
 
 class Engine:
     def __init__(self, config: EngineConfig):
@@ -79,7 +81,7 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
         self.drafter = None
         if (
-            self.config.enable_mtp
+            self.config.enable_specualtive_decoding
             and not self.config.enable_dt_separation
             and self.config.tp_info.is_primary()
         ):
@@ -121,7 +123,10 @@ class Engine:
         # ======================= Linear state table ========================
         if config.model_config.is_hybrid:
             page_cols = div_ceil(self.max_seq_len, config.page_size)
-            reserve_cols = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
+            reserve_cols = (
+                config.speculative_num_draft_tokens + 1
+                if config.enable_specualtive_decoding else 0
+            )
             self.ctx.state_table = self.state_table = torch.full(
                 (config.max_running_req + 1, page_cols + reserve_cols),
                 -1,
@@ -131,6 +136,17 @@ class Engine:
             self.ctx.draft_offset = self.draft_offset = (
                 page_cols if reserve_cols !=0 else None
             )
+            if reserve_cols != 0:
+                # Every table row permanently owns one K+1 verify reserve.  Slot ids
+                # evolve through commit-time swaps with page checkpoints, so this must
+                # be initialized once rather than rebuilt for each scheduled batch.
+                reserve = torch.arange(
+                    self.num_states,
+                    self.num_states + self.num_draft_states,
+                    dtype=torch.int32,
+                    device=self.device,
+                ).view(config.max_running_req, reserve_cols)
+                self.state_table[:config.max_running_req, page_cols:].copy_(reserve)
 
         # ======================= Attention & MoE backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -157,14 +173,14 @@ class Engine:
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
 
-        mtp_skip_graphs = getattr(config, "enable_mtp", False)
+        speculative_skip_graphs = config.enable_specualtive_decoding
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=[] if mtp_skip_graphs else config.cuda_graph_bs,
-            cuda_graph_max_bs=0 if mtp_skip_graphs else config.cuda_graph_max_bs,
+            cuda_graph_bs=[] if speculative_skip_graphs else config.cuda_graph_bs,
+            cuda_graph_max_bs=0 if speculative_skip_graphs else config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -218,11 +234,14 @@ class Engine:
         # For hybrid models every KV page also owns one linear-state slot, and each MTP
         # request additionally owns a K+1 slot reserve. Both are inside the memory budget.
         cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
-        num_draft_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
-        num_draft_states = min(
-            config.max_running_req,
-            config.decode_batch_budget // config.speculative_num_draft_tokens, # real concurrency
-        ) * num_draft_per_req if config.enable_mtp else 0
+        num_draft_per_req = (
+            config.speculative_num_draft_tokens + 1
+            if config.enable_specualtive_decoding else 0
+        )
+        num_draft_states = (
+            config.max_running_req * num_draft_per_req
+            if config.enable_specualtive_decoding else 0
+        )
         draft_bytes = num_draft_states * cache_per_state
         draft_concurrency = min(
             config.max_running_req,
@@ -238,7 +257,7 @@ class Engine:
             * config.model_config.num_kv_heads
             * config.model_config.head_dim
             * self.dtype.itemsize
-            if config.enable_mtp and not config.enable_dt_separation else 0
+            if config.enable_specualtive_decoding and not config.enable_dt_separation else 0
         )
         mtp_workspace_bytes = (
             32 * 1024 * 1024
@@ -332,7 +351,9 @@ class Engine:
     ) -> ForwardOutput | VerifyOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            if batch.is_verify or (self.config.enable_mtp and batch.is_prefill):
+            if batch.is_verify or (
+                self.config.enable_specualtive_decoding and batch.is_prefill
+            ):
                 hidden, logits = self.model.forward_verify()
                 batch.full_hidden = hidden
             elif self.graph_runner.can_use_cuda_graph(batch):
@@ -429,7 +450,7 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")
 
-    if config.enable_mtp:
+    if config.enable_specualtive_decoding:
         assert config.speculative_algorithm == "MTP", (
             "only the MTP algorithm is implemented (got --speculative-algorithm "
             f"{config.speculative_algorithm!r})"

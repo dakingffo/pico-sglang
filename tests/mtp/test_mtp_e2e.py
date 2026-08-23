@@ -77,7 +77,7 @@ class OfflineScheduler(Scheduler):
         self.results.extend(reply)
 
 
-def make_config(enable_mtp: bool, num_pages: int = 256) -> SchedulerConfig:
+def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> SchedulerConfig:
     # page_size stays 1 here: the engine overrides it to 64 for hybrid models (must be a
     # multiple of 64), and dense models (the non-MTP byte-identity regression) keep 1.
     # num_pages is small because a hybrid page also owns one ~9.6MB linear-state slot, so
@@ -91,14 +91,14 @@ def make_config(enable_mtp: bool, num_pages: int = 256) -> SchedulerConfig:
         num_page_override=num_pages,
         cache_type="naive",  # hybrid is force-upgraded to hybrid_radix by the engine
         cuda_graph_max_bs=0,
-        speculative_algorithm="MTP" if enable_mtp else None,
-        speculative_draft_model_path=MODEL if enable_mtp else None,
+        speculative_algorithm="MTP" if enable_specualtive_decoding else None,
+        speculative_draft_model_path=MODEL if enable_specualtive_decoding else None,
         speculative_num_draft_tokens=K,
         offline_mode=True,
     )
 
 
-def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) -> dict:
+def run(enable_specualtive_decoding: bool, debug_logits: bool = False, temperature: float = 0.0) -> dict:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
@@ -112,7 +112,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
                 sampling_params=SamplingParams(temperature=temperature, max_tokens=MAX_TOKENS),
             )
         )
-    sched = OfflineScheduler(make_config(enable_mtp), msgs)
+    sched = OfflineScheduler(make_config(enable_specualtive_decoding), msgs)
     uid_map = {uid: name for uid, (name, _) in enumerate(PROMPTS)}
 
     # top-2 logit margin at every position, recorded from the DECODE path's forward
@@ -138,7 +138,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
     # the verify forward), and each non-aborted req emits one list-typed DetokenizeMsg per
     # round whose length is num_sampled -- read it from the reply.
     hist: list[tuple[int, int]] = []
-    if enable_mtp:
+    if enable_specualtive_decoding:
         orig_process = sched.verify_manager.process
 
         def rec_process(ctx, batch, output):
@@ -150,7 +150,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
 
         sched.verify_manager.process = rec_process
 
-    if debug_logits or enable_mtp:
+    if debug_logits or enable_specualtive_decoding:
         rs = sched.engine.sampler.reject_sample
 
         def dump_rs(logits, batch, args):
@@ -254,7 +254,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
     sched.shutdown()
 
     result = {
-        "enable_mtp": enable_mtp,
+        "enable_specualtive_decoding": enable_specualtive_decoding,
         "tokens": {uid_map[u]: t for u, t in tokens.items()},
         "prompt_len": {uid_map[u]: len(m.input_ids) for u, m in enumerate(msgs)},
         "missing": missing,
@@ -270,7 +270,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
     result["verify_margins"] = [
         [u, p, round(m, 4)] for (u, p), m in verify_margins.items()
     ]
-    if enable_mtp:
+    if enable_specualtive_decoding:
         n = len(hist)
         result["accept_hist"] = hist
         if n:

@@ -1,6 +1,6 @@
 """Cache-hit e2e: a hybrid_radix prefix hit must produce byte-identical output.
 
-The whole point of HybridRadixPrefixCache is that a second request sharing page-
+The whole point of the hybrid RadixTreeNode is that a second request sharing page-
 aligned prefix tokens reuses the cached KV pages AND the cached per-page linear
 states (borrowed via state_table) instead of recomputing them. This driver proves
 that reusing them is CORRECT: a partial-hit run of a prompt produces exactly the
@@ -60,7 +60,7 @@ def build_prompts():
                  (("P", LEN_P), ("P2", LEN_P2), ("P6", LEN_P6))}
 
 
-def run(mode: str, enable_mtp: bool = True) -> dict:
+def run(mode: str, enable_specualtive_decoding: bool = True) -> dict:
     tok, prompts = build_prompts()
 
     def msg(name, uid):
@@ -74,7 +74,7 @@ def run(mode: str, enable_mtp: bool = True) -> dict:
     else:  # hit: P2 populates first; P and P6 hit its pages [0,128)
         msgs = [msg("P2", 1)]
 
-    sched = OfflineScheduler(make_config(enable_mtp), msgs)
+    sched = OfflineScheduler(make_config(enable_specualtive_decoding), msgs)
 
     # record the matched cached_len each prefill batch actually got (0 = cold, >0 = hit)
     max_cached: dict[int, int] = {}
@@ -128,7 +128,7 @@ def run(mode: str, enable_mtp: bool = True) -> dict:
     name_of = {0: "P", 1: "P2", 2: "P6"}
     return {
         "mode": mode,
-        "enable_mtp": enable_mtp,
+        "enable_specualtive_decoding": enable_specualtive_decoding,
         "streams": {name_of[u]: t for u, t in streams.items()},
         "max_cached": {name_of[u]: c for u, c in max_cached.items()},
         "integrity_ok": integrity_ok,
@@ -148,7 +148,10 @@ def main() -> None:
 
     if args.compare:
         cold, hit = (json.load(open(p)) for p in args.compare)
-        assert cold["enable_mtp"] == hit["enable_mtp"], "modes must match"
+        assert (
+            cold["enable_specualtive_decoding"]
+            == hit["enable_specualtive_decoding"]
+        ), "modes must match"
         ok = True
         for name in ("P", "P6"):
             c = cold["streams"].get(name, [])
@@ -169,12 +172,15 @@ def main() -> None:
         ok &= cold.get("integrity_ok", False)
         ok &= hit.get("integrity_ok", False)
         print(f"integrity: cold={cold.get('integrity_ok')} hit={hit.get('integrity_ok')}")
-        print(f"CACHE HIT TEST (mtp={cold['enable_mtp']}): "
+        print(f"CACHE HIT TEST (mtp={cold['enable_specualtive_decoding']}): "
               f"{'PASS' if ok else 'FAIL'}")
         sys.exit(0 if ok else 1)
 
     assert (args.cold or args.hit) and args.out
-    result = run("cold" if args.cold else "hit", enable_mtp=bool(args.mtp))
+    result = run(
+        "cold" if args.cold else "hit",
+        enable_specualtive_decoding=bool(args.mtp),
+    )
     with open(args.out, "w") as f:
         json.dump(result, f)
     print(json.dumps(result))

@@ -130,7 +130,7 @@ class GraphRunner:
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
+                self.buffer.logits[:bs] = model.forward() # trigger JIT
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
             if pool is None:
@@ -146,9 +146,8 @@ class GraphRunner:
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
-        g.replay()
+        self.graph_map[batch.padded_size].replay()
         return self.buffer.logits[:batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

@@ -84,7 +84,7 @@ def main() -> int:
 
     port = resolve_port(server_argv, server_args)
     proc = launch_server(
-        server_argv, port=port, enable_mtp=True,
+        server_argv, port=port, enable_specualtive_decoding=True,
         num_spec_tokens=server_args.speculative_num_draft_tokens,
         enable_dt=bench.dt,
     )

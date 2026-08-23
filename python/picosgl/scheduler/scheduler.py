@@ -52,9 +52,12 @@ class Scheduler(SchedulerIOMixin):
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
-        self.drafter_client = make_drafter_client(self, config) if config.enable_mtp else None
+        self.drafter_client = (
+            make_drafter_client(self, config)
+            if config.enable_specualtive_decoding else None
+        )
 
-        if config.enable_mtp:
+        if config.enable_specualtive_decoding:
             self.ar_manager = VerifyManager(
                 config, self.device,
                 self.cache_manager, self.table_manager,

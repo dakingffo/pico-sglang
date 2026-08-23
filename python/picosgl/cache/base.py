@@ -12,7 +12,7 @@ class BaseCacheHandle(ABC):
     cached_len: int
 
     @abstractmethod
-    def get_matched_indices(self) -> torch.Tensor: ...
+    def get_matched_indices(self) -> tuple[torch.Tensor, ...] | torch.Tensor: ...
 
 
 class SizeInfo(NamedTuple):

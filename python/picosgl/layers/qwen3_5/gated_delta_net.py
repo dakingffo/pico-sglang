@@ -4,8 +4,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from picosgl.core import get_global_ctx
+from picosgl.core import Request, get_global_ctx
 from picosgl.distributed import DistributedInfo, try_get_tp_info
+from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
 from picosgl.layers import BaseOP, LinearColParallelMerged, LinearRowParallel
 from picosgl.utils import div_even, nvtx_annotate
 
@@ -197,6 +198,45 @@ def _recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def _recurrent_gated_delta_rule_with_snapshots(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+):
+    """Batched Torch reference for short verify windows.
+
+    Unlike ``_recurrent_gated_delta_rule``, this returns every intermediate state so
+    callers can snapshot all speculative candidates without splitting the request batch.
+    Query and key are already L2-normalized.
+    """
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    ]
+    query *= 1 / (query.shape[-1] ** 0.5)
+    state = initial_state.to(torch.float32)
+    outputs = []
+    snapshots = []
+
+    for i in range(query.shape[2]):
+        q_t = query[:, :, i]
+        k_t = key[:, :, i]
+        v_t = value[:, :, i]
+        state = state * g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta[:, :, i].unsqueeze(-1)
+        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        outputs.append((state * q_t.unsqueeze(-1)).sum(dim=-2))
+        snapshots.append(state)
+
+    output = torch.stack(outputs, dim=2).transpose(1, 2).contiguous().to(initial_dtype)
+    return output, torch.stack(snapshots, dim=1)
+
+
 class _Conv1d(BaseOP):
     def __init__(self, in_channels: int, kernel_size: int):
         self.weight = torch.empty(in_channels, 1, kernel_size)
@@ -273,16 +313,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 offset += seq_len
             return out
         elif batch.is_verify:
-            # mini-prefill over each req's [old_bonus, drafts]; snapshots are written to
-            # circular slots so rejection rollback is pure pointer arithmetic (no memcpy).
-            out = torch.empty_like(x)
-            offset = 0
-            for req in batch.reqs:
-                seq_len = req.extend_len
-                seg = self._forward_verify_one(x[offset : offset + seq_len], req, pool, L)
-                out[offset : offset + seq_len] = seg
-                offset += seq_len
-            return out
+            return self._forward_verify(x, batch, pool, L)
         else:
             return self._forward_decode(x, batch, pool, L)
 
@@ -456,6 +487,129 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm.forward(core_attn_out, z).reshape(1, seq_len, -1)
         return self.out_proj.forward(core_attn_out).reshape(seq_len, -1)
+
+    def _forward_verify(self, x: torch.Tensor, batch, pool, L: int) -> torch.Tensor:
+        """Batched verify for packed request-major ``[old_bonus, drafts]`` rows.
+
+        Requests with the same verify length share one convolution and one recurrent
+        launch.  Tail requests can have fewer drafts, so distinct lengths are kept in
+        separate groups instead of padding and accidentally advancing their states.
+        """
+        ctx = get_global_ctx()
+        state_table = ctx.state_table
+        rb = ctx.draft_offset
+        assert state_table is not None and rb is not None
+
+        groups = batch.linear_verify_metadata
+        if groups is None:
+            entries_by_len: dict[int, list[tuple[Request, int]]] = {}
+            offset = 0
+            for req in batch.reqs:
+                entries_by_len.setdefault(req.extend_len, []).append((req, offset))
+                offset += req.extend_len
+            assert offset == x.shape[0]
+
+            groups = {}
+            for seq_len, entries in entries_by_len.items():
+                row_indices = torch.tensor(
+                    [row for _req, start in entries for row in range(start, start + seq_len)],
+                    dtype=torch.int64,
+                    device=x.device,
+                )
+                table_indices = torch.tensor(
+                    [req.table_idx for req, _start in entries],
+                    dtype=torch.int64,
+                    device=x.device,
+                )
+                baseline_slots = torch.tensor(
+                    [req.baseline_slot for req, _start in entries],
+                    dtype=torch.int64,
+                    device=x.device,
+                )
+                write_slots = state_table[table_indices, rb : rb + seq_len]
+                groups[seq_len] = row_indices, baseline_slots, write_slots
+            batch.linear_verify_metadata = groups
+
+        mixed_qkv_flat = self.in_proj_qkv.forward(x)
+        z = self.in_proj_z.forward(x).reshape(-1, self.num_v_heads, self.head_v_dim)
+        b_flat = self.in_proj_b.forward(x)
+        a_flat = self.in_proj_a.forward(x)
+        core_attn_out = torch.empty(
+            x.shape[0], self.num_v_heads, self.head_v_dim,
+            dtype=x.dtype, device=x.device,
+        )
+
+        for seq_len, (row_indices, baseline_slots, write_slots) in groups.items():
+            bs = len(baseline_slots)
+
+            mixed_qkv = mixed_qkv_flat.index_select(0, row_indices)
+            mixed_qkv = mixed_qkv.view(bs, seq_len, self.conv_dim).transpose(1, 2)
+            conv_state = pool.conv_state[baseline_slots, L]
+            conv_in = torch.cat([conv_state, mixed_qkv], dim=-1)
+            mixed_qkv = F.silu(
+                F.conv1d(conv_in, self.conv1d.weight, groups=self.conv_dim)
+            ).transpose(1, 2)
+
+            # Window j+1 is the convolution state after candidate j.  index_copy_ is
+            # required here: advanced indexing returns a copy and would silently drop
+            # writes to the pool.
+            conv_snapshots = (
+                conv_in.unfold(-1, self.state_len, 1)[:, :, 1:]
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
+            pool.conv_state[:, L].index_copy_(
+                0,
+                write_slots.flatten().to(torch.int64),
+                conv_snapshots.flatten(0, 1),
+            )
+
+            query, key, value = torch.split(
+                mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+            )
+            query = query.reshape(bs, seq_len, -1, self.head_k_dim)
+            key = key.reshape(bs, seq_len, -1, self.head_k_dim)
+            value = value.reshape(bs, seq_len, -1, self.head_v_dim)
+            b = b_flat.index_select(0, row_indices).view(bs, seq_len, self.num_v_heads)
+            a = a_flat.index_select(0, row_indices).view(bs, seq_len, self.num_v_heads)
+            beta = b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+            if self.num_v_heads // self.num_k_heads > 1:
+                repeats = self.num_v_heads // self.num_k_heads
+                query = query.repeat_interleave(repeats, dim=2)
+                key = key.repeat_interleave(repeats, dim=2)
+            query = _l2norm(query, dim=-1, eps=1e-6)
+            key = _l2norm(key, dim=-1, eps=1e-6)
+            initial_state = pool.recurrent_state[baseline_slots, L]
+
+            if x.is_cuda:
+                group_out = recurrent_gated_delta_triton(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state,
+                    write_slots,
+                    pool.recurrent_state[:, L],
+                )
+            else:
+                group_out, snapshots = _recurrent_gated_delta_rule_with_snapshots(
+                    query, key, value, g, beta, initial_state
+                )
+                pool.recurrent_state[:, L].index_copy_(
+                    0,
+                    write_slots.flatten().to(torch.int64),
+                    snapshots.flatten(0, 1).to(pool.dtype),
+                )
+            core_attn_out.index_copy_(0, row_indices, group_out.flatten(0, 1))
+
+        core_attn_out = self.norm.forward(
+            core_attn_out.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+        ).reshape(x.shape[0], -1)
+        return self.out_proj.forward(core_attn_out)
 
     def _forward_decode(self, x: torch.Tensor, batch, pool, L: int) -> torch.Tensor:
         ctx = get_global_ctx()

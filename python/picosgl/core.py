@@ -103,6 +103,9 @@ class Batch:
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     full_hidden : torch.Tensor | None = field(init=False, default=None)
+    linear_verify_metadata: dict[
+        int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] | None = field(init=False, default=None)
 
     @property
     def is_prefill(self) -> bool:

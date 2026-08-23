@@ -55,13 +55,13 @@ def main() -> int:
     port = resolve_port(server_argv, server_args)
 
     results: dict[str, dict[str, dict]] = {}
-    for label, enable_mtp in modes:
+    for label, enable_specualtive_decoding in modes:
         proc = launch_server(
             server_argv,
             port=port,
-            enable_mtp=enable_mtp,
+            enable_specualtive_decoding=enable_specualtive_decoding,
             num_spec_tokens=server_args.speculative_num_draft_tokens,
-            enable_dt=bench.dt and enable_mtp,
+            enable_dt=bench.dt and enable_specualtive_decoding,
         )
         try:
             base = wait_server_ready(port)
@@ -77,13 +77,16 @@ def main() -> int:
                         prompts,
                         in_lens,
                         out_lens,
-                        mtp=enable_mtp,
+                        mtp=enable_specualtive_decoding,
                         warmup=not bench.no_warmup,
                         pbar=not bench.no_pbar,
                     )
                 )
                 assert stats["chunks_ok"], "SSE chunk count inconsistent (parse broken?)"
-                note = f"avg_accept={stats['avg_accept']:.2f}" if enable_mtp else ""
+                note = (
+                    f"avg_accept={stats['avg_accept']:.2f}"
+                    if enable_specualtive_decoding else ""
+                )
                 print_stats(
                     f"bench_spec_decode {label} tp={server_args.tp_info.size} "
                     f"in={bench.input_len} out={bench.output_len} conc={c}",

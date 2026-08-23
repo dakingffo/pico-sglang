@@ -61,8 +61,6 @@ def _local_linear_head_counts(model_config: ModelConfig) -> tuple[int, int]:
 
 
 def linear_state_slot_bytes_for_config(model_config: ModelConfig, dtype: torch.dtype) -> int:
-    """Bytes of one per-rank state slot for a model, using the same conv_dim formula
-    as the pool (local head counts under TP)."""
     if not model_config.is_hybrid:
         return 0
     num_k_heads, num_v_heads = _local_linear_head_counts(model_config)
@@ -110,15 +108,17 @@ def create_naive_cache(device: torch.device):
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
 def create_radix_cache(device: torch.device):
-    from .radix_prefix_cache import RadixPrefixCache
+    from .radix_prefix_cache import RadixTreeNode, RadixPrefixCache
 
-    return RadixPrefixCache(device=device)
+    return RadixPrefixCache(device=device, node_type=RadixTreeNode)
+
 
 @SUPPORTED_CACHE_MANAGER.register("hybrid_radix")
 def create_hybrid_radix_cache(device: torch.device):
-    from .radix_prefix_cache import HybridRadixPrefixCache
+    from .radix_prefix_cache import HybridRadixTreeNode, RadixPrefixCache
 
-    return HybridRadixPrefixCache(device=device)
+    return RadixPrefixCache(device=device, node_type=HybridRadixTreeNode)
+
 
 def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
     return SUPPORTED_CACHE_MANAGER[type](device)

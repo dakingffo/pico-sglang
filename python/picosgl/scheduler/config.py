@@ -60,6 +60,8 @@ class SchedulerConfig(EngineConfig):
         if self.max_decode_tokens is not None:
             return self.max_decode_tokens
         base = max(1, self.max_running_req // 2)
-        return base * self.speculative_num_draft_tokens if self.enable_mtp else base
-
+        return (
+            base * self.speculative_num_draft_tokens
+            if self.enable_specualtive_decoding else base
+        )
 

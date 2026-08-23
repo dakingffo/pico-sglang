@@ -183,13 +183,26 @@ class MTPEngine(EngineBase):
         states: list[MTPState],
         step: int,
     ) -> torch.Tensor:
-        """Vectorize greedy rows; preserve each sampling request's exact distribution."""
+        """Sample active rows and retain the exact distribution used for each draft."""
         tokens = logits.argmax(dim=-1).to(torch.int32)
-        for i, st in enumerate(states):
-            if step >= st.n_drafts or st.sampling_params.is_greedy:
-                continue
-            dist = self.sampler._target_dist(logits[i], st.sampling_params)
+        sampling_rows = [
+            i for i, st in enumerate(states)
+            if step < st.n_drafts and not st.sampling_params.is_greedy
+        ]
+        if not sampling_rows:
+            return tokens
+
+        rows = torch.tensor(sampling_rows, dtype=torch.int64, device=self.device)
+        params = [states[i].sampling_params for i in sampling_rows]
+        args = self.sampler.prepare_params(params)
+        probs = self.sampler.probabilities(logits.index_select(0, rows), args)
+
+        import flashinfer.sampling as sampling
+
+        sampled = sampling.sampling_from_probs(probs).to(torch.int32)
+        tokens.index_copy_(0, rows, sampled)
+        for prob, i in zip(probs, sampling_rows):
+            st = states[i]
             assert st.draft_probs is not None
-            st.draft_probs[step] = dist
-            tokens[i] = torch.multinomial(dist, 1)[0].to(torch.int32)
+            st.draft_probs[step].copy_(prob)
         return tokens

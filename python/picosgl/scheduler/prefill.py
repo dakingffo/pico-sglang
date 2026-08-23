@@ -71,13 +71,15 @@ class PrefillAdder:
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            page_entry.copy_(handle.get_matched_indices())
+            matched = handle.get_matched_indices()
             # borrow the matched pages' linear-state slots (per page) instead of allocating
             if (state_table := self.cache_manager.state_table) is not None:
-                matched_state = handle.get_matched_state_slots()
-                if matched_state is not None:
-                    ps = self.cache_manager.page_size
-                    state_table[table_idx, : cached_len // ps] = matched_state
+                matched_indices, matched_state = matched
+                ps = self.cache_manager.page_size
+                state_table[table_idx, : cached_len // ps] = matched_state
+            else:
+                matched_indices = matched
+            page_entry.copy_(matched_indices)
 
         return handle, table_idx
 

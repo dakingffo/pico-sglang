@@ -94,15 +94,12 @@ class CacheManager:
     def allocate_draft_state(self, reqs: list[Request]) -> None:
         if self.state_pool is None or self.state_table is None:
             return
-        offset = self.num_states
+        assert self.draft_offset is not None
         for req in reqs:
-            begin = self.draft_offset
-            end = begin + req.extend_len
             state = self.state_table[req.table_idx]
-            state[begin: end] = torch.arange(offset, offset + req.extend_len, dtype=torch.int32, device=self.device)
+            assert req.extend_len <= len(state[self.draft_offset:])
             if req.baseline_slot == -1:  # first verify round; state_commit_verify owns it after
                 req.baseline_slot = int(state[(req.cached_len - 1) // self.page_size])
-            offset += req.extend_len
 
     def cache_req(self, req: Request, *, finished: bool) -> None:
         # ==================================== valid cache region ====================================
@@ -162,15 +159,15 @@ class CacheManager:
             self._free_state_columns(
                 uid, insert_len // self.page_size, div_ceil(req.cached_len, self.page_size)
             )
-            # 3) wipe the whole row: the tree already owns [0, insert_len//ps) so their
-            #    slots stay alive, and wiping guarantees a reused table_idx never inherits
-            #    a stale reference (which a later batch would write into or double-free).
-            self.state_table[uid, :] = -1
+            # 3) wipe page references only.  The verify reserve permanently belongs to
+            #    this table row; its ids evolve through commit-time swaps with page slots
+            #    and must survive table_idx reuse.
+            page_end = self.draft_offset or self.state_table.shape[1]
+            self.state_table[uid, :page_end] = -1
         else:
             # 3) re-point matched pages to the tree's canonical slots
-            matched_state = new_handle.get_matched_state_slots()
-            if matched_state is not None:
-                self.state_table[uid, : insert_len // self.page_size] = matched_state
+            _matched_indices, matched_state = new_handle.get_matched_indices()
+            self.state_table[uid, : insert_len // self.page_size] = matched_state
 
     def _free_state_columns(self, uid: int, lo: int, hi: int) -> None:
         if self.state_pool is None or lo >= hi:
@@ -231,10 +228,11 @@ class CacheManager:
         if self.page_size > 1:
             assert torch.all(self.free_pages % self.page_size == 0)
         if self.state_pool is not None and self.state_table is not None:
-            # Idle (the only time this runs): no running requests, and finished requests
-            # wipe their rows, so every slot is either free or owned by the radix tree.
+            # Idle (the only time this runs): page columns have no running-request refs.
+            # Verify reserve columns remain permanently populated.
             free_state = len(self.free_states)
-            live_state = int((self.state_table >= 0).sum().item())
+            page_end = self.draft_offset or self.state_table.shape[1]
+            live_state = int((self.state_table[:, :page_end] >= 0).sum().item())
             tree_state = self.prefix_cache.total_state_pages()
             if live_state != 0:
                 raise RuntimeError(
@@ -247,6 +245,17 @@ class CacheManager:
                     f" free_state({free_state}) + tree_state({tree_state}) !="
                     f" num_states({self.num_states})"
                 )
+            if self.draft_offset is not None:
+                reserve = self.state_table[:-1, self.draft_offset:].flatten()
+                if (
+                    len(reserve) != self.num_draft_states
+                    or torch.any(reserve < 0)
+                    or len(torch.unique(reserve)) != len(reserve)
+                ):
+                    raise RuntimeError(
+                        "CacheManager state integrity check failed: verify reserve "
+                        "contains missing or duplicate slot references."
+                    )
 
     @contextmanager
     def lazy_free_region(self):

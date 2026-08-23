@@ -36,7 +36,10 @@ def main() -> int:
         },
     )
     port = resolve_port(server_argv, server_args)
-    proc = launch_server(server_argv, port=port, enable_mtp=False, num_spec_tokens=0)
+    proc = launch_server(
+        server_argv, port=port,
+        enable_specualtive_decoding=False, num_spec_tokens=0,
+    )
     try:
         base = wait_server_ready(port)
         for c in parse_int_list(bench.num_prompts, 32):

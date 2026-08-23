@@ -164,7 +164,7 @@ def _flag_value(argv: list[str], name: str) -> str | None:
     return None
 
 
-def make_server_cmd(server_argv: list[str], *, port: int, enable_mtp: bool, num_spec_tokens: int, enable_dt: bool = False) -> list[str]:
+def make_server_cmd(server_argv: list[str], *, port: int, enable_specualtive_decoding: bool, num_spec_tokens: int, enable_dt: bool = False) -> list[str]:
     """Rebuild the child cmd from the library-parsed argv, pinning what the bench controls.
 
     --port and every speculative/MTP flag are stripped and set deterministically so tp /
@@ -186,7 +186,7 @@ def make_server_cmd(server_argv: list[str], *, port: int, enable_mtp: bool, num_
         argv.append(a)
         i += 1
     argv += ["--port", str(port)]
-    if enable_mtp:
+    if enable_specualtive_decoding:
         model_path = _flag_value(server_argv, "--model-path")
         assert model_path, "MTP bench needs --model-path"
         argv += ["--speculative-algorithm", "MTP",
@@ -197,9 +197,15 @@ def make_server_cmd(server_argv: list[str], *, port: int, enable_mtp: bool, num_
     return [sys.executable, "-m", "picosgl"] + argv
 
 
-def launch_server(server_argv: list[str], *, port: int, enable_mtp: bool, num_spec_tokens: int, enable_dt: bool = False):
+def launch_server(server_argv: list[str], *, port: int, enable_specualtive_decoding: bool, num_spec_tokens: int, enable_dt: bool = False):
     """Spawn the pico-sglang server in its own process group. Returns (Popen, log path)."""
-    cmd = make_server_cmd(server_argv, port=port, enable_mtp=enable_mtp, num_spec_tokens=num_spec_tokens, enable_dt=enable_dt)
+    cmd = make_server_cmd(
+        server_argv,
+        port=port,
+        enable_specualtive_decoding=enable_specualtive_decoding,
+        num_spec_tokens=num_spec_tokens,
+        enable_dt=enable_dt,
+    )
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.join(_REPO, "python") + os.pathsep + env.get("PYTHONPATH", "")
     log_path = f"/tmp/picosgl_bench_{port}.log"
