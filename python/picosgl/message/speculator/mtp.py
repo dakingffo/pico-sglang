@@ -1,36 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from picosgl.core import SamplingParams
 
-from ..utils import deserialize_type
-from .base import BaseDrafterMsg
+from .base import (
+    SpeculatorHandshakeMsg,
+    SpeculatorHandshakeAckMsg,
+    SpeculatorInitMsg,
+)
 
+if TYPE_CHECKING:
+    import torch
 
-class BaseMTPMsg(BaseDrafterMsg):
-    @staticmethod
-    def decoder(json: dict) -> BaseMTPMsg:
-        return deserialize_type(globals(), json)
+    from picosgl.speculator import BaseSpeculatorConfig, SpeculatorHiddenBase
 
 
 @dataclass
-class DraftHandshakeMsg(BaseMTPMsg):
-    connection_id  : bytes
-    max_hidden_rows: int
-    hidden_size    : int
-    max_prob_rows  : int
-    vocab_size     : int
+class MTPHandshakeMsg(SpeculatorHandshakeMsg):
     window_size    : int
 
 
 @dataclass
-class DraftHandshakeAckMsg(BaseMTPMsg):
+class MTPHandshakeAckMsg(SpeculatorHandshakeAckMsg):
     pass
 
 
 @dataclass
-class DraftInitMsg(BaseMTPMsg):
+class MTPInitMsg(SpeculatorInitMsg):
     uid            : int
     table_idx      : int
     carry_positions: list[int]
@@ -38,31 +36,54 @@ class DraftInitMsg(BaseMTPMsg):
     sampling_params: SamplingParams
 
 
-@dataclass
-class DraftStepReq(BaseMTPMsg):
-    uid             : int
-    n_drafts        : int
-    append_positions: list[int]
-    append_tokens   : list[int]
-    sampling        : bool
+def make_mtp_handshake_message(
+    speculator_config: BaseSpeculatorConfig,
+    connection_id    : bytes,
+    max_hidden_rows  : int,
+    hidden_size      : int,
+    max_prob_rows    : int,
+    vocab_size       : int,
+) -> MTPHandshakeMsg:
+    from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
+
+    assert isinstance(speculator_config, MTPSpeculatorConfig)
+    return MTPHandshakeMsg(
+        connection_id=connection_id,
+        max_hidden_rows=max_hidden_rows,
+        hidden_size=hidden_size,
+        max_prob_rows=max_prob_rows,
+        vocab_size=vocab_size,
+        window_size=speculator_config.window_size,
+    )
 
 
-@dataclass
-class DraftStepMsg(BaseMTPMsg):
-    reqs: list[DraftStepReq]
+def make_mtp_init_message(
+    speculator_config: BaseSpeculatorConfig,
+    uid              : int,
+    table_idx        : int,
+    end_position     : int,
+    token_ids        : torch.Tensor,
+    hidden_feature   : SpeculatorHiddenBase,
+    sampling_params  : SamplingParams,
+) -> tuple[MTPInitMsg, torch.Tensor]:
+    from picosgl.speculator.drafters.mtp import (
+        MTPHiddenFeature,
+        MTPSpeculatorConfig,
+    )
 
-
-@dataclass
-class DraftReply(BaseMTPMsg):
-    uid         : int
-    draft_tokens: list[int]
-
-
-@dataclass
-class DraftReplyMsg(BaseMTPMsg):
-    reqs: list[DraftReply]
-
-
-@dataclass
-class DraftRemoveMsg(BaseMTPMsg):
-    uid: int
+    assert isinstance(speculator_config, MTPSpeculatorConfig)
+    assert isinstance(hidden_feature, MTPHiddenFeature)
+    full_hidden = hidden_feature.full_hidden
+    window_len = min(speculator_config.window_size, full_hidden.shape[0])
+    positions = list(range(end_position + 1 - window_len, end_position + 1))
+    return (
+        MTPInitMsg(
+            input_rows=window_len,
+            uid=uid,
+            table_idx=table_idx,
+            carry_positions=positions,
+            carry_tokens=token_ids[positions].tolist(),
+            sampling_params=sampling_params,
+        ),
+        full_hidden[-window_len:].contiguous(),
+    )

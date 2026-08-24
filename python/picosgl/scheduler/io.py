@@ -11,7 +11,8 @@ from picosgl.message import (
     BaseTokenizerMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
-    DraftReplyMsg,
+    BaseSpeculatorMsg,
+    SpeculatorReplyMsg,
 )
 from picosgl.message.queue import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue
 from picosgl.utils import init_logger
@@ -137,13 +138,13 @@ class SchedulerIOMixin:
 
     def _send_draft_to_ranks(
         self,
-        reply: DraftReplyMsg,
+        reply: SpeculatorReplyMsg,
         probs: torch.Tensor | None,
     ) -> None:
         """Rank0 broadcasts a step's draft results to the other TP ranks.
 
         Only rank0 talks to the drafter (zmq + NCCL); every rank's VerifyManager schedules
-        the same requests, so rank>0 needs the identical DraftReplyMsg + draft_probs to
+        the same requests, so rank>0 needs the identical SpeculatorReplyMsg + draft_probs to
         backfill its own DraftState. Mirror of ``_recv_msg_multi_rank0/1``: rank0 PUBs the
         raw messages and gloo-broadcasts the count; the probs tensor crosses as raw fp32
         bytes (the drafter side already did the GPU→CPU trip).
@@ -158,15 +159,16 @@ class SchedulerIOMixin:
     def _recv_draft_from_rank0(
         self,
         vocab_size: int,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+    ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
         """Non-primary-rank receive side of ``_send_draft_to_ranks``."""
         dst = torch.tensor(-1)
         self.tp_cpu_group.broadcast(dst, root=0).wait()
         n = int(dst.item())
         assert n in (1, 2), f"bad draft broadcast count {n}"
-        reply = DraftReplyMsg.decoder(
+        reply = BaseSpeculatorMsg.decoder(
             msgpack.unpackb(self._recv_from_rank0.get_raw(), raw=False)
         )
+        assert isinstance(reply, SpeculatorReplyMsg)
         probs = None
         if n == 2:
             data = np.frombuffer(self._recv_from_rank0.get_raw(), dtype=np.float32)

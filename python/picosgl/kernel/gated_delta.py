@@ -112,7 +112,9 @@ def _recurrent_gated_delta_kernel(
         )
         tl.store(output_ptr, out, mask=v_off < HEAD_V_DIM)
 
-        slot = tl.load(write_slots + batch_idx * stride_wb + seq_idx * stride_ws)
+        slot = tl.load(
+            write_slots + batch_idx * stride_wb + seq_idx * stride_ws
+        ).to(tl.int64)
         state_ptr = (
             state_pool
             + slot * stride_ps

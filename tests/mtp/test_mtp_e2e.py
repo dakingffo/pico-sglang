@@ -28,11 +28,8 @@ from picosgl.distributed import DistributedInfo
 from picosgl.message import UserMsg
 from picosgl.scheduler.config import SchedulerConfig
 from picosgl.scheduler.scheduler import Scheduler
-from picosgl.speculator import (
-    MTPSpeculatorConfig,
-    make_local_data_plane_pair,
-    speculator_worker,
-)
+from picosgl.speculator import make_local_data_plane_pair, speculator_worker
+from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
 
 MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 

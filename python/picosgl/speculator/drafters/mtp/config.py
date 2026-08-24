@@ -19,6 +19,10 @@ class MTPSpeculatorConfig(BaseSpeculatorConfig):
     num_draft_tokens: int = 4
     window_size     : int = 128
 
+    @property
+    def max_init_hidden_rows(self) -> int:
+        return self.window_size
+
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve:
         width = self.num_draft_tokens + 1
         return SpeculatorReserve(

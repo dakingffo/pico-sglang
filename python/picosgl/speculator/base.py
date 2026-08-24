@@ -8,8 +8,16 @@ import torch
 
 if TYPE_CHECKING:
     from picosgl.engine.config import EngineConfig
+    from picosgl.message import (
+        SpeculatorHandshakeAckMsg,
+        SpeculatorHandshakeMsg,
+        SpeculatorInitMsg,
+        SpeculatorReplyMsg,
+        SpeculatorStepMsg,
+    )
     from picosgl.scheduler.config import SchedulerConfig
     from picosgl.models.drafters import BaseDrafterModel
+
 
 class SpeculatorHiddenBase(ABC):
     @abstractmethod
@@ -25,6 +33,10 @@ class SpeculatorReserve:
 class BaseSpeculatorConfig(ABC):
     algorithm       : ClassVar[str]
     num_draft_tokens: int
+
+    @property
+    @abstractmethod
+    def max_init_hidden_rows(self) -> int: ...
 
     @abstractmethod
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve: ...
@@ -85,3 +97,26 @@ class EngineBase(ABC):
     def destroy(self) -> None:
         """Release engine-side resources (CUDA graph pools etc.) on shutdown."""
         pass
+
+
+class DraftManagerBase(ABC):
+    def __init__(self, engine: EngineBase) -> None:
+        self.engine = engine
+
+    @abstractmethod
+    def handshake(
+        self, msg: SpeculatorHandshakeMsg
+    ) -> SpeculatorHandshakeAckMsg: ...
+
+    @abstractmethod
+    def init(self, msg: SpeculatorInitMsg, tensor: torch.Tensor) -> None: ...
+
+    @abstractmethod
+    def step(
+        self,
+        msg   : SpeculatorStepMsg,
+        tensor: torch.Tensor | None,
+    ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]: ...
+
+    @abstractmethod
+    def remove(self, uid: int) -> None: ...

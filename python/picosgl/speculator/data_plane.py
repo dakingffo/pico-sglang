@@ -26,7 +26,6 @@ def make_data_plane_sizes(
     config     : SchedulerConfig,
     hidden_size: int,
     vocab_size : int,
-    window_size: int,
 ) -> DataPlaneSizes:
     speculator_config = config.speculator_config
     assert speculator_config is not None
@@ -36,7 +35,8 @@ def make_data_plane_sizes(
         config.decode_batch_budget // K,
     )
     return DataPlaneSizes(
-        max(window_size, max_batch_size * (K + 1)), hidden_size,
+        max(speculator_config.max_init_hidden_rows, max_batch_size * (K + 1)),
+        hidden_size,
         max_batch_size * K, vocab_size,
     )
 

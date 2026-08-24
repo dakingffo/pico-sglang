@@ -7,7 +7,12 @@ import torch
 
 from picosgl.engine import VerifyOutput
 from picosgl.core import Batch, Request, Context
-from picosgl.message import DetokenizeMsg, DraftStepReq
+from picosgl.message import (
+    DetokenizeMsg,
+    SpeculatorStepMsg,
+    SpeculatorStepReq,
+    make_init_message,
+)
 from picosgl.speculator import DraftState, SpeculatorHiddenBase
 from picosgl.utils import div_ceil
 
@@ -54,8 +59,12 @@ class VerifyManager(ARManagerBase):
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
         speculator_config = config.speculator_config
         assert speculator_config is not None
+        speculative_algorithm = config.speculative_algorithm
+        assert speculative_algorithm is not None
 
         self.page_table = table_manager.page_table
+        self.speculative_algorithm = speculative_algorithm
+        self.speculator_config = speculator_config
         self.num_spec_tokens = speculator_config.num_draft_tokens
         self.client = client
         self.vocab_size = vocab_size
@@ -78,7 +87,9 @@ class VerifyManager(ARManagerBase):
         req        : Request,
         req_feature: SpeculatorHiddenBase,
     ) -> None:
-        self.client.init(
+        msg, hidden = make_init_message(
+            self.speculative_algorithm,
+            self.speculator_config,
             req.uid,
             req.table_idx,
             req.cached_len,
@@ -86,6 +97,7 @@ class VerifyManager(ARManagerBase):
             req_feature,
             req.sampling_params,
         )
+        self.client.init(msg, hidden)
         self.running_reqs[req.uid] = req
         self._state_table[req.table_idx] = VerifyState()
 
@@ -112,7 +124,7 @@ class VerifyManager(ARManagerBase):
                 req.device_len = C + n_drafts + 1
                 toks, pos, hids = self._state_table[req.table_idx].get_carry()
                 step_reqs.append(
-                    DraftStepReq(
+                    SpeculatorStepReq(
                         uid=uid,
                         n_drafts=n_drafts,
                         append_positions=pos,
@@ -127,9 +139,14 @@ class VerifyManager(ARManagerBase):
             return None
 
         appended_hidden = torch.cat(hidden_rows, dim=0) if hidden_rows else None
-        has_sampling = any(sr.sampling for sr in step_reqs)
-
-        reply, probs = self.client.step(step_reqs, appended_hidden, has_sampling)
+        input_rows = sum(len(sr.append_positions) for sr in step_reqs)
+        output_rows = sum(sr.n_drafts for sr in step_reqs if sr.sampling)
+        step_msg = SpeculatorStepMsg(
+            reqs=step_reqs,
+            input_rows=input_rows,
+            output_rows=output_rows,
+        )
+        reply, probs = self.client.step(step_msg, appended_hidden)
 
         reply_by_uid = {r.uid: r for r in reply.reqs}
         probs_by_uid: dict[int, torch.Tensor] = {}

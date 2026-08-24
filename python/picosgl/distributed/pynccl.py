@@ -100,7 +100,7 @@ def init_pynccl_drafter_target_separation(
 
     Used for the 2-rank target↔drafter data plane, which has no gloo group to broadcast
     the uid through (unlike the TP group's ``init_pynccl``). ``nccl_uid`` is the 128 raw
-    bytes of the ncclUniqueId created on rank 0 and carried by DraftHandshakeMsg.
+    bytes of the ncclUniqueId created on rank 0 and carried by SpeculatorHandshakeMsg.
     """
     max_size_bytes = min(max_size_bytes, ENV.PYNCCL_MAX_BUFFER_SIZE.value)
 

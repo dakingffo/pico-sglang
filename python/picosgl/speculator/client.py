@@ -1,28 +1,22 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.core import SamplingParams
 from picosgl.message import (
-    BaseDrafterMsg,
-    DraftHandshakeAckMsg,
-    DraftHandshakeMsg,
-    DraftInitMsg,
-    DraftRemoveMsg,
-    DraftReplyMsg,
-    DraftStepMsg,
+    BaseSpeculatorMsg,
+    SpeculatorHandshakeAckMsg,
+    SpeculatorHandshakeMsg,
+    SpeculatorInitMsg,
+    SpeculatorRemoveMsg,
+    SpeculatorReplyMsg,
+    SpeculatorStepMsg,
 )
 from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
 
-from .data_plane import DataPlane, make_data_plane_sizes
-from .drafters.mtp import (
-    MTPHiddenFeature,
-    MTPSpeculatorConfig,
-)
-from .base import SpeculatorHiddenBase
+from .data_plane import DataPlane, DataPlaneSizes
 
 if TYPE_CHECKING:
     from picosgl.scheduler.config import SchedulerConfig
@@ -36,45 +30,17 @@ class SpeculatorClientBase(ABC):
         device      : torch.device,
         vocab_size  : int,
         hidden_size : int,
-        window_size : int | None = None,
     ):
         self.config = config
         self.device = device
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        speculator_config = config.speculator_config
-        assert isinstance(speculator_config, MTPSpeculatorConfig)
-        self.num_spec_tokens = speculator_config.num_draft_tokens
-        self.window_size = (
-            window_size if window_size is not None else speculator_config.window_size
-        )
-
-    @staticmethod
-    def _unwrap_hidden(hidden_feature: SpeculatorHiddenBase) -> torch.Tensor:
-        assert isinstance(hidden_feature, MTPHiddenFeature)
-        return hidden_feature.full_hidden
-
-    def _prepare_init(
-        self,
-        end_position   : int,
-        token_ids      : torch.Tensor,
-        hidden_feature : SpeculatorHiddenBase,
-    ) -> tuple[list[int], list[int], torch.Tensor]:
-        full_hidden = self._unwrap_hidden(hidden_feature)
-        window_len = min(self.window_size, full_hidden.shape[0])
-        positions = list(range(end_position + 1 - window_len, end_position + 1))
-        tokens = token_ids[positions].tolist()
-        return positions, tokens, full_hidden[-window_len:].contiguous()
 
     @abstractmethod
     def init(
         self,
-        uid            : int,
-        table_idx      : int,
-        end_position   : int,
-        token_ids      : torch.Tensor,
-        hidden_feature : SpeculatorHiddenBase,
-        sampling_params: SamplingParams,
+        msg   : SpeculatorInitMsg,
+        hidden: torch.Tensor,
     ) -> None:
         """Seed the drafter's per-request state with a prefill terminal window."""
         ...
@@ -82,10 +48,9 @@ class SpeculatorClientBase(ABC):
     @abstractmethod
     def step(
         self,
-        reqs           : list,
-        appended_hidden: torch.Tensor | None,
-        has_sampling   : bool,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+        msg   : SpeculatorStepMsg,
+        tensor: torch.Tensor | None,
+    ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
         """Blocking draft round. Returns the reply and the drafter's draft_probs rows
         (None if no request sampled this round)."""
         ...
@@ -107,86 +72,67 @@ class MainSpeculatorClient(SpeculatorClientBase):
         device      : torch.device,
         vocab_size  : int,
         hidden_size : int,
-        window_size : int | None              = None,
+        handshake   : SpeculatorHandshakeMsg,
         scheduler_io: SchedulerIOMixin | None = None,
         data_plane   : DataPlane | None        = None,
     ):
-        super().__init__(config, device, vocab_size, hidden_size, window_size)
+        super().__init__(config, device, vocab_size, hidden_size)
         self._io = scheduler_io
         assert data_plane is not None
         self.data_plane = data_plane
         self.sender = ZmqPushQueue(
-            config.zmq_drafter_addr, create=True, encoder=BaseDrafterMsg.encoder
+            config.zmq_drafter_addr, create=True, encoder=BaseSpeculatorMsg.encoder
         )
         self.receiver = ZmqPullQueue(
-            config.zmq_drafter_reply_addr, create=True, decoder=DraftReplyMsg.decoder
+            config.zmq_drafter_reply_addr,
+            create=True,
+            decoder=BaseSpeculatorMsg.decoder,
         )
 
-        sizes = make_data_plane_sizes(
-            self.config, self.hidden_size, self.vocab_size, self.window_size
+        sizes = DataPlaneSizes(
+            handshake.max_hidden_rows,
+            handshake.hidden_size,
+            handshake.max_prob_rows,
+            handshake.vocab_size,
         )
-        uid = self.data_plane.make_connection_id()
         # Connection metadata must go out before transport initialization, which blocks
         # until the worker consumes the same handshake.
-        self.sender.put(
-            DraftHandshakeMsg(
-                connection_id=uid,
-                max_hidden_rows=sizes.max_hidden_rows,
-                hidden_size=self.hidden_size,
-                max_prob_rows=sizes.max_prob_rows,
-                vocab_size=self.vocab_size,
-                window_size=self.window_size,
-            )
-        )
-        self.data_plane.init_rank0(uid, sizes)
+        self.sender.put(handshake)
+        self.data_plane.init_rank0(handshake.connection_id, sizes)
         ack = self.receiver.get()
-        assert isinstance(ack, DraftHandshakeAckMsg), (
-            f"expected DraftHandshakeAckMsg, got {ack!r}"
+        assert isinstance(ack, SpeculatorHandshakeAckMsg), (
+            f"expected SpeculatorHandshakeAckMsg, got {ack!r}"
         )
 
     def init(
         self,
-        uid            : int,
-        table_idx      : int,
-        end_position   : int,
-        token_ids      : torch.Tensor,
-        hidden_feature : SpeculatorHiddenBase,
-        sampling_params: SamplingParams,
+        msg   : SpeculatorInitMsg,
+        hidden: torch.Tensor,
     ) -> None:
-        carry_positions, carry_tokens, hidden = self._prepare_init(
-            end_position, token_ids, hidden_feature
-        )
-        self.sender.put(
-            DraftInitMsg(
-                uid=uid,
-                table_idx=table_idx,
-                carry_positions=list(carry_positions),
-                carry_tokens=list(carry_tokens),
-                sampling_params=sampling_params,
-            )
-        )
+        self.sender.put(msg)
         self.data_plane.send_hidden(hidden)
 
     def step(
         self,
-        reqs           : list,
-        appended_hidden: torch.Tensor | None,
-        has_sampling   : bool,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
-        self.sender.put(DraftStepMsg(reqs=reqs))
-        if appended_hidden is not None:
-            self.data_plane.send_hidden(appended_hidden)
+        msg   : SpeculatorStepMsg,
+        tensor: torch.Tensor | None,
+    ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
+        self.sender.put(msg)
+        if tensor is not None:
+            assert tensor.shape[0] == msg.input_rows
+            self.data_plane.send_hidden(tensor)
+        else:
+            assert msg.input_rows == 0
         probs: torch.Tensor | None = None
-        if has_sampling:
-            rows = sum(r.n_drafts for r in reqs if r.sampling)
-            probs = self.data_plane.recv_probs(rows)
+        if msg.output_rows > 0:
+            probs = self.data_plane.recv_probs(msg.output_rows)
         reply = self.receiver.get()
         if self._io is not None and self.config.tp_info.size > 1:
             self._io._send_draft_to_ranks(reply, probs)
         return reply, probs
 
     def remove(self, uid: int) -> None:
-        self.sender.put(DraftRemoveMsg(uid=uid))
+        self.sender.put(SpeculatorRemoveMsg(uid=uid))
 
     def destroy(self) -> None:
         self.data_plane.destroy()
@@ -209,18 +155,16 @@ class BroadcastSpeculatorClient(SpeculatorClientBase):
         device      : torch.device,
         vocab_size  : int,
         hidden_size : int,
-        window_size : int | None              = None,
         scheduler_io: SchedulerIOMixin | None = None
     ):
-        super().__init__(config, device, vocab_size, hidden_size, window_size)
+        super().__init__(config, device, vocab_size, hidden_size)
         self._io = scheduler_io
 
     def step(
         self,
-        reqs           : list,
-        appended_hidden: torch.Tensor | None,
-        has_sampling   : bool,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+        msg   : SpeculatorStepMsg,
+        tensor: torch.Tensor | None,
+    ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
         return self._io._recv_draft_from_rank0(self.vocab_size)
 
     def init(self, *args, **kwargs) -> None:

@@ -166,7 +166,7 @@ def _flag_value(argv: list[str], name: str) -> str | None:
 
 
 def resolve_num_spec_tokens(server_argv: list[str]) -> int:
-    from picosgl.speculator import MTPSpeculatorConfig
+    from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
 
     value = _flag_value(server_argv, "--speculative-num-draft-tokens")
     return int(value) if value is not None else MTPSpeculatorConfig.num_draft_tokens
