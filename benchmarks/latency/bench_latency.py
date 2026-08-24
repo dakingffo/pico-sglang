@@ -16,6 +16,11 @@ zipped (a length-1 list broadcasts), so the common sweeps are:
   python benchmarks/latency/bench_latency.py --model-path <model> \
       --input-lens 32 --output-lens 16,64,256
 
+  # Natural prompts from Spec-Bench (the first turn of multi-turn records)
+  python benchmarks/latency/bench_latency.py --model-path <model> \
+      --dataset spec_bench --dataset-category coding,math_reasoning \
+      --num-prompts 8 --output-lens 64
+
 Server flags are parsed by the library's ``picosgl.server.args.parse_args`` --
 nothing is redefined here.
 """
@@ -92,7 +97,15 @@ def main() -> int:
             for i, (in_len, out_len) in enumerate(configs):
                 # fresh seed per config so the prefix cache can't serve later configs
                 prompts, in_lens = make_prompts(
-                    server_args.model_path, in_len, c, bench.seed + i
+                    server_args.model_path,
+                    in_len,
+                    c,
+                    bench.seed + i,
+                    dataset=bench.dataset,
+                    dataset_categories=bench.dataset_category,
+                )
+                display_in_len = (
+                    round(sum(in_lens) / len(in_lens)) if bench.dataset else in_len
                 )
                 out_lens = [out_len] * c
                 stats = asyncio.run(
@@ -110,10 +123,10 @@ def main() -> int:
                 assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
                 print_stats(
                     f"bench_latency tp={server_args.tp_info.size} "
-                    f"in={in_len} out={out_len} conc={c}",
+                    f"in={display_in_len} out={out_len} conc={c}",
                     stats,
                 )
-                rows.append((c, in_len, out_len, stats))
+                rows.append((c, display_in_len, out_len, stats))
         print_latency_summary(rows)
         return 0
     finally:

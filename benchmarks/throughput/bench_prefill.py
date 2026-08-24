@@ -8,6 +8,8 @@ throughput (input-tok/s), TTFT and req/s. Server flags are parsed by the library
 Examples:
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
       --input-len 2048 --num-prompts 64
+  python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
+      --dataset spec_bench --num-prompts 64 --output-len 8
 """
 import asyncio
 import os
@@ -15,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from bench_common import (
+    input_label,
     launch_server,
     make_prompts,
     parse_full,
@@ -44,7 +47,12 @@ def main() -> int:
         base = wait_server_ready(port)
         for c in parse_int_list(bench.num_prompts, 32):
             prompts, in_lens = make_prompts(
-                server_args.model_path, bench.input_len, c, bench.seed
+                server_args.model_path,
+                bench.input_len,
+                c,
+                bench.seed,
+                dataset=bench.dataset,
+                dataset_categories=bench.dataset_category,
             )
             out_lens = [bench.output_len] * c
             stats = asyncio.run(
@@ -62,7 +70,8 @@ def main() -> int:
             assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
             print_stats(
                 f"bench_prefill tp={server_args.tp_info.size} "
-                f"in={bench.input_len} out={bench.output_len} conc={c}",
+                f"in={input_label(bench.dataset, in_lens, bench.input_len)} "
+                f"out={bench.output_len} conc={c}",
                 stats,
             )
         return 0

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import random
 import signal
@@ -49,6 +50,16 @@ BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
     "--input-len": {"type": int, "default": None, "help": "prompt length in tokens"},
     "--output-len": {"type": int, "default": None, "help": "generation length in tokens"},
     "--seed": {"type": int, "default": 0, "help": "RNG seed for prompt generation (A/B uses one batch)"},
+    "--dataset": {
+        "type": str,
+        "default": None,
+        "help": "JSON/JSONL dataset path or a name under benchmarks/datasets",
+    },
+    "--dataset-category": {
+        "type": str,
+        "default": None,
+        "help": "comma-separated dataset categories to include",
+    },
     "--no-warmup": {"action": "store_true", "help": "skip the warmup request before the timed batch"},
     "--no-pbar": {"action": "store_true", "help": "disable the progress counter"},
 }
@@ -86,6 +97,96 @@ def parse_int_list(s: str | None, default: int) -> list[int]:
 # prompt generation (deterministic, seeded)
 # -------------------------------------------------------------------------------------
 
+_DATASET_DIR = os.path.join(_REPO, "benchmarks", "datasets")
+
+
+def resolve_dataset_path(dataset: str) -> str:
+    candidates = [dataset]
+    for name in (dataset, dataset.replace("-", "_")):
+        candidates.append(os.path.join(_DATASET_DIR, name))
+        if not name.endswith((".json", ".jsonl")):
+            candidates.append(os.path.join(_DATASET_DIR, name + ".jsonl"))
+            candidates.append(os.path.join(_DATASET_DIR, name + ".json"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+    raise FileNotFoundError(
+        f"Dataset {dataset!r} was not found as a path or under {_DATASET_DIR}"
+    )
+
+
+def _prompt_from_record(record: dict[str, Any]) -> str:
+    if turns := record.get("turns"):
+        # Spec-Bench's first 80 records are multi-turn MT-Bench questions. A serving
+        # throughput batch has no preceding assistant response, so only turn 0 is a
+        # self-contained prompt.
+        return str(turns[0])
+    for key in ("prompt", "question", "text", "instruction"):
+        if value := record.get(key):
+            return str(value)
+    if conversations := record.get("conversations"):
+        for turn in conversations:
+            if turn.get("role", turn.get("from")) in ("user", "human"):
+                return str(turn.get("content", turn.get("value", "")))
+    raise ValueError(f"Cannot find a user prompt in dataset record: {record!r}")
+
+
+def load_dataset_prompts(
+    dataset   : str,
+    categories: str | None = None,
+) -> list[str]:
+    path = resolve_dataset_path(dataset)
+    with open(path, encoding="utf-8") as f:
+        if path.endswith(".jsonl"):
+            records = [json.loads(line) for line in f if line.strip()]
+        else:
+            records = json.load(f)
+    if isinstance(records, dict):
+        records = records.get("data", records.get("questions", []))
+    assert isinstance(records, list), f"Dataset root must be a list: {path}"
+
+    selected_categories = (
+        {value.strip() for value in categories.split(",") if value.strip()}
+        if categories else None
+    )
+    prompts = [
+        _prompt_from_record(record)
+        for record in records
+        if selected_categories is None or record.get("category") in selected_categories
+    ]
+    if not prompts:
+        suffix = f" for categories {sorted(selected_categories)}" if selected_categories else ""
+        raise ValueError(f"Dataset {path} contains no usable prompts{suffix}")
+    return prompts
+
+
+def _take_dataset_prompts(
+    dataset   : str,
+    categories: str | None,
+    count     : int,
+    seed      : int,
+) -> list[str]:
+    prompts = load_dataset_prompts(dataset, categories)
+    if count > len(prompts):
+        raise ValueError(
+            f"Requested {count} prompts, but dataset selection only contains "
+            f"{len(prompts)}; refusing to repeat prompts because prefix-cache hits "
+            "would distort the benchmark"
+        )
+    random.Random(seed).shuffle(prompts)
+    return prompts[:count]
+
+
+def _dataset_prompt_len(tokenizer: Any, prompt: str) -> int:
+    """Match the chat-template tokenization performed by ``TokenizeManager``."""
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return len(tokenizer.encode(text))
+
+
 def generate_prompt(tokenizer: Any, n: int) -> str:
     """Generate a prompt of approximately `n` tokens via decode/encode round-trip."""
     vocab_size = tokenizer.vocab_size // 2
@@ -102,34 +203,81 @@ def generate_prompt(tokenizer: Any, n: int) -> str:
     raise ValueError("Failed to generate a message of the desired length.")
 
 
-def make_prompts(model_path: str, input_len: int, num_prompts: int, seed: int):
+def make_prompts(
+    model_path        : str,
+    input_len         : int,
+    num_prompts       : int,
+    seed              : int,
+    *,
+    dataset           : str | None = None,
+    dataset_categories: str | None = None,
+):
     """One seeded batch of prompts + their exact token lengths. Reused across A/B runs."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    random.seed(seed)
-    prompts, lens = [], []
-    for _ in range(num_prompts):
-        p = generate_prompt(tokenizer, input_len)
-        prompts.append(p)
-        lens.append(len(tokenizer.encode(p, add_special_tokens=False)))
+    if dataset is not None:
+        prompts = _take_dataset_prompts(
+            dataset, dataset_categories, num_prompts, seed
+        )
+    else:
+        random.seed(seed)
+        prompts = [generate_prompt(tokenizer, input_len) for _ in range(num_prompts)]
+    lens = (
+        [_dataset_prompt_len(tokenizer, prompt) for prompt in prompts]
+        if dataset is not None else [input_len] * num_prompts
+    )
     return prompts, lens
 
 
-def make_mixed_prompts(model_path: str, segments: list[tuple[int, int]], seed: int):
+def make_mixed_prompts(
+    model_path        : str,
+    segments          : list[tuple[int, int]],
+    seed              : int,
+    *,
+    dataset           : str | None = None,
+    dataset_categories: str | None = None,
+):
     """One seeded mixed-length batch. ``segments`` is [(input_len, count), ...]; returns
     (prompts, lens) in segment order so group indices are just running offsets."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    random.seed(seed)
-    prompts, lens = [], []
-    for in_len, count in segments:
-        for _ in range(count):
-            p = generate_prompt(tokenizer, in_len)
-            prompts.append(p)
-            lens.append(len(tokenizer.encode(p, add_special_tokens=False)))
+    if dataset is not None:
+        count = sum(count for _, count in segments)
+        dataset_prompts = load_dataset_prompts(dataset, dataset_categories)
+        if count > len(dataset_prompts):
+            raise ValueError(
+                f"Requested {count} prompts, but dataset selection only contains "
+                f"{len(dataset_prompts)}"
+            )
+        random.Random(seed).shuffle(dataset_prompts)
+        candidates = [
+            (prompt, _dataset_prompt_len(tokenizer, prompt))
+            for prompt in dataset_prompts
+        ]
+        prompts, lens = [], []
+        for target_len, group_size in segments:
+            candidates.sort(key=lambda item: abs(item[1] - target_len))
+            selected, candidates = candidates[:group_size], candidates[group_size:]
+            prompts.extend(prompt for prompt, _ in selected)
+            lens.extend(length for _, length in selected)
+    else:
+        random.seed(seed)
+        prompts, lens = [], []
+        for in_len, count in segments:
+            for _ in range(count):
+                prompt = generate_prompt(tokenizer, in_len)
+                prompts.append(prompt)
+                lens.append(len(tokenizer.encode(prompt, add_special_tokens=False)))
     return prompts, lens
+
+
+def input_label(dataset: str | None, input_lens: list[int], fallback: int) -> str:
+    if dataset is None:
+        return str(fallback)
+    mean_len = sum(input_lens) / len(input_lens) if input_lens else 0
+    return f"dataset(avg={mean_len:.0f})"
 
 
 # -------------------------------------------------------------------------------------

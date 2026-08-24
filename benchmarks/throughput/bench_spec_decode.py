@@ -11,6 +11,9 @@ Examples:
       --input-len 64 --output-len 256 --num-prompts 32 --speculative-num-draft-tokens 4
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
       --mode mtp --out /tmp/mtp.json   # single-mode run for longer data collection
+  python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
+      --dataset spec_bench --dataset-category coding,math_reasoning \
+      --num-prompts 8 --output-len 256
 """
 import asyncio
 import json
@@ -19,6 +22,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from bench_common import (
+    input_label,
     launch_server,
     make_prompts,
     parse_full,
@@ -69,7 +73,12 @@ def main() -> int:
             base = wait_server_ready(port)
             for c in parse_int_list(bench.num_prompts, 32):
                 prompts, in_lens = make_prompts(
-                    server_args.model_path, bench.input_len, c, bench.seed
+                    server_args.model_path,
+                    bench.input_len,
+                    c,
+                    bench.seed,
+                    dataset=bench.dataset,
+                    dataset_categories=bench.dataset_category,
                 )
                 out_lens = [bench.output_len] * c
                 stats = asyncio.run(
@@ -91,7 +100,8 @@ def main() -> int:
                 )
                 print_stats(
                     f"bench_spec_decode {label} tp={server_args.tp_info.size} "
-                    f"in={bench.input_len} out={bench.output_len} conc={c}",
+                    f"in={input_label(bench.dataset, in_lens, bench.input_len)} "
+                    f"out={bench.output_len} conc={c}",
                     stats,
                     note=note,
                 )

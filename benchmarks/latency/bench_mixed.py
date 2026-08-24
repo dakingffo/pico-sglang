@@ -20,6 +20,10 @@ to the server's ``--enable-dt-separation``. Examples:
   # No DT separation: target tp=2 (drafter shares rank0's card)
   python benchmarks/latency/bench_mixed.py --model-path <model> --tensor-parallel-size 2 \
       --num-prompts 1,4,8,16,32,64,128,256
+
+  # Pick the dataset prompts nearest to the requested short/long target lengths
+  python benchmarks/latency/bench_mixed.py --model-path <model> \
+      --dataset spec_bench --num-prompts 16 --short-len 128 --long-len 2048
 """
 import asyncio
 import os
@@ -80,8 +84,11 @@ def main() -> int:
     frac = max(0.0, min(1.0, bench.long_frac))
     concs = parse_int_list(bench.num_prompts, 32)
 
-    print(f"  mixed workload: {int(frac * 100)}% long (in {bench.long_len}, out {bench.long_out}) + "
-          f"{int((1 - frac) * 100)}% short (in {bench.short_len}, out {bench.short_out})")
+    source = f"dataset={bench.dataset}" if bench.dataset else "synthetic"
+    print(f"  mixed workload ({source}): {int(frac * 100)}% long "
+          f"(target in {bench.long_len}, out {bench.long_out}) + "
+          f"{int((1 - frac) * 100)}% short "
+          f"(target in {bench.short_len}, out {bench.short_out})")
 
     port = resolve_port(server_argv, server_args)
     proc = launch_server(
@@ -96,7 +103,13 @@ def main() -> int:
             n_long = min(c, max(1, round(c * frac)))
             n_short = c - n_long
             segments = [(bench.short_len, n_short), (bench.long_len, n_long)]
-            prompts, in_lens = make_mixed_prompts(server_args.model_path, segments, bench.seed + c)
+            prompts, in_lens = make_mixed_prompts(
+                server_args.model_path,
+                segments,
+                bench.seed + c,
+                dataset=bench.dataset,
+                dataset_categories=bench.dataset_category,
+            )
             out_lens = [bench.short_out] * n_short + [bench.long_out] * n_long
             summary, tics = asyncio.run(
                 run_online_bench_tics(

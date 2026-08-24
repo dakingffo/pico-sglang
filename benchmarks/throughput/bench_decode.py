@@ -8,6 +8,8 @@ the library's ``picosgl.server.args.parse_args`` -- nothing is redefined here.
 Examples:
   python benchmarks/throughput/bench_decode.py --model-path <model> --tp-size 2 \
       --input-len 32 --output-len 256 --num-prompts 32
+  python benchmarks/throughput/bench_decode.py --model-path <model> --tp-size 2 \
+      --dataset spec_bench --num-prompts 32 --output-len 256
 """
 import asyncio
 import os
@@ -15,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from bench_common import (
+    input_label,
     launch_server,
     make_prompts,
     parse_full,
@@ -46,7 +49,12 @@ def main() -> int:
         rows = []
         for c in parse_int_list(bench.num_prompts, 32):
             prompts, in_lens = make_prompts(
-                server_args.model_path, bench.input_len, c, bench.seed
+                server_args.model_path,
+                bench.input_len,
+                c,
+                bench.seed,
+                dataset=bench.dataset,
+                dataset_categories=bench.dataset_category,
             )
             out_lens = [bench.output_len] * c
             stats = asyncio.run(
@@ -64,7 +72,8 @@ def main() -> int:
             assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
             print_stats(
                 f"bench_decode tp={server_args.tp_info.size} "
-                f"in={bench.input_len} out={bench.output_len} conc={c}",
+                f"in={input_label(bench.dataset, in_lens, bench.input_len)} "
+                f"out={bench.output_len} conc={c}",
                 stats,
             )
             rows.append((c, stats))
