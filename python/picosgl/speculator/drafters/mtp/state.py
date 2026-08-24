@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from picosgl.core import SamplingParams
 
-from ...base import DraftState
+from ...base import DraftState, SpeculatorHiddenBase
+
+
+@dataclass(frozen=True)
+class MTPHiddenFeature(SpeculatorHiddenBase):
+    full_hidden: torch.Tensor
+
+    def select(self, index) -> MTPHiddenFeature:
+        return MTPHiddenFeature(self.full_hidden[index].contiguous())
 
 
 class MTPState(DraftState):

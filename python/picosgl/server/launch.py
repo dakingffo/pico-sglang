@@ -7,7 +7,7 @@ from dataclasses import replace
 from picosgl.distributed import DistributedInfo
 from picosgl.utils import init_logger
 from picosgl.scheduler import schedule_worker
-from picosgl.speculator import speculator_worker
+from picosgl.speculator import make_local_data_plane_pair, speculator_worker
 from picosgl.tokenizer import tokenize_worker, detokenize_worker
 
 
@@ -23,6 +23,21 @@ def launch_server(run_shell: bool = False) -> None:
 
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue[str] = mp.Queue()
+        enable_speculator_worker = server_args.speculative_algorithm is not None
+        speculator_start_event = (
+            mp.Event()
+            if enable_speculator_worker and not server_args.dt_separation else None
+        )
+        speculator_ready_event = (
+            mp.Event()
+            if enable_speculator_worker and not server_args.dt_separation else None
+        )
+        if enable_speculator_worker and not server_args.dt_separation:
+            target_data_plane, speculator_data_plane = make_local_data_plane_pair(
+                server_args
+            )
+        else:
+            target_data_plane, speculator_data_plane = None, None
 
         for i in range(world_size):
             args = replace(
@@ -32,6 +47,9 @@ def launch_server(run_shell: bool = False) -> None:
             kwargs: dict = {
                 "args": args,
                 "ack_queue": ack_queue,
+                "speculator_start_event": speculator_start_event,
+                "speculator_ready_event": speculator_ready_event,
+                "speculator_data_plane": target_data_plane if i == 0 else None,
             }
             mp.Process(
                 target=schedule_worker,
@@ -40,14 +58,14 @@ def launch_server(run_shell: bool = False) -> None:
                 name=f"picosgl-TP{i}-scheduler",
             ).start()
 
-        enable_speculator_worker: bool = (
-            server_args.dt_separation and server_args.speculative_algorithm is not None
-        )
         if enable_speculator_worker:
             mp.Process(
                 target=speculator_worker,
                 kwargs={
                     "args": server_args,
+                    "speculator_start_event": speculator_start_event,
+                    "speculator_ready_event": speculator_ready_event,
+                    "speculator_data_plane": speculator_data_plane,
                     "ack_queue": ack_queue,
                 },
                 daemon=False,

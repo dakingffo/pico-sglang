@@ -8,7 +8,7 @@ from picosgl.utils import torch_dtype
 from picosgl.engine import Sampler
 from picosgl.models.drafters import BaseDrafterModel, Qwen3_5MTPDrafter
 
-from ...base import EngineBase, SpeculatorReserve
+from ...base import EngineBase
 from .attention import MTPAttentionBackend
 from .config import MTPSpeculatorConfig
 from .pool import MTPKVPool
@@ -37,10 +37,6 @@ class MTPEngine(EngineBase):
         self.stream = torch.cuda.Stream(device=device)
         self.num_spec_tokens = num_spec_tokens
         self.vocab_size = vocab_size
-        self._reserve = SpeculatorReserve(
-            num_state_slots=max_running_req * (num_spec_tokens + 1),
-            state_slots_per_request=num_spec_tokens + 1,
-        )
         self.drafter = drafter
         self.sampler = Sampler(device, vocab_size)
 
@@ -64,20 +60,13 @@ class MTPEngine(EngineBase):
             device=device,
         )
 
-    @property
-    def acquire_reserve(self) -> SpeculatorReserve:
-        return self._reserve
-
     @classmethod
     def from_config(
         cls,
-        drafter: BaseDrafterModel | None,
-        device : torch.device,
-        config : SchedulerConfig,
+        device: torch.device,
+        config: SchedulerConfig,
     ) -> MTPEngine:
-        if drafter is None:
-            drafter = cls.load_drafter(device, config)
-        assert isinstance(drafter, Qwen3_5MTPDrafter)
+        drafter = cls.load_drafter(device, config)
         speculator_config = config.speculator_config
         assert isinstance(speculator_config, MTPSpeculatorConfig)
         K = speculator_config.num_draft_tokens

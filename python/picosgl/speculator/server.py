@@ -1,24 +1,29 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import platform
 from typing import TYPE_CHECKING
 
 import torch
 
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.message import BaseDrafterMsg, DraftStepMsg
-from picosgl.models.drafters import BaseDrafterModel
 from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
-from picosgl.utils import Registry
+from picosgl.utils import Registry, init_logger
 
 from .base import EngineBase
-from .data_plane import NCCLDataPlane
-from .drafters.mtp import MTPEngine
+from .data_plane import (
+    CUDAIPCDataPlane,
+    DataPlane,
+    NCCLDataPlane,
+    SharedMemoryDataPlane,
+    make_data_plane_sizes,
+)
+from .drafters.mtp import MTPEngine, MTPSpeculatorConfig
 from .runner import SpeculatorRunner
 from .client import (
     BroadcastSpeculatorClient,
-    LocalSpeculatorClient,
-    RemoteSpeculatorClient,
+    MainSpeculatorClient,
     SpeculatorClientBase,
 )
 
@@ -29,25 +34,68 @@ if TYPE_CHECKING:
 
 SUPPORTED_DRAFTER_ENGINE = Registry[type[EngineBase]]("Drafter Engine")
 SUPPORTED_DRAFTER_ENGINE.register("MTP")(MTPEngine)
+logger = init_logger(__name__)
 
 
 def make_drafter_engine(
-    drafter: BaseDrafterModel | None,
-    device : torch.device,
-    config : SchedulerConfig,
+    device: torch.device,
+    config: SchedulerConfig,
 ) -> EngineBase:
     algorithm = config.speculative_algorithm
     assert algorithm is not None
-    return SUPPORTED_DRAFTER_ENGINE[algorithm].from_config(drafter, device, config)
+    return SUPPORTED_DRAFTER_ENGINE[algorithm].from_config(device, config)
 
 
-# independent speculator process when DT separation is enabled
+def make_speculator_data_plane(
+    config          : SchedulerConfig,
+    device          : torch.device,
+    rank            : int,
+    local_data_plane: DataPlane | None,
+) -> NCCLDataPlane | CUDAIPCDataPlane | SharedMemoryDataPlane:
+    if config.dt_separation:
+        return NCCLDataPlane(device, rank=rank, dtype=config.dtype)
+    else:
+        assert local_data_plane is not None
+        assert local_data_plane.rank == rank
+        assert local_data_plane.device == device
+        return local_data_plane
+
+
+def make_local_data_plane_pair(
+    config    : SchedulerConfig,
+    mp_context: mp.context.BaseContext | None = None,
+) -> tuple[CUDAIPCDataPlane, CUDAIPCDataPlane] | tuple[
+    SharedMemoryDataPlane, SharedMemoryDataPlane
+]:
+    data_plane_cls = (
+        SharedMemoryDataPlane
+        if "microsoft" in platform.release().lower()
+        else CUDAIPCDataPlane
+    )
+    if data_plane_cls is SharedMemoryDataPlane:
+        logger.warning("Using the shared-memory compatibility data plane under WSL")
+    return data_plane_cls.make_pair(
+        torch.device("cuda:0"), config.dtype, mp_context
+    )
+
+
+# The speculator always owns an independent process. DT separation only selects whether
+# that process shares Target rank 0's device or runs on the next device.
 @torch.inference_mode()
 def speculator_worker(
     *,
-    args      : SchedulerConfig,
-    ack_queue : mp.Queue[str] | None = None,
+    args                  : SchedulerConfig,
+    speculator_start_event: mp.synchronize.Event | None = None,
+    speculator_ready_event: mp.synchronize.Event | None = None,
+    speculator_data_plane : DataPlane | None = None,
+    ack_queue             : mp.Queue[str] | None = None,
 ) -> None:
+    # In shared-device mode Target rank 0 must capture its initial free-memory baseline
+    # before this process creates a CUDA context or allocates the drafter.
+    if not args.dt_separation:
+        assert speculator_start_event is not None
+        speculator_start_event.wait()
+
     device = torch.device(
         f"cuda:{args.tp_info.size}" if args.dt_separation else "cuda:0"
     )
@@ -61,15 +109,32 @@ def speculator_worker(
     # (LinearColumnParallel etc.) read the global TP info, which the main engine sets for
     # itself — this process must set it before constructing the model.
     with tp_override(DistributedInfo(0, 1)):
-        runner = SpeculatorRunner(
-            engine=make_drafter_engine(None, device, args),
-            data_plane=NCCLDataPlane(device, rank=1, dtype=args.dtype),
-            recv=ZmqPullQueue(args.zmq_drafter_addr, create=False, decoder=DraftStepMsg.decoder), 
-            reply=ZmqPushQueue(args.zmq_drafter_reply_addr, create=False, encoder=BaseDrafterMsg.encoder)
-        )
+        speculator_config = args.speculator_config
+        assert isinstance(speculator_config, MTPSpeculatorConfig)
 
-        if ack_queue is not None:
-            ack_queue.put("Speculator is ready")
+        def on_engine_ready() -> None:
+            if not args.dt_separation:
+                assert speculator_ready_event is not None
+                speculator_ready_event.set()
+            if ack_queue is not None:
+                ack_queue.put("Speculator is ready")
+
+        runner = SpeculatorRunner(
+            engine_factory=lambda: make_drafter_engine(device, args),
+            data_plane=make_speculator_data_plane(
+                args, device, rank=1,
+                local_data_plane=speculator_data_plane,
+            ),
+            recv=ZmqPullQueue(args.zmq_drafter_addr, create=False, decoder=DraftStepMsg.decoder),
+            reply=ZmqPushQueue(args.zmq_drafter_reply_addr, create=False, encoder=BaseDrafterMsg.encoder),
+            on_engine_ready=on_engine_ready,
+            data_plane_sizes=make_data_plane_sizes(
+                args,
+                args.model_config.hidden_size,
+                args.model_config.vocab_size,
+                speculator_config.window_size,
+            ),
+        )
         runner.run_forever()
 
 
@@ -83,15 +148,11 @@ def make_speculator_client(
             config, sche.device, mc.vocab_size, mc.hidden_size,
             scheduler_io=sche
         )
-    if config.dt_separation:
-        return RemoteSpeculatorClient(
-            config, sche.device, mc.vocab_size, mc.hidden_size,
-            scheduler_io=sche
-        )
-    else:
-        engine = sche.engine.speculator
-        assert engine is not None
-        return LocalSpeculatorClient(
-            config, sche.device, mc.vocab_size, mc.hidden_size,
-            engine=engine, scheduler_io=sche
-        )
+    return MainSpeculatorClient(
+        config, sche.device, mc.vocab_size, mc.hidden_size,
+        scheduler_io=sche,
+        data_plane=make_speculator_data_plane(
+            config, sche.device, rank=0,
+            local_data_plane=sche.speculator_data_plane,
+        ),
+    )

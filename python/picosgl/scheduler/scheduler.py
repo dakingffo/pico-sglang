@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 import torch
 
@@ -27,10 +27,20 @@ from .verify import VerifyManager
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    import multiprocessing as mp
+    from picosgl.speculator.data_plane import DataPlane
+
 
 class Scheduler(SchedulerIOMixin):
-    def __init__(self, config: SchedulerConfig):
-        self.engine = Engine(config)
+    def __init__(
+        self,
+        config                : SchedulerConfig,
+        speculator_start_event: mp.synchronize.Event | None = None,
+        speculator_ready_event: mp.synchronize.Event | None = None,
+        speculator_data_plane : DataPlane | None = None,
+    ):
+        self.engine = Engine(config, speculator_start_event, speculator_ready_event)
         super().__init__(config, self.engine.tp_cpu_group)
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -40,6 +50,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.config = config
+        self.speculator_data_plane = speculator_data_plane
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,

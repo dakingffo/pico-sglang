@@ -1,3 +1,3 @@
-from .mtp import MTPEngine, MTPSpeculatorConfig, MTPState
+from .mtp import MTPEngine, MTPHiddenFeature, MTPSpeculatorConfig, MTPState
 
-__all__ = ["MTPSpeculatorConfig", "MTPEngine", "MTPState"]
+__all__ = ["MTPSpeculatorConfig", "MTPEngine", "MTPHiddenFeature", "MTPState"]

@@ -6,25 +6,28 @@ from abc import ABC, abstractmethod
 import torch
 
 from picosgl.core import SamplingParams
-from picosgl.distributed import make_nccl_uid_bytes
 from picosgl.message import (
     BaseDrafterMsg,
     DraftHandshakeAckMsg,
     DraftHandshakeMsg,
     DraftInitMsg,
     DraftRemoveMsg,
-    DraftReply,
     DraftReplyMsg,
     DraftStepMsg,
 )
 from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
 
-from .data_plane import DataPlaneSizes, NCCLDataPlane
-from .drafters.mtp import MTPEngine, MTPSpeculatorConfig, MTPState
+from .data_plane import DataPlane, make_data_plane_sizes
+from .drafters.mtp import (
+    MTPHiddenFeature,
+    MTPSpeculatorConfig,
+)
+from .base import SpeculatorHiddenBase
 
 if TYPE_CHECKING:
     from picosgl.scheduler.config import SchedulerConfig
     from picosgl.scheduler.io import SchedulerIOMixin
+
 
 class SpeculatorClientBase(ABC):
     def __init__(
@@ -46,15 +49,32 @@ class SpeculatorClientBase(ABC):
             window_size if window_size is not None else speculator_config.window_size
         )
 
+    @staticmethod
+    def _unwrap_hidden(hidden_feature: SpeculatorHiddenBase) -> torch.Tensor:
+        assert isinstance(hidden_feature, MTPHiddenFeature)
+        return hidden_feature.full_hidden
+
+    def _prepare_init(
+        self,
+        end_position   : int,
+        token_ids      : torch.Tensor,
+        hidden_feature : SpeculatorHiddenBase,
+    ) -> tuple[list[int], list[int], torch.Tensor]:
+        full_hidden = self._unwrap_hidden(hidden_feature)
+        window_len = min(self.window_size, full_hidden.shape[0])
+        positions = list(range(end_position + 1 - window_len, end_position + 1))
+        tokens = token_ids[positions].tolist()
+        return positions, tokens, full_hidden[-window_len:].contiguous()
+
     @abstractmethod
     def init(
         self,
-        uid             : int,
-        table_idx       : int,
-        carry_positions : list[int],
-        carry_tokens    : list[int],
-        hidden          : torch.Tensor,
-        sampling_params : SamplingParams,
+        uid            : int,
+        table_idx      : int,
+        end_position   : int,
+        token_ids      : torch.Tensor,
+        hidden_feature : SpeculatorHiddenBase,
+        sampling_params: SamplingParams,
     ) -> None:
         """Seed the drafter's per-request state with a prefill terminal window."""
         ...
@@ -81,8 +101,6 @@ class SpeculatorClientBase(ABC):
 
 
 class MainSpeculatorClient(SpeculatorClientBase):
-    """Primary-rank side: drafts, then broadcasts the result to the other TP ranks."""
-
     def __init__(
         self,
         config      : SchedulerConfig,
@@ -91,139 +109,31 @@ class MainSpeculatorClient(SpeculatorClientBase):
         hidden_size : int,
         window_size : int | None              = None,
         scheduler_io: SchedulerIOMixin | None = None,
+        data_plane   : DataPlane | None        = None,
     ):
         super().__init__(config, device, vocab_size, hidden_size, window_size)
         self._io = scheduler_io
-
-    def step(
-        self,
-        reqs           : list,
-        appended_hidden: torch.Tensor | None,
-        has_sampling   : bool,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
-        reply, probs = self._draft(reqs, appended_hidden, has_sampling)
-        if self._io is not None and self.config.tp_info.size > 1:
-            self._io._send_draft_to_ranks(reply, probs)
-        return reply, probs
-
-    @abstractmethod
-    def _draft(
-        self,
-        reqs           : list,
-        appended_hidden: torch.Tensor | None,
-        has_sampling   : bool,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
-        ...
-
-
-class LocalSpeculatorClient(MainSpeculatorClient):
-    def __init__(
-        self,
-        config      : SchedulerConfig,
-        device      : torch.device,
-        vocab_size  : int,
-        hidden_size : int,
-        window_size : int | None              = None,
-        engine      : MTPEngine | None        = None,
-        scheduler_io: SchedulerIOMixin | None = None,
-    ):
-        super().__init__(
-            config, device, vocab_size, hidden_size,
-            window_size=window_size, scheduler_io=scheduler_io
-        )
-        self.engine = engine
-        self.states: dict[int, MTPState] = {}
-
-    def init(
-        self,
-        uid             : int,
-        table_idx       : int,
-        carry_positions : list[int],
-        carry_tokens    : list[int],
-        hidden          : torch.Tensor,
-        sampling_params : SamplingParams,
-    ) -> None:
-        self.states[uid] = MTPState(
-            table_idx=table_idx,
-            sampling_params=sampling_params,
-            window_positions=list(carry_positions),
-            window_tokens=list(carry_tokens),
-            window_hidden=hidden,
-            window_size=self.window_size,
-        )
-
-    def _draft(
-        self,
-        reqs           : list,
-        appended_hidden: torch.Tensor | None,
-        has_sampling   : bool,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
-        off = 0
-        for req in reqs:
-            st = self.states[req.uid]
-            st.n_drafts = req.n_drafts
-            if n := len(req.append_positions):
-                st.update_window(
-                    req.append_positions, req.append_tokens, appended_hidden[off : off + n]
-                )
-                off += n
-        self.engine.draft([self.states[req.uid] for req in reqs])
-
-        probs: torch.Tensor | None = None
-        if sampling_reqs := [req for req in reqs if req.sampling]:
-            probs = torch.cat(
-                [self.states[req.uid].draft_probs[: req.n_drafts] for req in sampling_reqs],
-                dim=0,
-            )
-        reply = DraftReplyMsg(
-            reqs=[
-                DraftReply(uid=r.uid, draft_tokens=self.states[r.uid].draft_tokens)
-                for r in reqs
-            ]
-        )
-        return reply, probs
-
-    def remove(self, uid: int) -> None:
-        self.states.pop(uid, None)
-
-    def destroy(self) -> None:
-        return
-
-
-class RemoteSpeculatorClient(MainSpeculatorClient):
-    def __init__(
-        self,
-        config      : SchedulerConfig,
-        device      : torch.device,
-        vocab_size  : int,
-        hidden_size : int,
-        window_size : int | None              = None,
-        scheduler_io: SchedulerIOMixin | None = None,
-    ):
-        super().__init__(
-            config, device, vocab_size, hidden_size,
-            window_size=window_size, scheduler_io=scheduler_io
-        )
-        self.data_plane = NCCLDataPlane(device, rank=0, dtype=config.dtype)
+        assert data_plane is not None
+        self.data_plane = data_plane
         self.sender = ZmqPushQueue(
             config.zmq_drafter_addr, create=True, encoder=BaseDrafterMsg.encoder
         )
         self.receiver = ZmqPullQueue(
             config.zmq_drafter_reply_addr, create=True, decoder=DraftReplyMsg.decoder
         )
-        
-        K = self.num_spec_tokens
-        max_hidden_rows = max(self.window_size, self.config.max_running_req * (K + 1))
-        max_prob_rows = self.config.max_running_req * K
-        sizes = DataPlaneSizes(max_hidden_rows, self.hidden_size, max_prob_rows, self.vocab_size)
-        uid = make_nccl_uid_bytes()
-        # uid must go out before the blocking NCCL init (both ranks block in ncclCommInitRank).
+
+        sizes = make_data_plane_sizes(
+            self.config, self.hidden_size, self.vocab_size, self.window_size
+        )
+        uid = self.data_plane.make_connection_id()
+        # Connection metadata must go out before transport initialization, which blocks
+        # until the worker consumes the same handshake.
         self.sender.put(
             DraftHandshakeMsg(
-                nccl_uid=uid,
-                max_hidden_rows=max_hidden_rows,
+                connection_id=uid,
+                max_hidden_rows=sizes.max_hidden_rows,
                 hidden_size=self.hidden_size,
-                max_prob_rows=max_prob_rows,
+                max_prob_rows=sizes.max_prob_rows,
                 vocab_size=self.vocab_size,
                 window_size=self.window_size,
             )
@@ -236,13 +146,16 @@ class RemoteSpeculatorClient(MainSpeculatorClient):
 
     def init(
         self,
-        uid             : int,
-        table_idx       : int,
-        carry_positions : list[int],
-        carry_tokens    : list[int],
-        hidden          : torch.Tensor,
-        sampling_params : SamplingParams,
+        uid            : int,
+        table_idx      : int,
+        end_position   : int,
+        token_ids      : torch.Tensor,
+        hidden_feature : SpeculatorHiddenBase,
+        sampling_params: SamplingParams,
     ) -> None:
+        carry_positions, carry_tokens, hidden = self._prepare_init(
+            end_position, token_ids, hidden_feature
+        )
         self.sender.put(
             DraftInitMsg(
                 uid=uid,
@@ -254,7 +167,7 @@ class RemoteSpeculatorClient(MainSpeculatorClient):
         )
         self.data_plane.send_hidden(hidden)
 
-    def _draft(
+    def step(
         self,
         reqs           : list,
         appended_hidden: torch.Tensor | None,
@@ -268,6 +181,8 @@ class RemoteSpeculatorClient(MainSpeculatorClient):
             rows = sum(r.n_drafts for r in reqs if r.sampling)
             probs = self.data_plane.recv_probs(rows)
         reply = self.receiver.get()
+        if self._io is not None and self.config.tp_info.size > 1:
+            self._io._send_draft_to_ranks(reply, probs)
         return reply, probs
 
     def remove(self, uid: int) -> None:
@@ -282,14 +197,14 @@ class RemoteSpeculatorClient(MainSpeculatorClient):
 class BroadcastSpeculatorClient(SpeculatorClientBase):
     """Non-primary-rank stand-in for ``SpeculatorClientBase``.
 
-    Only rank0 has the zmq/NCCL client; other TP ranks receive the draft results rank0
+    Only rank0 has the ZMQ/data-plane client; other TP ranks receive the draft results rank0
     broadcasts (``scheduler.io``) and present the same ``step`` interface so
     ``VerifyManager`` is rank-agnostic. ``init``/``remove`` are no-ops — no drafter state
     lives on non-primary ranks.
     """
 
     def __init__(
-        self,         
+        self,
         config      : SchedulerConfig,
         device      : torch.device,
         vocab_size  : int,

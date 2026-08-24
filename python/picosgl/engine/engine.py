@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import torch
 
@@ -9,11 +9,9 @@ from picosgl.layers.attention_backend import make_attention_backend
 from picosgl.layers.moe_backend import make_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
 from picosgl.distributed import (
-    DistributedInfo,
     destroy_distributed,
     enable_pynccl_distributed,
     set_tp_info,
-    tp_override,
 )
 from picosgl.cache import (
     make_kvcache_pool,
@@ -29,6 +27,9 @@ from picosgl.utils import (
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
+
+if TYPE_CHECKING:
+    import multiprocessing as mp
 
 logger = init_logger(__name__)
 
@@ -61,7 +62,12 @@ ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 
 class Engine:
-    def __init__(self, config: EngineConfig):
+    def __init__(
+        self,
+        config                : EngineConfig,
+        speculator_start_event: mp.synchronize.Event | None = None,
+        speculator_ready_event: mp.synchronize.Event | None = None,
+    ):
         assert not torch.cuda.is_initialized()
         set_tp_info(config.tp_info)
         _adjust_config(config)
@@ -80,27 +86,29 @@ class Engine:
         init_free_memory = self._sync_get_memory()[0]  # min across ranks (tightest rank anchors budget)
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
+        if (
+            config.enable_specualtive_decoding
+            and not config.dt_separation
+            and config.tp_info.is_primary()
+        ):
+            assert speculator_start_event is not None
+            speculator_start_event.set()
+
         # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = make_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        self.speculator = None
+
         if (
-            self.config.enable_specualtive_decoding
-            and not self.config.dt_separation
-            and self.config.tp_info.is_primary()
+            config.enable_specualtive_decoding
+            and not config.dt_separation
+            and config.tp_info.is_primary()
         ):
-            from picosgl.speculator import make_drafter_engine
+            assert speculator_ready_event is not None
+            speculator_ready_event.wait()
 
-            with tp_override(DistributedInfo(0, 1)):
-                self.speculator = make_drafter_engine(None, self.device, self.config)
-
-        if self.speculator is not None:
-            self.speculator_reserve = self.speculator.acquire_reserve
-        elif config.speculator_config is not None:
-            # Under DT separation the engine lives in another process, so the concrete
-            # config provides the same Target-side reserve description.
+        if config.speculator_config is not None:
             self.speculator_reserve = config.speculator_config.make_reserve(
                 config.max_running_req
             )
@@ -238,7 +246,7 @@ class Engine:
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int, int | None]:
-        # min free across ranks: the non-DT in-process drafter lives only on rank0, so
+        # min free across ranks: the non-DT speculator worker shares rank0's device, so
         # its bytes must shrink the budget (max would ignore the tightest rank).
         new_free_memory = self._sync_get_memory()[0]
         cache_per_page = (
@@ -249,8 +257,8 @@ class Engine:
             * self.dtype.itemsize
             * config.model_config.num_attention_layers
         )
-        # For hybrid models every KV page also owns one linear-state slot. Speculator
-        # engines report their Target-side verify reserve through ``acquire_reserve``.
+        # For hybrid models every KV page also owns one linear-state slot. Target-side
+        # verify states are reserved according to the selected speculator configuration.
         cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
         num_draft_states = (
             self.speculator_reserve.num_state_slots
@@ -341,7 +349,10 @@ class Engine:
                 self.config.enable_specualtive_decoding and batch.is_prefill
             ):
                 hidden, logits = self.model.forward_verify()
-                batch.full_hidden = hidden
+                if batch.is_prefill:
+                    speculator_config = self.config.speculator_config
+                    assert speculator_config is not None
+                    batch.hidden_feature = speculator_config.make_hidden_feature(hidden)
             elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
@@ -362,8 +373,6 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        if self.speculator is not None:
-            self.speculator.destroy()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

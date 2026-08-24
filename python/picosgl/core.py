@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from picosgl.cache import BaseCacheHandle, BaseKVCachePool, LinearStatePool
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from picosgl.layers.moe_backend import BaseMoeBackend
+    from picosgl.speculator import SpeculatorHiddenBase
 
 
 @dataclass
@@ -102,7 +103,7 @@ class Batch:
     # step, used for the residual rejection sampling (needs the full distribution).
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
-    full_hidden : torch.Tensor | None = field(init=False, default=None)
+    hidden_feature: SpeculatorHiddenBase | None = field(init=False, default=None)
     linear_verify_metadata: dict[
         int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ] | None = field(init=False, default=None)

@@ -2,7 +2,13 @@ import torch
 
 from picosgl.distributed import DistributedInfo
 from picosgl.scheduler import SchedulerConfig
-from picosgl.speculator import MTPSpeculatorConfig, SpeculatorReserve
+from picosgl.speculator import (
+    DataPlaneSizes,
+    MTPHiddenFeature,
+    MTPSpeculatorConfig,
+    SpeculatorReserve,
+    make_data_plane_sizes,
+)
 
 
 def test_mtp_speculator_config() -> None:
@@ -25,3 +31,15 @@ def test_mtp_speculator_config() -> None:
         num_state_slots=32,
         state_slots_per_request=4,
     )
+    assert make_data_plane_sizes(config, 1024, 100, 96) == DataPlaneSizes(
+        max_hidden_rows=96,
+        hidden_size=1024,
+        max_prob_rows=12,
+        vocab_size=100,
+    )
+
+    hidden = torch.arange(12).view(4, 3)
+    hidden_feature = speculator_config.make_hidden_feature(hidden)
+    assert isinstance(hidden_feature, MTPHiddenFeature)
+    selected = hidden_feature.select(slice(1, 3))
+    assert torch.equal(selected.full_hidden, hidden[1:3])

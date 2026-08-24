@@ -7,8 +7,8 @@ import torch
 
 from picosgl.engine import VerifyOutput
 from picosgl.core import Batch, Request, Context
-from picosgl.message import DetokenizeMsg, DraftReplyMsg, DraftStepReq
-from picosgl.speculator import DraftState, MTPSpeculatorConfig
+from picosgl.message import DetokenizeMsg, DraftStepReq
+from picosgl.speculator import DraftState, SpeculatorHiddenBase
 from picosgl.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
@@ -53,10 +53,10 @@ class VerifyManager(ARManagerBase):
     ) -> None:
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
         speculator_config = config.speculator_config
-        assert isinstance(speculator_config, MTPSpeculatorConfig)
+        assert speculator_config is not None
+
         self.page_table = table_manager.page_table
         self.num_spec_tokens = speculator_config.num_draft_tokens
-        self.window_size = speculator_config.window_size
         self.client = client
         self.vocab_size = vocab_size
         self._state_table: dict[int, VerifyState] = {}
@@ -73,15 +73,19 @@ class VerifyManager(ARManagerBase):
             self.client.remove(uid)
             return req, inflight
 
-    def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
-        req_hidden = full_hidden[mapping == req.table_idx]
-        C = req.cached_len
-        window_len = min(self.window_size, req_hidden.shape[0])
-        # window ends at the bonus position C (token_pool[C] = bonus)
-        positions = list(range(C + 1 - window_len, C + 1))
-        tokens = self.token_pool[req.table_idx, positions].tolist()
-        hidden = req_hidden[-window_len:].contiguous()
-        self.client.init(req.uid, req.table_idx, positions, tokens, hidden, req.sampling_params)
+    def on_prefill_done(
+        self,
+        req        : Request,
+        req_feature: SpeculatorHiddenBase,
+    ) -> None:
+        self.client.init(
+            req.uid,
+            req.table_idx,
+            req.cached_len,
+            self.token_pool[req.table_idx],
+            req_feature,
+            req.sampling_params,
+        )
         self.running_reqs[req.uid] = req
         self._state_table[req.table_idx] = VerifyState()
 
@@ -175,12 +179,12 @@ class VerifyManager(ARManagerBase):
             return super().process(ctx, forward_input, output)  # prefill commit
 
         extend_token = output.next_tokens_gpu  # (bs, K+1) int32
-        full_hidden = output.full_hidden       # (sum of num_sampled, hidden)
+        full_hidden = output.full_hidden
         offset = 0
         committed: list[tuple[int, int, list[int], int]] = [tuple()] * len(batch.reqs)
 
         for i, (req, extend_token) in enumerate(zip(forward_input.batch.reqs, extend_token)):
-            num_sampled = req.extend_len  # = n_drafts + 1 (this req's rows in logits/full_hidden)
+            num_sampled = req.extend_len
             row_start = offset
             offset += num_sampled
             if req.uid not in self.running_reqs:

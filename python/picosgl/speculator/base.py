@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Self
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -10,6 +10,10 @@ if TYPE_CHECKING:
     from picosgl.engine.config import EngineConfig
     from picosgl.scheduler.config import SchedulerConfig
     from picosgl.models.drafters import BaseDrafterModel
+
+class SpeculatorHiddenBase(ABC):
+    @abstractmethod
+    def select(self, index) -> Self: ...
 
 
 @dataclass(frozen=True)
@@ -26,7 +30,11 @@ class BaseSpeculatorConfig(ABC):
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve: ...
 
     @abstractmethod
+    def make_hidden_feature(self, full_hidden: torch.Tensor) -> SpeculatorHiddenBase: ...
+
+    @abstractmethod
     def validate(self, config: EngineConfig) -> None: ...
+
 
 @dataclass
 class DraftState:
@@ -54,20 +62,14 @@ class EngineBase(ABC):
     num_spec_tokens : int
     vocab_size      : int
 
-    @property
-    @abstractmethod
-    def acquire_reserve(self) -> SpeculatorReserve:
-        """Return Target-side storage reserved for this speculator."""
-
     @classmethod
     @abstractmethod
     def from_config(
         cls,
-        drafter: BaseDrafterModel | None,
-        device : torch.device,
-        config : SchedulerConfig,
+        device: torch.device,
+        config: SchedulerConfig,
     ) -> EngineBase:
-        """Build an algorithm engine, loading its model when ``drafter`` is absent."""
+        """Build an algorithm engine and load its standalone drafter model."""
 
     @staticmethod
     @abstractmethod

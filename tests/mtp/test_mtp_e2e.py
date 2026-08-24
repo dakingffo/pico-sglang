@@ -13,6 +13,7 @@ Usage:
 """
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
 
@@ -27,7 +28,11 @@ from picosgl.distributed import DistributedInfo
 from picosgl.message import UserMsg
 from picosgl.scheduler.config import SchedulerConfig
 from picosgl.scheduler.scheduler import Scheduler
-from picosgl.speculator import MTPSpeculatorConfig
+from picosgl.speculator import (
+    MTPSpeculatorConfig,
+    make_local_data_plane_pair,
+    speculator_worker,
+)
 
 MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 
@@ -59,16 +64,49 @@ TIE_MARGIN = 0.2
 class OfflineScheduler(Scheduler):
     """Scheduler with an in-process message queue instead of ZMQ.
 
-    DT separation is off locally (single GPU), so the drafter runs in-process: the
-    scheduler builds a ``LocalSpeculatorClient`` around the standalone
-    ``Qwen3_5MTPDrafter`` + ``MTPEngine``, with no separate speculator process or ZMQ
-    control plane, and no data plane. This is the non-DT production path.
+    Requests and replies bypass the tokenizer-side ZMQ queues. In speculative mode the
+    drafter still follows the production architecture: a separate same-device worker,
+    a ZMQ control plane, and the configured tensor data plane.
     """
 
     def __init__(self, config, msgs):
         self._pending = list(msgs)
         self.results: list = []
-        super().__init__(config)
+        self.speculator_process: mp.Process | None = None
+        self._speculator_queues: list = []
+        if config.enable_specualtive_decoding:
+            ctx = mp.get_context("spawn")
+            start_event = ctx.Event()
+            ready_event = ctx.Event()
+            ack_queue = ctx.Queue(maxsize=1)
+            target_data_plane, speculator_data_plane = make_local_data_plane_pair(
+                config, ctx
+            )
+            self._speculator_queues = [ack_queue]
+            self.speculator_process = ctx.Process(
+                target=speculator_worker,
+                kwargs={
+                    "args": config,
+                    "speculator_start_event": start_event,
+                    "speculator_ready_event": ready_event,
+                    "speculator_data_plane": speculator_data_plane,
+                    "ack_queue": ack_queue,
+                },
+                daemon=False,
+                name="picosgl-test-speculator",
+            )
+            self.speculator_process.start()
+            try:
+                super().__init__(
+                    config, start_event, ready_event, target_data_plane
+                )
+            except BaseException:
+                self.speculator_process.terminate()
+                self.speculator_process.join()
+                raise
+            assert ack_queue.get() == "Speculator is ready"
+        else:
+            super().__init__(config)
 
     def offline_receive_msg(self, blocking: bool = False) -> list:
         out, self._pending = self._pending, []
@@ -76,6 +114,15 @@ class OfflineScheduler(Scheduler):
 
     def offline_send_result(self, reply) -> None:
         self.results.extend(reply)
+
+    def shutdown(self) -> None:
+        super().shutdown()
+        if self.speculator_process is not None:
+            self.speculator_process.terminate()
+            self.speculator_process.join()
+        for queue in self._speculator_queues:
+            queue.close()
+            queue.join_thread()
 
 
 def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> SchedulerConfig:

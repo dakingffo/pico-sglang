@@ -11,6 +11,8 @@ from picosgl.message import DetokenizeMsg
 from picosgl.utils import align_ceil
 
 if TYPE_CHECKING:
+    from picosgl.speculator import SpeculatorHiddenBase
+
     from .cache import CacheManager
     from .config import SchedulerConfig
     from .table import TableManager
@@ -60,8 +62,12 @@ class ARManagerBase:
             req.aborted = True
             return req, inflight
 
-    def on_prefill_done(self, req: Request, full_hidden, mapping) -> None:
-        """Prefill -> AR handoff hook. decode: no-op; verify (MTP): seed the carry."""
+    def on_prefill_done(
+        self,
+        req        : Request,
+        req_feature: SpeculatorHiddenBase,
+    ) -> None:
+        """Prefill -> AR handoff hook. Decode does not need speculator features."""
         return None
 
     def process(
@@ -99,8 +105,12 @@ class ARManagerBase:
                 elif batch.is_prefill:
                     if req.can_decode:
                         self.running_reqs[req.uid] = req
-                        if batch.full_hidden is not None:
-                            self.on_prefill_done(req, batch.full_hidden, forward_input.input_tuple[0])
+                        if batch.hidden_feature is not None:
+                            mapping = forward_input.input_tuple[0]
+                            self.on_prefill_done(
+                                req,
+                                batch.hidden_feature.select(mapping == req.table_idx)
+                            )
                     self.cache_manager.cache_req(req, finished=False)
 
         self.inflight_uids[0] = set()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from picosgl.message import (
@@ -24,21 +26,32 @@ logger = init_logger(__name__)
 class SpeculatorRunner:
     def __init__(
         self,
-        engine    : EngineBase,
-        data_plane: DataPlane,
-        recv      : ZmqPullQueue,
-        reply     : ZmqPushQueue,
+        engine_factory  : Callable[[], EngineBase],
+        data_plane      : DataPlane,
+        recv            : ZmqPullQueue,
+        reply           : ZmqPushQueue,
+        on_engine_ready : Callable[[EngineBase], None] | None = None,
+        data_plane_sizes: DataPlaneSizes | None                = None,
     ) -> None:
-        self.engine = engine
+        self.engine_factory = engine_factory
+        self.engine: EngineBase | None = None
         self.data_plane = data_plane
         self.recv = recv
         self.reply = reply
+        self.on_engine_ready = on_engine_ready
+        self.data_plane_sizes = data_plane_sizes
         self.states: dict[int, MTPState] = {}
         self.window_size = 0
         self.hidden_size = 0
         self.vocab_size = 0
 
     def run_forever(self) -> None:
+        self.engine = self.engine_factory()
+        if self.data_plane_sizes is not None:
+            self.data_plane.prepare_rank1(self.data_plane_sizes)
+        if self.on_engine_ready is not None:
+            self.on_engine_ready()
+
         handshake = self.recv.get()
         assert isinstance(handshake, DraftHandshakeMsg), (
             f"expected DraftHandshakeMsg, got {handshake!r}"
@@ -50,7 +63,9 @@ class SpeculatorRunner:
             handshake.max_hidden_rows, handshake.hidden_size,
             handshake.max_prob_rows, handshake.vocab_size,
         )
-        self.data_plane.init_rank1(handshake.nccl_uid, sizes)
+        if self.data_plane_sizes is not None:
+            assert sizes == self.data_plane_sizes
+        self.data_plane.init_rank1(handshake.connection_id, sizes)
         self.reply.put(DraftHandshakeAckMsg())
         logger.info(
             "Speculator ready: window_size=%d hidden_size=%d vocab_size=%d device=%s",
@@ -83,6 +98,7 @@ class SpeculatorRunner:
         )
 
     def _on_step(self, msg: DraftStepMsg) -> None:
+        assert self.engine is not None
         total_rows = sum(len(r.append_positions) for r in msg.reqs)
         if total_rows > 0:
             hidden = self.data_plane.recv_hidden(total_rows)
