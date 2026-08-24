@@ -110,8 +110,6 @@ class RadixTreeNode:
 
 
 class HybridRadixTreeNode(RadixTreeNode):
-    counter = count(0)
-
     def __init__(self, key_fn: KEY_FN, page_size: int = 1, tic: int | None = None):
         super().__init__(key_fn, page_size, tic)
         self._st: torch.Tensor

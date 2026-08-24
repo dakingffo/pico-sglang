@@ -20,21 +20,21 @@ SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("trtllm")
-def create_trtllm_backend(config: ModelConfig):
+def make_trtllm_backend(config: ModelConfig):
     from .trtllm import TensorRTLLMBackend
 
     return TensorRTLLMBackend(config)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("fi")
-def create_fi_backend(config: ModelConfig):
+def make_fi_backend(config: ModelConfig):
     from .fi import FlashInferBackend
 
     return FlashInferBackend(config)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("fa")
-def create_fa_backend(config: ModelConfig):
+def make_fa_backend(config: ModelConfig):
     from .fa import FlashAttentionBackend
 
     return FlashAttentionBackend(config)
@@ -49,7 +49,7 @@ def validate_attn_backend(backend: str, allow_auto: bool = True):
     return backend
 
 
-def create_attention_backend(
+def make_attention_backend(
     backend: str,
     config: ModelConfig,
 ) -> BaseAttnBackend:
@@ -59,8 +59,8 @@ def create_attention_backend(
         p_backend, d_backend = backend.split(",", 1)
         if p_backend != d_backend:
             logger.info(f"Using hybrid attention backend: prefill={p_backend}, decode={d_backend}")
-            p_backend = create_attention_backend(p_backend, config)
-            d_backend = create_attention_backend(d_backend, config)
+            p_backend = make_attention_backend(p_backend, config)
+            d_backend = make_attention_backend(d_backend, config)
             return HybridBackend(p_backend, d_backend)
         backend = p_backend  # both are the same, fall through to single backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
@@ -71,7 +71,7 @@ def create_attention_backend(
 __all__ = [
     "BaseAttnMetadata",
     "BaseAttnBackend",
-    "create_attention_backend",
+    "make_attention_backend",
     "SUPPORTED_ATTENTION_BACKENDS",
     "validate_attn_backend",
 ]

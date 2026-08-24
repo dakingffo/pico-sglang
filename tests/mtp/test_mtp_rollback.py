@@ -71,9 +71,9 @@ def main():
     torch.cuda.set_device(device)
 
     from picosgl.core import Batch, Context, Request, set_global_ctx
-    from picosgl.cache import create_kvcache_pool
+    from picosgl.cache import make_kvcache_pool
     from picosgl.cache.linear.state_pool import LinearStatePool
-    from picosgl.layers.attention_backend import create_attention_backend
+    from picosgl.layers.attention_backend import make_attention_backend
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
     from picosgl.models.weight import load_target_weight
     from picosgl.scheduler.cache import CacheManager
@@ -97,7 +97,7 @@ def main():
     # KV cache is per-token pages (page_size=1); the 64-granular pages below are STATE
     # pages (state_table columns), indexed by the layer, not by the attention backend.
     kv_pages = 4096
-    ctx.kv_cache = create_kvcache_pool(
+    ctx.kv_cache = make_kvcache_pool(
         model_config=mcfg, num_pages=kv_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
@@ -124,7 +124,7 @@ def main():
     ctx.state_table = st
     ctx.draft_offset = rb
     set_global_ctx(ctx)
-    ctx.attn_backend = create_attention_backend("fi", mcfg)
+    ctx.attn_backend = make_attention_backend("fi", mcfg)
 
     cm = CacheManager(
         num_pages=8, page_size=PS, num_states=64,

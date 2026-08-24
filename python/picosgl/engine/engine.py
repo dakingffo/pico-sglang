@@ -5,17 +5,23 @@ from typing import Any, NamedTuple, TypeAlias
 
 import torch
 
-from picosgl.layers.attention_backend import create_attention_backend
-from picosgl.layers.moe_backend import create_moe_backend
+from picosgl.layers.attention_backend import make_attention_backend
+from picosgl.layers.moe_backend import make_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
-from picosgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from picosgl.distributed import (
+    DistributedInfo,
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_tp_info,
+    tp_override,
+)
 from picosgl.cache import (
-    create_kvcache_pool,
-    create_linear_state_pool,
+    make_kvcache_pool,
+    make_linear_state_pool,
     linear_state_slot_bytes_for_config,
 )
 from picosgl.layers import set_rope_device
-from picosgl.models import create_model, load_target_weight
+from picosgl.models import make_model, load_target_weight
 from picosgl.utils import (
     align_ceil, div_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 )
@@ -77,21 +83,33 @@ class Engine:
         # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(config.model_config)
+            self.model = make_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        self.drafter = None
+        self.speculator = None
         if (
             self.config.enable_specualtive_decoding
-            and not self.config.enable_dt_separation
+            and not self.config.dt_separation
             and self.config.tp_info.is_primary()
         ):
-            from picosgl.speculator import make_local_drafter  # lazy: speculator imports picosgl.engine
+            from picosgl.speculator import make_drafter_engine
 
-            self.drafter = make_local_drafter(self.device, self.config)
+            with tp_override(DistributedInfo(0, 1)):
+                self.speculator = make_drafter_engine(None, self.device, self.config)
+
+        if self.speculator is not None:
+            self.speculator_reserve = self.speculator.acquire_reserve
+        elif config.speculator_config is not None:
+            # Under DT separation the engine lives in another process, so the concrete
+            # config provides the same Target-side reserve description.
+            self.speculator_reserve = config.speculator_config.make_reserve(
+                config.max_running_req
+            )
+        else:
+            self.speculator_reserve = None
 
         self.num_pages, num_tokens, self.num_draft_states = self._determine_num_pages(init_free_memory, config)
         # ======================= KV cache initialization ========================
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+        self.ctx.kv_cache = self.kv_cache = make_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
@@ -103,7 +121,7 @@ class Engine:
         self.num_states = 0
         if config.model_config.is_hybrid:
             self.num_states = self.num_pages
-            self.ctx.linear_state = self.linear_state = create_linear_state_pool(
+            self.ctx.linear_state = self.linear_state = make_linear_state_pool(
                 model_config=config.model_config,
                 num_slots=self.num_states + self.num_draft_states,
                 device=self.device,
@@ -124,8 +142,8 @@ class Engine:
         if config.model_config.is_hybrid:
             page_cols = div_ceil(self.max_seq_len, config.page_size)
             reserve_cols = (
-                config.speculative_num_draft_tokens + 1
-                if config.enable_specualtive_decoding else 0
+                self.speculator_reserve.state_slots_per_request
+                if self.speculator_reserve is not None else 0
             )
             self.ctx.state_table = self.state_table = torch.full(
                 (config.max_running_req + 1, page_cols + reserve_cols),
@@ -149,11 +167,11 @@ class Engine:
                 self.state_table[:config.max_running_req, page_cols:].copy_(reserve)
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+        self.ctx.attn_backend = self.attn_backend = make_attention_backend(
             config.attention_backend, config.model_config
         )
         if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+            self.ctx.moe_backend = self.moe_backend = make_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -231,39 +249,14 @@ class Engine:
             * self.dtype.itemsize
             * config.model_config.num_attention_layers
         )
-        # For hybrid models every KV page also owns one linear-state slot, and each MTP
-        # request additionally owns a K+1 slot reserve. Both are inside the memory budget.
+        # For hybrid models every KV page also owns one linear-state slot. Speculator
+        # engines report their Target-side verify reserve through ``acquire_reserve``.
         cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
-        num_draft_per_req = (
-            config.speculative_num_draft_tokens + 1
-            if config.enable_specualtive_decoding else 0
-        )
         num_draft_states = (
-            config.max_running_req * num_draft_per_req
-            if config.enable_specualtive_decoding else 0
+            self.speculator_reserve.num_state_slots
+            if self.speculator_reserve is not None else 0
         )
         draft_bytes = num_draft_states * cache_per_state
-        draft_concurrency = min(
-            config.max_running_req,
-            config.decode_batch_budget // config.speculative_num_draft_tokens,
-        )
-        mtp_kv_slots = (
-            config.max_running_req * config.speculator_window_size
-            + draft_concurrency * config.speculative_num_draft_tokens
-        )
-        mtp_kv_bytes = (
-            2
-            * mtp_kv_slots
-            * config.model_config.num_kv_heads
-            * config.model_config.head_dim
-            * self.dtype.itemsize
-            if config.enable_specualtive_decoding and not config.enable_dt_separation else 0
-        )
-        mtp_workspace_bytes = (
-            32 * 1024 * 1024
-            if mtp_kv_bytes and config.attention_backend.rsplit(",", 1)[-1] in ("auto", "fi")
-            else 0
-        )
 
         num_pages = config.num_page_override
         if num_pages is None:
@@ -271,14 +264,12 @@ class Engine:
             available_memory = (
                 int(config.memory_ratio * old_free_memory)
                 - model_memory
-                - mtp_kv_bytes
-                - mtp_workspace_bytes
             )
             if config.model_config.is_hybrid:
                 min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
                 available_states = (available_memory - min_pages_bytes) // cache_per_state
                 assert num_draft_states <= available_states, (
-                    f"Not enough memory for {num_draft_states} MTP draft states: "
+                    f"Not enough memory for {num_draft_states} speculator states: "
                     f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum KV pages. "
                     f"Raise --memory-ratio / --max-running-req, or pin --num-pages."
                 )
@@ -299,11 +290,6 @@ class Engine:
         num_tokens = num_pages * config.page_size
         logger.info(f"Allocating {num_tokens} tokens for KV cache,\
                      K + V = {mem_GB(num_pages * cache_per_page)}")
-        if mtp_kv_bytes:
-            logger.info(
-                f"Reserving {mtp_kv_slots} MTP KV slots = {mem_GB(mtp_kv_bytes)}, "
-                f"attention workspace = {mem_GB(mtp_workspace_bytes)}"
-            )
         if config.model_config.is_hybrid:
             logger.info(
                 f"Allocating {num_pages + num_draft_states}"
@@ -362,7 +348,7 @@ class Engine:
                 logits = self.model.forward()
 
         if batch.is_verify:
-            next_tokens_gpu = self.sampler.reject_sample(logits, batch, args).to(torch.int32)
+            next_tokens_gpu = self.sampler.reject_sample(logits, batch).to(torch.int32)
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
             copy_done_event = torch.cuda.Event()
             copy_done_event.record(self.stream)
@@ -376,6 +362,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.speculator is not None:
+            self.speculator.destroy()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -451,38 +439,25 @@ def _adjust_config(config: EngineConfig):
             logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")
 
     if config.enable_specualtive_decoding:
-        assert config.speculative_algorithm == "MTP", (
-            "only the MTP algorithm is implemented (got --speculative-algorithm "
-            f"{config.speculative_algorithm!r})"
+        speculator_config = config.speculator_config
+        assert speculator_config is not None, (
+            "speculator_config is required when speculative decoding is enabled"
         )
-        assert config.speculative_draft_model_path == config.model_path, (
-            "--speculative-draft-model-path must equal --model-path under MTP "
-            f"(got {config.speculative_draft_model_path!r} vs {config.model_path!r})."
+        assert speculator_config.algorithm == config.speculative_algorithm, (
+            f"Speculator config {type(speculator_config).__name__} belongs to "
+            f"{speculator_config.algorithm}, not {config.speculative_algorithm}."
         )
-        assert config.model_config.mtp_num_hidden_layers > 0, (
-            "MTP speculative decoding requires a model with an MTP head "
-            "(mtp_num_hidden_layers > 0)."
-        )
-        assert config.speculative_num_draft_tokens >= 1, (
-            "--speculative-num-draft-tokens must be >= 1"
-        )
-        assert config.decode_batch_budget >= config.speculative_num_draft_tokens, (
-            "--max-decode-tokens must be >= --speculative-num-draft-tokens, "
-            "or the draft-state region is empty"
-        )
-        if config.enable_dt_separation:
+        speculator_config.validate(config)
+        if config.dt_separation:
             import torch as _torch
 
             assert _torch.cuda.device_count() > config.tp_info.size, (
                 "--enable-dt-separation requires at least tp_size + 1 GPUs "
                 f"(tp_size={config.tp_info.size})."
             )
-    elif config.speculative_algorithm == "DFLASH":
-        raise NotImplementedError(
-            "DFLASH speculative decoding is not implemented yet; "
-            "only --speculative-algorithm MTP is supported."
-        )
-    elif config.enable_dt_separation:
+    elif config.speculator_config is not None:
+        raise ValueError("speculator_config requires --speculative-algorithm.")
+    elif config.dt_separation:
         raise ValueError(
             "--enable-dt-separation requires --speculative-algorithm."
         )

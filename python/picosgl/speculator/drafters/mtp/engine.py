@@ -4,15 +4,19 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from picosgl.utils import torch_dtype
 from picosgl.engine import Sampler
+from picosgl.models.drafters import BaseDrafterModel, Qwen3_5MTPDrafter
 
-from ...base import EngineBase
+from ...base import EngineBase, SpeculatorReserve
 from .attention import MTPAttentionBackend
+from .config import MTPSpeculatorConfig
 from .pool import MTPKVPool
 from .state import MTPState
 
 if TYPE_CHECKING:
-    from picosgl.models.drafters import Qwen3_5MTPDrafter
+    from picosgl.engine.config import EngineConfig
+    from picosgl.scheduler.config import SchedulerConfig
 
 
 class MTPEngine(EngineBase):
@@ -33,10 +37,14 @@ class MTPEngine(EngineBase):
         self.stream = torch.cuda.Stream(device=device)
         self.num_spec_tokens = num_spec_tokens
         self.vocab_size = vocab_size
+        self._reserve = SpeculatorReserve(
+            num_state_slots=max_running_req * (num_spec_tokens + 1),
+            state_slots_per_request=num_spec_tokens + 1,
+        )
         self.drafter = drafter
         self.sampler = Sampler(device, vocab_size)
 
-        attention = drafter.layers.op_list[0].self_attn
+        attention = self.drafter.layers.op_list[0].self_attn
         self.pool = MTPKVPool(
             max_running_req=max_running_req,
             window_size=window_size,
@@ -55,6 +63,46 @@ class MTPEngine(EngineBase):
             dtype=attention.k_proj.weight.dtype,
             device=device,
         )
+
+    @property
+    def acquire_reserve(self) -> SpeculatorReserve:
+        return self._reserve
+
+    @classmethod
+    def from_config(
+        cls,
+        drafter: BaseDrafterModel | None,
+        device : torch.device,
+        config : SchedulerConfig,
+    ) -> MTPEngine:
+        if drafter is None:
+            drafter = cls.load_drafter(device, config)
+        assert isinstance(drafter, Qwen3_5MTPDrafter)
+        speculator_config = config.speculator_config
+        assert isinstance(speculator_config, MTPSpeculatorConfig)
+        K = speculator_config.num_draft_tokens
+        return cls(
+            drafter,
+            device,
+            config.model_config.vocab_size,
+            K,
+            config.max_running_req,
+            speculator_config.window_size,
+            min(config.max_running_req, config.decode_batch_budget // K),
+            config.attention_backend,
+        )
+
+    @staticmethod
+    def load_drafter(
+        device: torch.device, config: EngineConfig
+    ) -> Qwen3_5MTPDrafter:
+        mc = config.model_config
+        with torch_dtype(config.dtype):
+            drafter = Qwen3_5MTPDrafter(mc)
+        model_path = config.speculative_draft_model_path
+        assert model_path is not None
+        drafter.load_weights(model_path, device)
+        return drafter
 
     def draft(self, states: list[MTPState]) -> None:
         K = self.num_spec_tokens

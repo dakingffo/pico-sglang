@@ -4,7 +4,7 @@ bench_prefill / bench_decode / bench_spec_decode all launch a real pico-sglang H
 server as a subprocess, wait for it to be ready, then drive a streaming
 ``/v1/chat/completions`` workload against it over httpx. The workload code is
 byte-identical across tp sizes and MTP on/off -- the ONLY thing that changes is the
-server's launch flags (``--tensor-parallel-size`` / ``--enable-mtp``) -- so every run
+server's launch flags (``--tensor-parallel-size`` / ``--speculative-algorithm``) -- so every run
 is a controlled-variable comparison.
 
 Server arguments are NOT redefined here: the library's
@@ -40,8 +40,9 @@ if os.path.isdir("/home/daking/.conda/envs/daking"):
 # -------------------------------------------------------------------------------------
 
 # Bench-only flags. Every other flag (--model-path, --tp-size, --dtype, --host/--port,
-# --page-size, --num-pages, --max-running-requests, --memory-ratio, --enable-mtp,
-# --num-spec-tokens, ...) is parsed by the library's picosgl.server.args.parse_args.
+# --page-size, --num-pages, --max-running-requests, --memory-ratio,
+# --speculative-num-draft-tokens, ...) is parsed by the library's
+# picosgl.server.args.parse_args.
 BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
     "--num-prompts": {"type": str, "default": None,
                       "help": "comma-separated concurrent request counts (default 32)"},
@@ -149,10 +150,10 @@ def resolve_port(server_argv: list[str], server_args: Any) -> int:
 
 
 _MTP_VALUE_FLAGS = (
-    "--port", "--num-spec-tokens", "--speculative-algorithm",
+    "--port", "--speculative-algorithm",
     "--speculative-num-draft-tokens", "--speculative-draft-model-path",
 )
-_MTP_BOOL_FLAGS = ("--enable-mtp", "--enable-dt-separation")
+_MTP_BOOL_FLAGS = ("--enable-dt-separation",)
 
 
 def _flag_value(argv: list[str], name: str) -> str | None:
@@ -162,6 +163,13 @@ def _flag_value(argv: list[str], name: str) -> str | None:
         if a.startswith(name + "="):
             return a.split("=", 1)[1]
     return None
+
+
+def resolve_num_spec_tokens(server_argv: list[str]) -> int:
+    from picosgl.speculator import MTPSpeculatorConfig
+
+    value = _flag_value(server_argv, "--speculative-num-draft-tokens")
+    return int(value) if value is not None else MTPSpeculatorConfig.num_draft_tokens
 
 
 def make_server_cmd(server_argv: list[str], *, port: int, enable_specualtive_decoding: bool, num_spec_tokens: int, enable_dt: bool = False) -> list[str]:

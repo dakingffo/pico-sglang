@@ -33,6 +33,7 @@ from bench_common import (
     parse_full,
     parse_int_list,
     print_stats,
+    resolve_num_spec_tokens,
     resolve_port,
     run_online_bench_tics,
     summarize_group,
@@ -85,7 +86,7 @@ def main() -> int:
     port = resolve_port(server_argv, server_args)
     proc = launch_server(
         server_argv, port=port, enable_specualtive_decoding=True,
-        num_spec_tokens=server_args.speculative_num_draft_tokens,
+        num_spec_tokens=resolve_num_spec_tokens(server_argv),
         enable_dt=bench.dt,
     )
     try:

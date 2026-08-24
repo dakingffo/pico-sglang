@@ -121,13 +121,6 @@ class Sampler:
         else:
             return sample_impl(logits.float(), args)
 
-    def draft_token(self, logits_row: torch.Tensor, params) -> int:
-        """Sample one MTP draft token from the same distribution used during verification."""
-        if params.is_greedy:
-            return int(logits_row.argmax().item())
-        args = self.prepare_params([params])
-        return int(self.sample(logits_row.unsqueeze(0), args)[0].item())
-
     def probabilities(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         assert args.temperatures is not None
         return normalize_probs(
@@ -140,7 +133,7 @@ class Sampler:
         )
 
     @nvtx_annotate("Sampler")
-    def reject_sample(self, logits, batch, sample_args) -> torch.Tensor:
+    def reject_sample(self, logits, batch) -> torch.Tensor:
         """Spec-decode rejection sampling. Returns extend_token (bs, K+1) int32.
 
         Row layout per request: [draft_0, ..., draft_{num_sampled-2}, new_bonus, PAD...]

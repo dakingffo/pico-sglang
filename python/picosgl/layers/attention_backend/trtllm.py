@@ -131,7 +131,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = TRTLLMCaptureData.create(
+        capture = TRTLLMCaptureData.make(
             max_bs, max_seq_len // self.page_size, self.kvcache.device
         )
         self.max_graph_bs = max_bs

@@ -1,14 +1,14 @@
 """Speculative-decoding throughput benchmark: MTP vs non-MTP, controlled variables.
 
 Both runs use the SAME seeded prompt batch, the SAME httpx load driver and the SAME
-metrics -- the only thing that differs is the server's ``--enable-mtp`` flag
-(``--num-spec-tokens`` comes from the library's ServerArgs, default 4). tp size comes
+metrics -- the only thing that differs is the server's ``--speculative-algorithm`` flag
+(``--speculative-num-draft-tokens`` defaults to 4). tp size comes
 from ``--tp-size``. Server flags are parsed by the library's
 ``picosgl.server.args.parse_args`` -- nothing is redefined here.
 
 Examples:
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> --tp-size 2 \
-      --input-len 64 --output-len 256 --num-prompts 32 --num-spec-tokens 4
+      --input-len 64 --output-len 256 --num-prompts 32 --speculative-num-draft-tokens 4
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
       --mode mtp --out /tmp/mtp.json   # single-mode run for longer data collection
 """
@@ -25,6 +25,7 @@ from bench_common import (
     parse_int_list,
     print_compare,
     print_stats,
+    resolve_num_spec_tokens,
     resolve_port,
     run_online_bench,
     wait_server_ready,
@@ -53,6 +54,7 @@ def main() -> int:
         modes = [("mtp", True)]
 
     port = resolve_port(server_argv, server_args)
+    num_spec_tokens = resolve_num_spec_tokens(server_argv)
 
     results: dict[str, dict[str, dict]] = {}
     for label, enable_specualtive_decoding in modes:
@@ -60,7 +62,7 @@ def main() -> int:
             server_argv,
             port=port,
             enable_specualtive_decoding=enable_specualtive_decoding,
-            num_spec_tokens=server_args.speculative_num_draft_tokens,
+            num_spec_tokens=num_spec_tokens,
             enable_dt=bench.dt and enable_specualtive_decoding,
         )
         try:

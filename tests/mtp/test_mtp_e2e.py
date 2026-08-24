@@ -27,6 +27,7 @@ from picosgl.distributed import DistributedInfo
 from picosgl.message import UserMsg
 from picosgl.scheduler.config import SchedulerConfig
 from picosgl.scheduler.scheduler import Scheduler
+from picosgl.speculator import MTPSpeculatorConfig
 
 MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 
@@ -59,8 +60,8 @@ class OfflineScheduler(Scheduler):
     """Scheduler with an in-process message queue instead of ZMQ.
 
     DT separation is off locally (single GPU), so the drafter runs in-process: the
-    scheduler builds the standalone ``Qwen3_5MTPDrafter`` + ``MTPEngine`` directly
-    (``scheduler._make_inprocess_client``), with no separate drafter process, no zmq
+    scheduler builds a ``LocalSpeculatorClient`` around the standalone
+    ``Qwen3_5MTPDrafter`` + ``MTPEngine``, with no separate speculator process or ZMQ
     control plane, and no data plane. This is the non-DT production path.
     """
 
@@ -93,7 +94,10 @@ def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> Sche
         cuda_graph_max_bs=0,
         speculative_algorithm="MTP" if enable_specualtive_decoding else None,
         speculative_draft_model_path=MODEL if enable_specualtive_decoding else None,
-        speculative_num_draft_tokens=K,
+        speculator_config=(
+            MTPSpeculatorConfig(num_draft_tokens=K)
+            if enable_specualtive_decoding else None
+        ),
         offline_mode=True,
     )
 
@@ -153,8 +157,8 @@ def run(enable_specualtive_decoding: bool, debug_logits: bool = False, temperatu
     if debug_logits or enable_specualtive_decoding:
         rs = sched.engine.sampler.reject_sample
 
-        def dump_rs(logits, batch, args):
-            out = rs(logits, batch, args)
+        def dump_rs(logits, batch):
+            out = rs(logits, batch)
             if batch.is_verify:
                 off = 0
                 for req in batch.reqs:

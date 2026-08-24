@@ -1,26 +1,38 @@
 
 
-from .base import DraftState, EngineBase
-from .client import BroadcastDrafterClient, DrafterClientBase, LocalDrafterClient, RemoteDrafterClient
+from .base import BaseSpeculatorConfig, DraftState, EngineBase, SpeculatorReserve
+from .client import (
+    BroadcastSpeculatorClient,
+    LocalSpeculatorClient,
+    RemoteSpeculatorClient,
+    SpeculatorClientBase,
+)
 from .data_plane import DataPlane, DataPlaneSizes, NCCLDataPlane
-from .drafters import MTPEngine, MTPState
-from .runner import DrafterRunner
-from .server import drafter_worker, make_local_drafter, make_drafter_client
+from .drafters import MTPEngine, MTPSpeculatorConfig, MTPState
+from .runner import SpeculatorRunner
+from .server import (
+    make_drafter_engine,
+    make_speculator_client,
+    speculator_worker,
+)
 
 __all__ = [
     "DraftState",
     "EngineBase",
-    "DrafterClientBase",
-    "LocalDrafterClient",
-    "RemoteDrafterClient",
-    "BroadcastDrafterClient",
+    "BaseSpeculatorConfig",
+    "SpeculatorReserve",
+    "SpeculatorClientBase",
+    "LocalSpeculatorClient",
+    "RemoteSpeculatorClient",
+    "BroadcastSpeculatorClient",
     "DataPlane",
     "DataPlaneSizes",
     "NCCLDataPlane",
     "MTPEngine",
+    "MTPSpeculatorConfig",
     "MTPState",
-    "DrafterRunner",
-    "drafter_worker",
-    "make_local_drafter",
-    "make_drafter_client",
+    "SpeculatorRunner",
+    "make_drafter_engine",
+    "speculator_worker",
+    "make_speculator_client",
 ]

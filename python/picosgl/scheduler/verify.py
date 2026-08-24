@@ -8,13 +8,13 @@ import torch
 from picosgl.engine import VerifyOutput
 from picosgl.core import Batch, Request, Context
 from picosgl.message import DetokenizeMsg, DraftReplyMsg, DraftStepReq
-from picosgl.speculator import DraftState
+from picosgl.speculator import DraftState, MTPSpeculatorConfig
 from picosgl.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
 
 if TYPE_CHECKING:
-    from picosgl.speculator import DrafterClientBase
+    from picosgl.speculator import SpeculatorClientBase
 
     from .cache import CacheManager
     from .config import SchedulerConfig
@@ -48,13 +48,15 @@ class VerifyManager(ARManagerBase):
         cache_manager : CacheManager,
         table_manager : TableManager,
         eos_token_id  : int,
-        client        : DrafterClientBase,
+        client        : SpeculatorClientBase,
         vocab_size    : int,
     ) -> None:
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
+        speculator_config = config.speculator_config
+        assert isinstance(speculator_config, MTPSpeculatorConfig)
         self.page_table = table_manager.page_table
-        self.num_spec_tokens = config.speculative_num_draft_tokens
-        self.window_size = config.speculator_window_size
+        self.num_spec_tokens = speculator_config.num_draft_tokens
+        self.window_size = speculator_config.window_size
         self.client = client
         self.vocab_size = vocab_size
         self._state_table: dict[int, VerifyState] = {}

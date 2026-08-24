@@ -12,7 +12,7 @@ from picosgl.message import (
     ExitMsg,
     UserMsg,
 )
-from picosgl.speculator import make_drafter_client
+from picosgl.speculator import make_speculator_client
 from picosgl.utils import init_logger, load_tokenizer, div_ceil
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
@@ -52,8 +52,8 @@ class Scheduler(SchedulerIOMixin):
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
-        self.drafter_client = (
-            make_drafter_client(self, config)
+        self.speculator_client = (
+            make_speculator_client(self, config)
             if config.enable_specualtive_decoding else None
         )
 
@@ -61,7 +61,7 @@ class Scheduler(SchedulerIOMixin):
             self.ar_manager = VerifyManager(
                 config, self.device,
                 self.cache_manager, self.table_manager,
-                self.eos_token_id, self.drafter_client,
+                self.eos_token_id, self.speculator_client,
                 config.model_config.vocab_size,
             )
         else:
@@ -108,8 +108,8 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
-        if self.drafter_client is not None:
-            self.drafter_client.destroy()
+        if self.speculator_client is not None:
+            self.speculator_client.destroy()
         self.sync_all_ranks()
         self.engine.shutdown()
 

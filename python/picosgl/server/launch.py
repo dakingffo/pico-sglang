@@ -7,7 +7,7 @@ from dataclasses import replace
 from picosgl.distributed import DistributedInfo
 from picosgl.utils import init_logger
 from picosgl.scheduler import schedule_worker
-from picosgl.speculator import drafter_worker
+from picosgl.speculator import speculator_worker
 from picosgl.tokenizer import tokenize_worker, detokenize_worker
 
 
@@ -40,18 +40,18 @@ def launch_server(run_shell: bool = False) -> None:
                 name=f"picosgl-TP{i}-scheduler",
             ).start()
 
-        enable_drafter_worker: bool = (
-            server_args.enable_dt_separation and server_args.speculative_algorithm is not None
+        enable_speculator_worker: bool = (
+            server_args.dt_separation and server_args.speculative_algorithm is not None
         )
-        if enable_drafter_worker:
+        if enable_speculator_worker:
             mp.Process(
-                target=drafter_worker,
+                target=speculator_worker,
                 kwargs={
                     "args": server_args,
                     "ack_queue": ack_queue,
                 },
                 daemon=False,
-                name="picosgl-drafter",
+                name="picosgl-speculator",
             ).start()
 
         for i in range(server_args.num_tokenizer):
@@ -84,7 +84,7 @@ def launch_server(run_shell: bool = False) -> None:
             name="picosgl-detokenizer-0",
         ).start()
 
-        num_workers = server_args.num_tokenizer + 2 + int(enable_drafter_worker)
+        num_workers = server_args.num_tokenizer + 2 + int(enable_speculator_worker)
         for _ in range(num_workers):
             logger.info(ack_queue.get())
 

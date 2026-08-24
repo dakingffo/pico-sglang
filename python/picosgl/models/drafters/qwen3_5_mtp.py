@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from picosgl.layers import (
-    BaseOP,
     LinearColumnParallel,
     OPList,
     ParallelLMHead,
@@ -15,11 +14,13 @@ from picosgl.layers import (
 from picosgl.layers.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 from picosgl.models import load_weight
 
+from .base import BaseDrafterModel
+
 if TYPE_CHECKING:
     from picosgl.models.config import ModelConfig
 
 
-class Qwen3_5MTPDrafter(BaseOP):
+class Qwen3_5MTPDrafter(BaseDrafterModel):
     """Standalone MTP drafter with its own embedding and LM head.
 
     The checkpoint stores no ``mtp.*`` embed/lm_head keys; those are the target's

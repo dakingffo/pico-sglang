@@ -8,10 +8,42 @@ from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
 from picosgl.layers.qwen3_5.gated_delta_net import (
     Qwen3_5GatedDeltaNet,
     _l2norm,
-    _recurrent_gated_delta_rule_with_snapshots,
 )
 from picosgl.models.config import ModelConfig, RotaryConfig
 from picosgl.utils import torch_dtype
+
+
+def _recurrent_gated_delta_rule_with_snapshots(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+):
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    ]
+    query *= 1 / (query.shape[-1] ** 0.5)
+    state = initial_state.to(torch.float32)
+    outputs = []
+    snapshots = []
+
+    for i in range(query.shape[2]):
+        q_t = query[:, :, i]
+        k_t = key[:, :, i]
+        v_t = value[:, :, i]
+        state = state * g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta[:, :, i].unsqueeze(-1)
+        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        outputs.append((state * q_t.unsqueeze(-1)).sum(dim=-2))
+        snapshots.append(state)
+
+    output = torch.stack(outputs, dim=2).transpose(1, 2).contiguous().to(initial_dtype)
+    return output, torch.stack(snapshots, dim=1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -171,12 +203,13 @@ def test_variable_length_layer_batch_matches_per_request():
     set_global_ctx(reference_ctx)
     try:
         offset = 0
-        with reference_ctx.forward_batch(batch):
-            for req, seq_len in zip(reqs, lengths):
-                reference_output[offset : offset + seq_len] = layer._forward_verify_one(
-                    x[offset : offset + seq_len], req, reference_pool, 0
+        for req, seq_len in zip(reqs, lengths):
+            one_batch = Batch(reqs=[req], phase="verify")
+            with reference_ctx.forward_batch(one_batch):
+                reference_output[offset : offset + seq_len] = layer._forward_verify(
+                    x[offset : offset + seq_len], one_batch, reference_pool, 0
                 )
-                offset += seq_len
+            offset += seq_len
     finally:
         clear_global_ctx()
 

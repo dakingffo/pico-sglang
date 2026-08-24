@@ -35,6 +35,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     from picosgl.layers.attention_backend import validate_attn_backend
     from picosgl.cache import SUPPORTED_CACHE_MANAGER
     from picosgl.layers.moe_backend import SUPPORTED_MOE_BACKENDS
+    from picosgl.speculator import MTPSpeculatorConfig
 
     parser = argparse.ArgumentParser(description="picosgl Server Arguments")
 
@@ -218,14 +219,21 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         "--speculative-num-draft-tokens",
         type=int,
         dest="speculative_num_draft_tokens",
-        default=ServerArgs.speculative_num_draft_tokens,
+        default=MTPSpeculatorConfig.num_draft_tokens,
         help="Number of speculative draft tokens (K) per verify round.",
+    )
+
+    parser.add_argument(
+        "--speculator-window-size",
+        type=int,
+        default=MTPSpeculatorConfig.window_size,
+        help="MTP attention window size.",
     )
 
     parser.add_argument(
         "--enable-dt-separation",
         action="store_true",
-        dest="enable_dt_separation",
+        dest="dt_separation",
         help="Run the drafter on a separate device (requires tp_size + 1 GPUs).",
     )
 
@@ -247,6 +255,18 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         kwargs["max_decode_tokens"] = (
             base * kwargs["speculative_num_draft_tokens"]
             if kwargs["speculative_algorithm"] is not None else base
+        )
+
+    num_draft_tokens = kwargs.pop("speculative_num_draft_tokens")
+    window_size = kwargs.pop("speculator_window_size")
+    if kwargs["speculative_algorithm"] == "MTP":
+        kwargs["speculator_config"] = MTPSpeculatorConfig(
+            num_draft_tokens=num_draft_tokens,
+            window_size=window_size,
+        )
+    elif kwargs["speculative_algorithm"] is not None:
+        parser.error(
+            f"--speculative-algorithm {kwargs['speculative_algorithm']} is not implemented"
         )
 
     from picosgl.utils import resolve_model_path

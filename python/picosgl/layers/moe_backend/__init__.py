@@ -17,18 +17,18 @@ SUPPORTED_MOE_BACKENDS = Registry[MoeBackendCreator]("MoE Backend")
 
 
 @SUPPORTED_MOE_BACKENDS.register("fused")
-def create_fused_moe_backend():
+def make_fused_moe_backend():
     from .fused import FusedMoe
 
     return FusedMoe()
 
 
-def create_moe_backend(backend: str) -> BaseMoeBackend:
+def make_moe_backend(backend: str) -> BaseMoeBackend:
     return SUPPORTED_MOE_BACKENDS[backend]()
 
 
 __all__ = [
     "BaseMoeBackend",
-    "create_moe_backend",
+    "make_moe_backend",
     "SUPPORTED_MOE_BACKENDS",
 ]

@@ -198,45 +198,6 @@ def _recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
-def _recurrent_gated_delta_rule_with_snapshots(
-    query,
-    key,
-    value,
-    g,
-    beta,
-    initial_state,
-):
-    """Batched Torch reference for short verify windows.
-
-    Unlike ``_recurrent_gated_delta_rule``, this returns every intermediate state so
-    callers can snapshot all speculative candidates without splitting the request batch.
-    Query and key are already L2-normalized.
-    """
-    initial_dtype = query.dtype
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32)
-        for x in (query, key, value, beta, g)
-    ]
-    query *= 1 / (query.shape[-1] ** 0.5)
-    state = initial_state.to(torch.float32)
-    outputs = []
-    snapshots = []
-
-    for i in range(query.shape[2]):
-        q_t = query[:, :, i]
-        k_t = key[:, :, i]
-        v_t = value[:, :, i]
-        state = state * g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
-        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta[:, :, i].unsqueeze(-1)
-        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        outputs.append((state * q_t.unsqueeze(-1)).sum(dim=-2))
-        snapshots.append(state)
-
-    output = torch.stack(outputs, dim=2).transpose(1, 2).contiguous().to(initial_dtype)
-    return output, torch.stack(snapshots, dim=1)
-
-
 class _Conv1d(BaseOP):
     def __init__(self, in_channels: int, kernel_size: int):
         self.weight = torch.empty(in_channels, 1, kernel_size)
@@ -404,90 +365,6 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_attn_out = self.norm.forward(core_attn_out, z).reshape(1, seq_len, -1)
         return self.out_proj.forward(core_attn_out).reshape(seq_len, -1)
 
-    def _forward_verify_one(
-        self, x: torch.Tensor, req, pool, L: int
-    ) -> torch.Tensor:
-        """Spec-decode verify step: process a request's n_drafts+1 tokens
-        [old_bonus, draft_0..draft_{n_drafts-1}] as a mini-prefill, writing each token's
-        post-state to the reserve slots R[0..K] (indexed via the state_table tail columns).
-
-        The baseline (req.baseline_slot) may be a reserve slot (R[0] for rounds after the
-        first) that candidate 0 also writes to; that is safe because the baseline is only
-        read at round start, into locals, before any candidate write. Committing the
-        accepted boundary is done by the scheduler via pure index ops (no state copy).
-        Math == n_drafts+1 decode rounds (per-token recurrent rule), which test2 already
-        equates to the chunked prefill rule.
-        """
-        seq_len = x.shape[0]  # n_drafts + 1
-        table_idx = req.table_idx
-        ctx = get_global_ctx()
-        state_table = ctx.state_table
-        rb = ctx.draft_offset
-        assert rb is not None
-        baseline_slot = req.baseline_slot
-        reserve_slots = [
-            int(s) for s in state_table[table_idx, rb : rb + seq_len]
-        ]
-
-        mixed_qkv = self.in_proj_qkv.forward(x).transpose(0, 1).unsqueeze(0)  # (1, conv_dim, seq)
-        z = self.in_proj_z.forward(x).reshape(1, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b.forward(x).unsqueeze(0)  # (1, seq, num_v_heads)
-        a = self.in_proj_a.forward(x).unsqueeze(0)
-
-        conv_in = torch.cat(
-            [pool.conv_state[baseline_slot, L].unsqueeze(0), mixed_qkv], dim=-1
-        )
-        total_len = conv_in.shape[-1]
-        conv_out = F.silu(
-            F.conv1d(
-                conv_in, self.conv1d.weight, None,
-                padding=self.conv_kernel_size - 1, groups=self.conv_dim,
-            )
-        )
-        mixed_qkv = conv_out[:, :, :total_len][:, :, -seq_len:]
-        # conv_state after token j = the last state_len entries of [baseline | tokens 0..j]
-        # = conv_in[:, :, j+1 : state_len+j+1]  (direct slice, no sequential conv).
-        for j in range(seq_len):
-            pool.conv_state[reserve_slots[j], L].copy_(
-                conv_in[0, :, j + 1 : self.state_len + j + 1]
-            )
-
-        query, key, value = torch.split(mixed_qkv.transpose(1, 2), [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(1, seq_len, -1, self.head_k_dim)
-        key = key.reshape(1, seq_len, -1, self.head_k_dim)
-        value = value.reshape(1, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # Per-token recurrent rule (n_drafts+1 sequential steps, exactly like n_drafts+1 decode
-        # rounds). The rule never mutates its input, so the baseline can be passed as a
-        # view; each step's final state is snapshotted to its circular slot.
-        # per-token output is (num_v_heads, head_v_dim); flatten like the chunked rule
-        # (which yields (1, seq, num_v_heads, head_v_dim)) before norm/out_proj.
-        core_attn_out = torch.empty(
-            seq_len, self.num_v_heads, self.head_v_dim, device=x.device, dtype=x.dtype
-        )
-        state = pool.recurrent_state[baseline_slot, L]
-        for j in range(seq_len):
-            out_j, state_j = _recurrent_gated_delta_rule(
-                query[:, j : j + 1], key[:, j : j + 1], value[:, j : j + 1],
-                g=g[:, j : j + 1], beta=beta[:, j : j + 1],
-                initial_state=state.unsqueeze(0), output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            state = state_j[0]  # (num_v_heads, k_dim, v_dim)
-            core_attn_out[j] = out_j[0, 0]
-            pool.recurrent_state[reserve_slots[j], L].copy_(state)
-
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm.forward(core_attn_out, z).reshape(1, seq_len, -1)
-        return self.out_proj.forward(core_attn_out).reshape(seq_len, -1)
-
     def _forward_verify(self, x: torch.Tensor, batch, pool, L: int) -> torch.Tensor:
         """Batched verify for packed request-major ``[old_bonus, drafts]`` rows.
 
@@ -495,6 +372,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         launch.  Tail requests can have fewer drafts, so distinct lengths are kept in
         separate groups instead of padding and accidentally advancing their states.
         """
+        assert x.is_cuda
         ctx = get_global_ctx()
         state_table = ctx.state_table
         rb = ctx.draft_offset
@@ -583,26 +461,16 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             key = _l2norm(key, dim=-1, eps=1e-6)
             initial_state = pool.recurrent_state[baseline_slots, L]
 
-            if x.is_cuda:
-                group_out = recurrent_gated_delta_triton(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    initial_state,
-                    write_slots,
-                    pool.recurrent_state[:, L],
-                )
-            else:
-                group_out, snapshots = _recurrent_gated_delta_rule_with_snapshots(
-                    query, key, value, g, beta, initial_state
-                )
-                pool.recurrent_state[:, L].index_copy_(
-                    0,
-                    write_slots.flatten().to(torch.int64),
-                    snapshots.flatten(0, 1).to(pool.dtype),
-                )
+            group_out = recurrent_gated_delta_triton(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state,
+                write_slots,
+                pool.recurrent_state[:, L],
+            )
             core_attn_out.index_copy_(0, row_indices, group_out.flatten(0, 1))
 
         core_attn_out = self.norm.forward(

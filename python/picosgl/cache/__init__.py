@@ -30,7 +30,7 @@ class CacheManagerCreator(Protocol):
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
-def create_kvcache_pool(
+def make_kvcache_pool(
     model_config: ModelConfig,
     num_pages   : int,
     page_size   : int,
@@ -75,7 +75,7 @@ def linear_state_slot_bytes_for_config(model_config: ModelConfig, dtype: torch.d
     return model_config.num_linear_layers * per_layer * dtype.itemsize
 
 
-def create_linear_state_pool(
+def make_linear_state_pool(
     model_config   : ModelConfig,
     num_slots      : int,
     device         : torch.device,
@@ -100,34 +100,34 @@ def create_linear_state_pool(
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
-def create_naive_cache(device: torch.device):
+def make_naive_cache(device: torch.device):
     from .naive_prefix_cache import NaivePrefixCache
 
     return NaivePrefixCache(device=device)
 
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
-def create_radix_cache(device: torch.device):
+def make_radix_cache(device: torch.device):
     from .radix_prefix_cache import RadixTreeNode, RadixPrefixCache
 
     return RadixPrefixCache(device=device, node_type=RadixTreeNode)
 
 
 @SUPPORTED_CACHE_MANAGER.register("hybrid_radix")
-def create_hybrid_radix_cache(device: torch.device):
+def make_hybrid_radix_cache(device: torch.device):
     from .radix_prefix_cache import HybridRadixTreeNode, RadixPrefixCache
 
     return RadixPrefixCache(device=device, node_type=HybridRadixTreeNode)
 
 
-def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
+def make_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
     return SUPPORTED_CACHE_MANAGER[type](device)
 
 
 __all__ = [
-    "create_kvcache_pool",
-    "create_linear_state_pool",
-    "create_prefix_cache",
+    "make_kvcache_pool",
+    "make_linear_state_pool",
+    "make_prefix_cache",
     "linear_state_slot_bytes_for_config",
     "BaseKVCachePool",
     "BaseCacheHandle",

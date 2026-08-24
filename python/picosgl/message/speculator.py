@@ -8,7 +8,7 @@ from .utils import deserialize_type, serialize_type
 
 
 class BaseDrafterMsg:
-    """Control-plane message between the target (rank0) and the drafter process.
+    """Control-plane message between the target (rank0) and the speculator process.
 
     Payloads are scalars / int lists / SamplingParams only — the heavy tensors
     (carry_hidden, appended hidden, draft_probs) cross the NCCL data plane, keyed by the

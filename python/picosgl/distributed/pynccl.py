@@ -71,7 +71,7 @@ def init_pynccl(
     return cast(PyNCCLCommunicator, cls(tp_rank, tp_size, max_size_bytes, nccl_id))
 
 
-def create_nccl_uid_bytes() -> bytes:
+def make_nccl_uid_bytes() -> bytes:
     """Create a fresh ncclUniqueId and return its 128 raw bytes (for the zmq handshake)."""
     return bytes((v & 0xFF for v in _load_nccl_module().create_nccl_uid()))
 

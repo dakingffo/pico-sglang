@@ -214,8 +214,8 @@ def test3_full_model(mcfg, loaded=None):
     print("=" * 60)
     print("Test 3: full model prefill vs decode logits (paged flashinfer)")
     from picosgl.core import Context, get_global_ctx, set_global_ctx, Request
-    from picosgl.cache import create_kvcache_pool, LinearStatePool
-    from picosgl.layers.attention_backend import create_attention_backend
+    from picosgl.cache import make_kvcache_pool, LinearStatePool
+    from picosgl.layers.attention_backend import make_attention_backend
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
@@ -230,7 +230,7 @@ def test3_full_model(mcfg, loaded=None):
     )
     ctx = Context(page_size=64)
     num_pages = 4096
-    ctx.kv_cache = create_kvcache_pool(
+    ctx.kv_cache = make_kvcache_pool(
         model_config=mcfg, num_pages=num_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
@@ -256,7 +256,7 @@ def test3_full_model(mcfg, loaded=None):
     ctx.page_table[:, : num_pages] = base  # req r token i -> page r*num_pages + i
     set_global_ctx(ctx)  # backend reads ctx.kv_cache via get_global_ctx()
     ctx._debug_attn = True
-    ctx.attn_backend = create_attention_backend("fi", mcfg)
+    ctx.attn_backend = make_attention_backend("fi", mcfg)
 
     tokenizer = __import__("transformers").AutoTokenizer.from_pretrained(MODEL_PATH)
     tokens = tokenizer("The quick brown fox jumps over the lazy dog and the", return_tensors="pt")

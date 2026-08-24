@@ -21,7 +21,7 @@ from .drafters.mtp import MTPState
 logger = init_logger(__name__)
 
 
-class DrafterRunner:
+class SpeculatorRunner:
     def __init__(
         self,
         engine    : EngineBase,
@@ -53,7 +53,7 @@ class DrafterRunner:
         self.data_plane.init_rank1(handshake.nccl_uid, sizes)
         self.reply.put(DraftHandshakeAckMsg())
         logger.info(
-            "Drafter ready: window_size=%d hidden_size=%d vocab_size=%d device=%s",
+            "Speculator ready: window_size=%d hidden_size=%d vocab_size=%d device=%s",
             self.window_size, self.hidden_size, self.vocab_size, self.engine.device,
         )
 
@@ -67,7 +67,7 @@ class DrafterRunner:
                 elif isinstance(msg, DraftRemoveMsg):
                     self.states.pop(msg.uid, None)
                 else:
-                    raise NotImplementedError(f"unknown drafter message: {msg!r}")
+                    raise NotImplementedError(f"unknown speculator message: {msg!r}")
         except KeyboardInterrupt:
             pass
 

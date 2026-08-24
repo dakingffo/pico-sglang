@@ -84,7 +84,7 @@ def test_reject_sample_groups_lengths_and_sampling_modes() -> None:
         ]
     )
 
-    output = sampler.reject_sample(logits, batch, sample_args=None)
+    output = sampler.reject_sample(logits, batch)
 
     expected = torch.tensor(
         [

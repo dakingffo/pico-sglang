@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 import torch
 
 from picosgl.core import SamplingParams
-from picosgl.distributed import create_nccl_uid_bytes
+from picosgl.distributed import make_nccl_uid_bytes
 from picosgl.message import (
     BaseDrafterMsg,
     DraftHandshakeAckMsg,
@@ -20,13 +20,13 @@ from picosgl.message import (
 from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
 
 from .data_plane import DataPlaneSizes, NCCLDataPlane
-from .drafters.mtp import MTPEngine, MTPState
+from .drafters.mtp import MTPEngine, MTPSpeculatorConfig, MTPState
 
 if TYPE_CHECKING:
     from picosgl.scheduler.config import SchedulerConfig
     from picosgl.scheduler.io import SchedulerIOMixin
 
-class DrafterClientBase(ABC):
+class SpeculatorClientBase(ABC):
     def __init__(
         self,
         config      : SchedulerConfig,
@@ -39,8 +39,12 @@ class DrafterClientBase(ABC):
         self.device = device
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        self.num_spec_tokens = config.speculative_num_draft_tokens
-        self.window_size = window_size if window_size is not None else config.speculator_window_size
+        speculator_config = config.speculator_config
+        assert isinstance(speculator_config, MTPSpeculatorConfig)
+        self.num_spec_tokens = speculator_config.num_draft_tokens
+        self.window_size = (
+            window_size if window_size is not None else speculator_config.window_size
+        )
 
     @abstractmethod
     def init(
@@ -76,7 +80,7 @@ class DrafterClientBase(ABC):
         ...
 
 
-class MainDrafterClient(DrafterClientBase):
+class MainSpeculatorClient(SpeculatorClientBase):
     """Primary-rank side: drafts, then broadcasts the result to the other TP ranks."""
 
     def __init__(
@@ -112,7 +116,7 @@ class MainDrafterClient(DrafterClientBase):
         ...
 
 
-class LocalDrafterClient(MainDrafterClient):
+class LocalSpeculatorClient(MainSpeculatorClient):
     def __init__(
         self,
         config      : SchedulerConfig,
@@ -186,7 +190,7 @@ class LocalDrafterClient(MainDrafterClient):
         return
 
 
-class RemoteDrafterClient(MainDrafterClient):
+class RemoteSpeculatorClient(MainSpeculatorClient):
     def __init__(
         self,
         config      : SchedulerConfig,
@@ -212,7 +216,7 @@ class RemoteDrafterClient(MainDrafterClient):
         max_hidden_rows = max(self.window_size, self.config.max_running_req * (K + 1))
         max_prob_rows = self.config.max_running_req * K
         sizes = DataPlaneSizes(max_hidden_rows, self.hidden_size, max_prob_rows, self.vocab_size)
-        uid = create_nccl_uid_bytes()
+        uid = make_nccl_uid_bytes()
         # uid must go out before the blocking NCCL init (both ranks block in ncclCommInitRank).
         self.sender.put(
             DraftHandshakeMsg(
@@ -275,8 +279,8 @@ class RemoteDrafterClient(MainDrafterClient):
         self.receiver.stop()
 
 
-class BroadcastDrafterClient(DrafterClientBase):
-    """Non-primary-rank stand-in for ``DrafterClientBase``.
+class BroadcastSpeculatorClient(SpeculatorClientBase):
+    """Non-primary-rank stand-in for ``SpeculatorClientBase``.
 
     Only rank0 has the zmq/NCCL client; other TP ranks receive the draft results rank0
     broadcasts (``scheduler.io``) and present the same ``step`` interface so

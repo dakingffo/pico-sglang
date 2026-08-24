@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from picosgl.core import Request
-from picosgl.cache import BaseCacheHandle, MatchResult, create_prefix_cache
+from picosgl.cache import BaseCacheHandle, MatchResult, make_prefix_cache
 from picosgl.utils import align_down, div_ceil
 
 if TYPE_CHECKING:
@@ -30,7 +30,7 @@ class CacheManager:
         # the `_free_pages` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         self.free_pages = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         self.free_states = torch.arange(num_states, dtype=torch.int32, device=device)
-        self.prefix_cache = create_prefix_cache(device=device, type=type)
+        self.prefix_cache = make_prefix_cache(device=device, type=type)
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table

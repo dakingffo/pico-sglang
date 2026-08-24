@@ -7,30 +7,49 @@ import torch
 
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.message import BaseDrafterMsg, DraftStepMsg
-from picosgl.models.drafters import Qwen3_5MTPDrafter
+from picosgl.models.drafters import BaseDrafterModel
 from picosgl.message.queue import ZmqPullQueue, ZmqPushQueue
-from picosgl.utils import torch_dtype
+from picosgl.utils import Registry
 
+from .base import EngineBase
 from .data_plane import NCCLDataPlane
 from .drafters.mtp import MTPEngine
-from .runner import DrafterRunner
-from .client import BroadcastDrafterClient, DrafterClientBase, LocalDrafterClient, RemoteDrafterClient
+from .runner import SpeculatorRunner
+from .client import (
+    BroadcastSpeculatorClient,
+    LocalSpeculatorClient,
+    RemoteSpeculatorClient,
+    SpeculatorClientBase,
+)
 
 if TYPE_CHECKING:
-    from picosgl.engine.config import EngineConfig
     from picosgl.scheduler.config import SchedulerConfig
     from picosgl.scheduler.scheduler import Scheduler
 
 
-# independent drafter process
+SUPPORTED_DRAFTER_ENGINE = Registry[type[EngineBase]]("Drafter Engine")
+SUPPORTED_DRAFTER_ENGINE.register("MTP")(MTPEngine)
+
+
+def make_drafter_engine(
+    drafter: BaseDrafterModel | None,
+    device : torch.device,
+    config : SchedulerConfig,
+) -> EngineBase:
+    algorithm = config.speculative_algorithm
+    assert algorithm is not None
+    return SUPPORTED_DRAFTER_ENGINE[algorithm].from_config(drafter, device, config)
+
+
+# independent speculator process when DT separation is enabled
 @torch.inference_mode()
-def drafter_worker(
+def speculator_worker(
     *,
     args      : SchedulerConfig,
     ack_queue : mp.Queue[str] | None = None,
 ) -> None:
     device = torch.device(
-        f"cuda:{args.tp_info.size}" if args.enable_dt_separation else "cuda:0"
+        f"cuda:{args.tp_info.size}" if args.dt_separation else "cuda:0"
     )
     torch.cuda.set_device(device)
     torch.manual_seed(42)
@@ -42,68 +61,37 @@ def drafter_worker(
     # (LinearColumnParallel etc.) read the global TP info, which the main engine sets for
     # itself — this process must set it before constructing the model.
     with tp_override(DistributedInfo(0, 1)):
-        with torch_dtype(args.dtype):
-            model = Qwen3_5MTPDrafter(args.model_config)
-        model.load_weights(args.speculative_draft_model_path, device)
-        K = args.speculative_num_draft_tokens
-        engine = MTPEngine(
-            model,
-            device,
-            args.model_config.vocab_size,
-            K,
-            args.max_running_req,
-            args.speculator_window_size,
-            min(args.max_running_req, args.decode_batch_budget // K),
-            args.attention_backend,
-        )
-        runner = DrafterRunner(
-            engine,
+        runner = SpeculatorRunner(
+            engine=make_drafter_engine(None, device, args),
             data_plane=NCCLDataPlane(device, rank=1, dtype=args.dtype),
             recv=ZmqPullQueue(args.zmq_drafter_addr, create=False, decoder=DraftStepMsg.decoder), 
             reply=ZmqPushQueue(args.zmq_drafter_reply_addr, create=False, encoder=BaseDrafterMsg.encoder)
         )
 
         if ack_queue is not None:
-            ack_queue.put("Drafter is ready")
+            ack_queue.put("Speculator is ready")
         runner.run_forever()
 
 
-# called by engine
-def make_local_drafter(device: torch.device, config: EngineConfig):
-    with tp_override(DistributedInfo(0, 1)):
-        mc = config.model_config
-        with torch_dtype(config.dtype):
-            drafter = Qwen3_5MTPDrafter(mc)
-        drafter.load_weights(config.speculative_draft_model_path, device)
-    return drafter
-
-
 # called by scheduler
-def make_drafter_client(sche: Scheduler, config: SchedulerConfig) -> DrafterClientBase:
+def make_speculator_client(
+    sche: Scheduler, config: SchedulerConfig
+) -> SpeculatorClientBase:
     mc = config.model_config
     if not config.tp_info.is_primary():
-        return BroadcastDrafterClient(
+        return BroadcastSpeculatorClient(
             config, sche.device, mc.vocab_size, mc.hidden_size,
             scheduler_io=sche
         )
-    if config.enable_dt_separation:
-        return RemoteDrafterClient(
+    if config.dt_separation:
+        return RemoteSpeculatorClient(
             config, sche.device, mc.vocab_size, mc.hidden_size,
             scheduler_io=sche
         )
     else:
-        K = config.speculative_num_draft_tokens
-        engine = MTPEngine(
-            sche.engine.drafter,
-            sche.device,
-            mc.vocab_size,
-            K,
-            config.max_running_req,
-            config.speculator_window_size,
-            min(config.max_running_req, config.decode_batch_budget // K),
-            config.attention_backend,
-        )
-        return LocalDrafterClient(
+        engine = sche.engine.speculator
+        assert engine is not None
+        return LocalSpeculatorClient(
             config, sche.device, mc.vocab_size, mc.hidden_size,
             engine=engine, scheduler_io=sche
         )

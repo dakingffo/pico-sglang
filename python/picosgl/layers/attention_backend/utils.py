@@ -12,7 +12,7 @@ class BaseCaptureData:
     page_table: torch.Tensor
 
     @classmethod
-    def create(cls, max_bs: int, max_seq_len: int, device: torch.device, **kwargs):
+    def make(cls, max_bs: int, max_seq_len: int, device: torch.device, **kwargs):
         return cls(
             seq_lens=torch.ones((max_bs,), dtype=torch.int32, device=device),
             positions=torch.zeros((max_bs,), dtype=torch.int32, device=device),
