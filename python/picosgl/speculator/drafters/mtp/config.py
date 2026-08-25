@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 class MTPSpeculatorConfig(BaseSpeculatorConfig):
     algorithm: ClassVar[str] = "MTP"
 
-    num_draft_tokens: int = 4
+    num_draft_tokens: int = 3
     window_size     : int = 128
 
     @property
