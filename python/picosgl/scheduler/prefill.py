@@ -12,7 +12,7 @@ from picosgl.core import (
     Batch, 
     Context 
 )
-from picosgl.utils import init_logger
+from picosgl.utils import init_logger, align_ceil
 
 from .ar import ForwardInput, ForwardOutput
 
@@ -58,7 +58,7 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_len = align_ceil(extend_len + req.output_len, self.cache_manager.page_size)
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None

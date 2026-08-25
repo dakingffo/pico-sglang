@@ -592,18 +592,26 @@ def summarize(
     first_times = [t[1] - t[0] for t in tics_all]
     accum_times = [t[i + 1] - t[i] for t in tics_all for i in range(1, len(t) - 1)]
     e2e_times = [t[-1] - t[0] for t in tics_all]
+    ttft_ms = _stats(first_times)
+    tpot_ms = _stats(accum_times)
+    if mtp and avg_accept > 0:
+        # MTP chunks are verify rounds; report per-token TPOT instead of per-round.
+        tpot_ms = [v / avg_accept for v in tpot_ms]
+    # stage-separated throughput: each rate over its own phase wall time
+    firsts = [t[1] for t in tics_all]
+    prefill_span = max(firsts) - start  # batch start -> last first token (prefill done)
+    decode_span = end - min(firsts)     # first first token -> batch end
     return {
         "n": n,
         "in_tokens": in_tokens,
         "requested_out": requested,
         "out_tokens": out_tokens,
         "duration_s": dur,
-        "prefill_tok_per_s": in_tokens / dur if dur > 0 else 0.0,
-        "decode_tok_per_s": out_tokens / dur if dur > 0 else 0.0,
-        "total_tok_per_s": (in_tokens + out_tokens) / dur if dur > 0 else 0.0,
+        "prefill_tok_per_s": in_tokens / prefill_span if prefill_span > 0 else 0.0,
+        "decode_tok_per_s": out_tokens / decode_span if decode_span > 0 else 0.0,
         "req_per_s": n / dur if dur > 0 else 0.0,
-        "ttft_ms": _stats(first_times),
-        "tpot_ms": _stats(accum_times),
+        "ttft_ms": ttft_ms,
+        "tpot_ms": tpot_ms,
         "e2e_s": _stats(e2e_times, scale=1.0),
         "rounds": sum_rounds,
         "avg_accept": avg_accept,
@@ -631,8 +639,7 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
     print(f"  prompts: {s['n']}  input: {s['in_tokens']} tok  output: {s['out_tokens']} tok"
           f"{short}  duration: {s['duration_s']:.2f}s")
     print(f"  prefill: {s['prefill_tok_per_s']:10.1f} input-tok/s")
-    print(f"  decode:  {s['decode_tok_per_s']:10.1f} output-tok/s")
-    print(f"  total:   {s['total_tok_per_s']:10.1f} tok/s   {s['req_per_s']:8.2f} req/s")
+    print(f"  decode:  {s['decode_tok_per_s']:10.1f} output-tok/s   {s['req_per_s']:8.2f} req/s")
     print(f"  TTFT(ms): avg {_fmt_ms(t[0])}  p50 {_fmt_ms(t[1])}  p90 {_fmt_ms(t[2])}  "
           f"p99 {_fmt_ms(t[3])}  max {_fmt_ms(t[4])}")
     print(f"  TPOT(ms): avg {_fmt_ms(p[0])}  p50 {_fmt_ms(p[1])}  p90 {_fmt_ms(p[2])}  "
@@ -647,10 +654,10 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
 def print_conc_summary(rows: list[tuple[int, dict]]) -> None:
     print("=" * 66)
     print("  concurrency sweep")
-    print(f"  {'conc':>6} {'decode':>10} {'total':>10} {'req/s':>8} "
+    print(f"  {'conc':>6} {'prefill':>10} {'decode':>10} {'req/s':>8} "
           f"{'TTFT p50':>10} {'TPOT p50':>10}")
     for conc, s in rows:
-        print(f"  {conc:>6} {s['decode_tok_per_s']:>10.1f} {s['total_tok_per_s']:>10.1f} "
+        print(f"  {conc:>6} {s['prefill_tok_per_s']:>10.1f} {s['decode_tok_per_s']:>10.1f} "
               f"{s['req_per_s']:>8.2f} {s['ttft_ms'][1]:>10.2f} {s['tpot_ms'][1]:>10.2f}")
     print("=" * 66)
 
@@ -660,7 +667,6 @@ def print_compare(a: dict, b: dict) -> None:
     print(f"  {'':>18} {'non-mtp':>12} {'mtp':>12} {'speedup':>10}")
     for key, name in [
         ("decode_tok_per_s", "decode tok/s"),
-        ("total_tok_per_s", "total tok/s"),
         ("req_per_s", "req/s"),
     ]:
         va, vb = a[key], b[key]
