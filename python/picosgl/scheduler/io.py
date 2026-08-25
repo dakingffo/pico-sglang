@@ -91,13 +91,10 @@ class SchedulerIOMixin:
 
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
+        pending_raw_msgs: list[bytes] = []
         if blocking:
             self.run_when_idle()
-            raw = self._recv_from_tokenizer.get_raw()
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
-
-        pending_raw_msgs: list[bytes] = []
+            pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
@@ -114,7 +111,6 @@ class SchedulerIOMixin:
         pending_msgs: list[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            pending_msgs.append(self._recv_from_rank0.get())
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)

@@ -1,3 +1,9 @@
+# Diagnostics: SIGUSR1 to any picosgl process dumps its Python stacks (faulthandler).
+import faulthandler
+import signal
+
+faulthandler.register(signal.SIGUSR1)
+
 from .arch import is_arch_supported, is_sm90_supported, is_sm100_supported
 from .logger import init_logger
 from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even

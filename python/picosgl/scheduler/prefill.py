@@ -95,7 +95,7 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        self.reserved_size += align_ceil(remain_len + pending_req.output_len, self.cache_manager.page_size)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         device_ids = self.table_manager.token_pool[table_idx, cached_len: cached_len + chunk_size]
         device_ids.copy_(
