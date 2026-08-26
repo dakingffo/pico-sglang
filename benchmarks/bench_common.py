@@ -60,6 +60,11 @@ BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
         "default": None,
         "help": "comma-separated dataset categories to include",
     },
+    "--out": {
+        "type": str,
+        "default": None,
+        "help": "incrementally write completed benchmark points to this JSON file",
+    },
     "--no-warmup": {"action": "store_true", "help": "skip the warmup request before the timed batch"},
     "--no-pbar": {"action": "store_true", "help": "disable the progress counter"},
 }
@@ -280,6 +285,29 @@ def input_label(dataset: str | None, input_lens: list[int], fallback: int) -> st
     return f"dataset(avg={mean_len:.0f})"
 
 
+def split_warmup_prompt(
+    prompts   : list[str],
+    input_lens: list[int],
+    warmup    : bool,
+) -> tuple[str | None, list[str], list[int]]:
+    """Remove one distinct prompt from the measured batch for warmup."""
+    if not warmup:
+        return None, prompts, input_lens
+    assert prompts, "warmup requires one extra prompt"
+    return prompts[-1], prompts[:-1], input_lens[:-1]
+
+
+def save_json(path: str | None, data: Any) -> None:
+    """Atomically persist every completed point so an interrupted matrix is useful."""
+    if path is None:
+        return
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+    print(f"  wrote {path}", flush=True)
+
+
 # -------------------------------------------------------------------------------------
 # server lifecycle: launch / ready / kill
 # -------------------------------------------------------------------------------------
@@ -343,8 +371,11 @@ def make_server_cmd(server_argv: list[str], *, port: int, enable_specualtive_dec
         i += 1
     argv += ["--port", str(port)]
     if enable_specualtive_decoding:
-        model_path = _flag_value(server_argv, "--model-path")
-        assert model_path, "MTP bench needs --model-path"
+        model_path = (
+            _flag_value(server_argv, "--model-path")
+            or _flag_value(server_argv, "--model")
+        )
+        assert model_path, "MTP bench needs --model-path/--model"
         argv += ["--speculative-algorithm", "MTP",
                  "--speculative-num-draft-tokens", str(num_spec_tokens),
                  "--speculative-draft-model-path", model_path]
@@ -437,9 +468,10 @@ async def stream_one(client: Any, base: str, model: str, prompt: str, output_len
 
     Every ``data: {json}`` line is exactly one detokenizer ack (one token per ack on the
     non-MTP path, one verify round per ack on the MTP path). ``data: [DONE]`` is the
-    terminator. ``ignore_eos + top_k=1 + temperature=0`` makes every request greedy and
-    deterministic, and the server delivers the full ``max_tokens`` budget -- see
-    ``summarize``.
+    terminator. Its arrival timestamp is retained as the request completion boundary,
+    matching SGLang's serving benchmark. ``ignore_eos + top_k=1 + temperature=0`` makes
+    every request greedy and deterministic, and the server delivers the full
+    ``max_tokens`` budget -- see ``summarize``.
     """
     payload = {
         "model": model,
@@ -458,6 +490,7 @@ async def stream_one(client: Any, base: str, model: str, prompt: str, output_len
                 continue
             data = line[len("data: "):]
             if data == "[DONE]":
+                tics.append(time.perf_counter())
                 break
             tics.append(time.perf_counter())
     if progress is not None:
@@ -473,7 +506,7 @@ async def run_online_bench_tics(
     output_lengths: list[int],
     *,
     mtp: bool = False,
-    warmup: bool = True,
+    warmup_prompt: str | None = None,
     pbar: bool = True,
 ) -> tuple[dict, list[list[float]]]:
     """Drive the workload, returning (summary, per-request tics) for split reporting."""
@@ -485,9 +518,11 @@ async def run_online_bench_tics(
         limits=httpx.Limits(max_connections=1024, max_keepalive_connections=128),
     )
     try:
-        if warmup and prompts:
+        if warmup_prompt is not None:
             # flush Triton autotune / CUDA graph capture / lazy detokenizer init
-            await stream_one(client, base, model, prompts[0], min(8, output_lengths[0]))
+            await stream_one(
+                client, base, model, warmup_prompt, min(8, output_lengths[0])
+            )
         progress = _Progress(len(prompts), on=pbar and len(prompts) > 1)
         tics_all = await asyncio.gather(*[
             stream_one(client, base, model, p, o, progress)
@@ -508,12 +543,12 @@ async def run_online_bench(
     output_lengths: list[int],
     *,
     mtp: bool = False,
-    warmup: bool = True,
+    warmup_prompt: str | None = None,
     pbar: bool = True,
 ) -> dict:
     summary, _ = await run_online_bench_tics(
         base, model, prompts, input_lengths, output_lengths,
-        mtp=mtp, warmup=warmup, pbar=pbar,
+        mtp=mtp, warmup_prompt=warmup_prompt, pbar=pbar,
     )
     return summary
 
@@ -566,10 +601,10 @@ def summarize(
     n = len(tics_all)
     in_tokens = sum(input_lengths)
     requested = sum(output_lengths)
-    # len(tics)-1 == number of JSON chunks (incl. the trailing finish_reason chunk).
-    # rounds == chunks - 1 == content chunks: per-token (non-MTP) or per-verify-round (MTP).
-    rounds = [max(len(t) - 2, 0) for t in tics_all]
-    sum_rounds = sum(rounds)
+    # Each trace is [request start, content chunks..., finish_reason, DONE]. The two
+    # trailing protocol chunks are not model output: AR has one content chunk per token;
+    # MTP has one prefill-token chunk followed by one chunk per verify round.
+    content_chunks = [max(len(t) - 3, 0) for t in tics_all]
     # Actual generated token count:
     #  - MTP: each verify round commits num_sampled tokens; the server delivers the full
     #    max_tokens budget. Verified on Qwen3.5-0.8B: max_tokens=8/16 -> 8/16 tokens.
@@ -578,43 +613,59 @@ def summarize(
     #    complete_n time instead of reading the pipeline-advanced device_len).
     if mtp:
         out_tokens = requested
-        avg_accept = out_tokens / sum_rounds if sum_rounds > 0 else 0.0
-        # sanity: spec-decode rounds are never more than the tokens they carry
-        chunks_ok = 0 < sum_rounds <= requested
+        # The first content chunk of each request is sampled by prefill. Every later
+        # chunk is one verify round containing one mandatory target token plus zero or
+        # more accepted drafts.
+        verify_rounds = sum(max(chunks - 1, 0) for chunks in content_chunks)
+        verify_tokens = requested - sum(min(length, 1) for length in output_lengths)
+        avg_accept = (
+            verify_tokens / verify_rounds - 1 if verify_rounds > 0 else 0.0
+        )
+        chunks_ok = all(
+            chunks >= min(length, 1)
+            for chunks, length in zip(content_chunks, output_lengths, strict=True)
+        ) and 0 <= verify_rounds <= verify_tokens
     else:
-        out_tokens = sum_rounds
+        verify_rounds = 0
+        out_tokens = sum(content_chunks)
         avg_accept = 0.0  # one chunk == one token; avg_accept is MTP-only
-        chunks_ok = sum_rounds == requested  # full budget delivered
+        chunks_ok = out_tokens == requested  # full budget delivered
 
     start = min(t[0] for t in tics_all)
     end = max(t[-1] for t in tics_all)
     dur = end - start
     first_times = [t[1] - t[0] for t in tics_all]
-    accum_times = [t[i + 1] - t[i] for t in tics_all for i in range(1, len(t) - 1)]
     e2e_times = [t[-1] - t[0] for t in tics_all]
     ttft_ms = _stats(first_times)
-    tpot_ms = _stats(accum_times)
-    if mtp and avg_accept > 0:
-        # MTP chunks are verify rounds; report per-token TPOT instead of per-round.
-        tpot_ms = [v / avg_accept for v in tpot_ms]
-    # stage-separated throughput: each rate over its own phase wall time
-    firsts = [t[1] for t in tics_all]
-    prefill_span = max(firsts) - start  # batch start -> last first token (prefill done)
-    decode_span = end - min(firsts)     # first first token -> batch end
+    # Match SGLang/vLLM serving semantics exactly: TPOT=(E2E-TTFT)/(O-1), where E2E
+    # ends when [DONE] arrives. This remains well-defined when one MTP chunk delivers
+    # several committed tokens at once.
+    tpot_times = [
+        (t[-1] - t[1]) / (output_len - 1) if output_len > 1 else 0.0
+        for t, output_len in zip(tics_all, output_lengths, strict=True)
+    ]
+    tpot_ms = _stats(tpot_times)
+    # HTTP timestamps cannot isolate a pure decode phase under continuous batching.
+    # Report client-observed output throughput over the complete batch makespan.
+    output_tok_per_s = out_tokens / dur if dur > 0 else 0.0
     return {
         "n": n,
         "in_tokens": in_tokens,
         "requested_out": requested,
         "out_tokens": out_tokens,
         "duration_s": dur,
-        "prefill_tok_per_s": in_tokens / prefill_span if prefill_span > 0 else 0.0,
-        "decode_tok_per_s": out_tokens / decode_span if decode_span > 0 else 0.0,
+        "prefill_tok_per_s": in_tokens / max(first_times) if first_times else 0.0,
+        "output_tok_per_s": output_tok_per_s,
+        # Compatibility alias for existing result readers. This is serving output
+        # throughput, not an isolated decode-kernel throughput.
+        "decode_tok_per_s": output_tok_per_s,
         "req_per_s": n / dur if dur > 0 else 0.0,
         "ttft_ms": ttft_ms,
         "tpot_ms": tpot_ms,
         "e2e_s": _stats(e2e_times, scale=1.0),
-        "rounds": sum_rounds,
+        "rounds": verify_rounds,
         "avg_accept": avg_accept,
+        "is_mtp": mtp,
         "chunks_ok": chunks_ok,
     }
 
@@ -639,22 +690,22 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
     print(f"  prompts: {s['n']}  input: {s['in_tokens']} tok  output: {s['out_tokens']} tok"
           f"{short}  duration: {s['duration_s']:.2f}s")
     print(f"  prefill: {s['prefill_tok_per_s']:10.1f} input-tok/s")
-    print(f"  decode:  {s['decode_tok_per_s']:10.1f} output-tok/s   {s['req_per_s']:8.2f} req/s")
+    print(f"  output:  {s['output_tok_per_s']:10.1f} output-tok/s   {s['req_per_s']:8.2f} req/s")
     print(f"  TTFT(ms): avg {_fmt_ms(t[0])}  p50 {_fmt_ms(t[1])}  p90 {_fmt_ms(t[2])}  "
           f"p99 {_fmt_ms(t[3])}  max {_fmt_ms(t[4])}")
     print(f"  TPOT(ms): avg {_fmt_ms(p[0])}  p50 {_fmt_ms(p[1])}  p90 {_fmt_ms(p[2])}  "
           f"p99 {_fmt_ms(p[3])}  max {_fmt_ms(p[4])}")
     print(f"  E2E(s):   avg {e[0]:>7.3f}  p50 {e[1]:>7.3f}  p90 {e[2]:>7.3f}  "
           f"p99 {e[3]:>7.3f}  max {e[4]:>7.3f}")
-    if s.get("avg_accept"):
-        print(f"  verify rounds: {s['rounds']}  avg_accept: {s['avg_accept']:.2f} tok/round")
+    if s.get("is_mtp"):
+        print(f"  verify rounds: {s['rounds']}  avg_accept: {s['avg_accept']:.2f} drafts/round")
     print("=" * 64)
 
 
 def print_conc_summary(rows: list[tuple[int, dict]]) -> None:
     print("=" * 66)
     print("  concurrency sweep")
-    print(f"  {'conc':>6} {'prefill':>10} {'decode':>10} {'req/s':>8} "
+    print(f"  {'conc':>6} {'prefill':>10} {'output':>10} {'req/s':>8} "
           f"{'TTFT p50':>10} {'TPOT p50':>10}")
     for conc, s in rows:
         print(f"  {conc:>6} {s['prefill_tok_per_s']:>10.1f} {s['decode_tok_per_s']:>10.1f} "
@@ -666,7 +717,7 @@ def print_compare(a: dict, b: dict) -> None:
     print("=" * 64)
     print(f"  {'':>18} {'non-mtp':>12} {'mtp':>12} {'speedup':>10}")
     for key, name in [
-        ("decode_tok_per_s", "decode tok/s"),
+        ("output_tok_per_s", "output tok/s"),
         ("req_per_s", "req/s"),
     ]:
         va, vb = a[key], b[key]

@@ -38,6 +38,8 @@ from bench_common import (
     print_stats,
     resolve_port,
     run_online_bench,
+    save_json,
+    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -93,16 +95,21 @@ def main() -> int:
     try:
         base = wait_server_ready(port)
         rows: list[tuple[int, int, int, dict]] = []
+        results: dict[str, dict] = {}
+        point_idx = 0
         for c in concs:
-            for i, (in_len, out_len) in enumerate(configs):
-                # fresh seed per config so the prefix cache can't serve later configs
+            for in_len, out_len in configs:
+                warmup = not bench.no_warmup
                 prompts, in_lens = make_prompts(
                     server_args.model_path,
                     in_len,
-                    c,
-                    bench.seed + i,
+                    c + int(warmup),
+                    bench.seed + point_idx,
                     dataset=bench.dataset,
                     dataset_categories=bench.dataset_category,
+                )
+                warmup_prompt, prompts, in_lens = split_warmup_prompt(
+                    prompts, in_lens, warmup
                 )
                 display_in_len = (
                     round(sum(in_lens) / len(in_lens)) if bench.dataset else in_len
@@ -116,7 +123,7 @@ def main() -> int:
                         in_lens,
                         out_lens,
                         mtp=False,
-                        warmup=not bench.no_warmup,
+                        warmup_prompt=warmup_prompt,
                         pbar=not bench.no_pbar,
                     )
                 )
@@ -127,6 +134,9 @@ def main() -> int:
                     stats,
                 )
                 rows.append((c, display_in_len, out_len, stats))
+                results[f"{c}:{display_in_len}:{out_len}"] = stats
+                save_json(bench.out, results)
+                point_idx += 1
         print_latency_summary(rows)
         return 0
     finally:

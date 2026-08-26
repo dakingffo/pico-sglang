@@ -16,7 +16,6 @@ Examples:
       --num-prompts 8 --output-len 256
 """
 import asyncio
-import json
 import os
 import sys
 
@@ -32,6 +31,8 @@ from bench_common import (
     resolve_num_spec_tokens,
     resolve_port,
     run_online_bench,
+    save_json,
+    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -44,7 +45,6 @@ def main() -> int:
             "--input-len": {"type": int, "default": 64, "help": "prompt length in tokens"},
             "--output-len": {"type": int, "default": 256, "help": "generation length in tokens"},
             "--mode": {"type": str, "choices": ["both", "nonmtp", "mtp"], "default": "both"},
-            "--out": {"type": str, "default": None, "help": "write per-mode stats JSON"},
             "--dt": {"action": "store_true",
                      "help": "enable drafter/target separation for the MTP run"},
         },
@@ -67,18 +67,23 @@ def main() -> int:
             port=port,
             enable_specualtive_decoding=enable_specualtive_decoding,
             num_spec_tokens=num_spec_tokens,
-            enable_dt=bench.dt and enable_specualtive_decoding,
+            enable_dt=(bench.dt or server_args.dt_separation)
+                      and enable_specualtive_decoding,
         )
         try:
             base = wait_server_ready(port)
-            for c in parse_int_list(bench.num_prompts, 32):
+            for point_idx, c in enumerate(parse_int_list(bench.num_prompts, 32)):
+                warmup = not bench.no_warmup
                 prompts, in_lens = make_prompts(
                     server_args.model_path,
                     bench.input_len,
-                    c,
-                    bench.seed,
+                    c + int(warmup),
+                    bench.seed + point_idx,
                     dataset=bench.dataset,
                     dataset_categories=bench.dataset_category,
+                )
+                warmup_prompt, prompts, in_lens = split_warmup_prompt(
+                    prompts, in_lens, warmup
                 )
                 out_lens = [bench.output_len] * c
                 stats = asyncio.run(
@@ -89,7 +94,7 @@ def main() -> int:
                         in_lens,
                         out_lens,
                         mtp=enable_specualtive_decoding,
-                        warmup=not bench.no_warmup,
+                        warmup_prompt=warmup_prompt,
                         pbar=not bench.no_pbar,
                     )
                 )
@@ -106,6 +111,7 @@ def main() -> int:
                     note=note,
                 )
                 results.setdefault(label, {})[str(c)] = stats
+                save_json(bench.out, results)
         finally:
             kill_server(proc)
 
@@ -113,10 +119,6 @@ def main() -> int:
         for c in parse_int_list(bench.num_prompts, 32):
             print(f"  concurrency = {c}")
             print_compare(results["nonmtp"][str(c)], results["mtp"][str(c)])
-    if bench.out:
-        with open(bench.out, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"  wrote {bench.out}")
     return 0
 
 
@@ -125,22 +127,23 @@ if __name__ == "__main__":
 
 
 # =========================================================================
-# 吞吐量测试矩阵 (A800-80GB-NVLink * 2, Qwen3.6-27B, output=256)
+# 吞吐量测试矩阵 (A800-80GB-NVLink * 2, Qwen3.6-27B, output=256, spec_bench=512)
 # 每个 run 都加 --out <json> 落地,防崩溃丢块缓冲。
+# spec_bench 用 --output-len 512:紧跟 1K 上下文测试之后跑;
 #
 # A. TP=2, DT 不分离 (--tensor-parallel-size 2)
 #    随机乱码 (--input-len N, 不带 --dataset):
 #      16K -> 1,2,4,8            8K -> 1,2,4,8,16
 #       4K -> 1,2,4,8,16,32      2K -> 1,2,4,8,16,32,64
 #       1K -> 1,2,4,8,16,32,64,128
-#    spec_bench (--dataset spec_bench): 1,2,4,8,16,32,64,128
+#    spec_bench (--dataset spec_bench, --output-len 512): 1,2,4,8,16,32,64,128
 #
-# B. DT 分离 (--tensor-parallel-size 1 --enable-dt-separation)
+# B. DT 分离 (--tensor-parallel-size 1 --enable-dt-separation --max-running-seq 16)
 #    随机乱码:
 #      16K -> 1        8K -> 1,2
 #       4K -> 1,2,4    2K -> 1,2,4,8
 #       1K -> 1,2,4,8,16
-#    spec_bench: 1,2,4,8,16
+#    spec_bench (--output-len 512): 1,2,4,8,16
 #
 # 纯 latency 矩阵暂不做。
 # =========================================================================
