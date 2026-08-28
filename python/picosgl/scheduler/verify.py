@@ -70,6 +70,12 @@ class VerifyManager(ARManagerBase):
         self.vocab_size = vocab_size
         self._state_table: dict[int, VerifyState] = {}
 
+    def _reserve_remain_len(self, req: Request) -> int:
+        if req.uid in self.inflight_uids[1]:
+            return req.max_device_len - (req.cached_len + 1)
+        else:
+            return req.remain_len
+
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
         inflight: bool = uid in self.inflight_uids[1]
         self.inflight_uids[1].discard(uid)

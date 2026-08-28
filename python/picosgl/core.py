@@ -78,6 +78,7 @@ class Request:
             f"max_device_len={self.max_device_len})"
         )
 
+@dataclass(eq=False)
 class ChunkedRequest(Request):
     def append_host(self, next_token: torch.Tensor) -> None:
         raise NotImplementedError("ChunkedRequest should not be sampled")

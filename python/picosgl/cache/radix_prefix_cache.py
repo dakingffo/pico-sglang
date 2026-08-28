@@ -270,7 +270,61 @@ class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
         )
 
     def check_integrity(self) -> None:
-        pass
+        evictable_size = 0
+        protected_size = 0
+        seen: set[int] = set()
+        stack: list[NodeT] = [self.root_node]
+
+        while stack:
+            node = stack.pop()
+            if node.uuid in seen:
+                raise RuntimeError(f"Radix cache contains a cycle or duplicate node {node.uuid}.")
+            seen.add(node.uuid)
+
+            if node.is_root():
+                if node.ref_count != 1:
+                    raise RuntimeError(
+                        f"Radix root ref_count must be 1, got {node.ref_count}."
+                    )
+            else:
+                if node.parent.children.get(self.key_fn(node._key)) is not node:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} is not indexed by its parent."
+                    )
+                if node.length <= 0 or node.length % self.page_size != 0:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} has invalid length {node.length}."
+                    )
+                if len(node.kv) != node.length:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} has {len(node.kv)} KV indices for"
+                        f" length {node.length}."
+                    )
+                if isinstance(node, HybridRadixTreeNode):
+                    expected_states = node.length // self.page_size
+                    if len(node.st) != expected_states:
+                        raise RuntimeError(
+                            f"Radix node {node.uuid} has {len(node.st)} state slots;"
+                            f" expected {expected_states}."
+                        )
+                if node.ref_count == 0:
+                    evictable_size += node.length
+                elif node.ref_count > 0:
+                    protected_size += node.length
+                else:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} has negative ref_count {node.ref_count}."
+                    )
+
+            stack.extend(node.children.values())
+
+        if evictable_size != self.evictable_size or protected_size != self.protected_size:
+            raise RuntimeError(
+                "Radix cache size accounting mismatch:"
+                f" recorded=({self.evictable_size} evictable,"
+                f" {self.protected_size} protected),"
+                f" actual=({evictable_size} evictable, {protected_size} protected)."
+            )
 
     def total_state_pages(self) -> int:
         """Total number of linear-state slots owned by the tree (one per cached page)."""

@@ -274,9 +274,20 @@ class CacheManager:
         if needed_pages > free_pages or needed_states > free_states:
             # Each evicted radix node frees page_size KV tokens AND one state slot per
             # page, so the shortfall (in pages/slots) is the unit to evict in tokens.
-            evicted_pages, evicted_states = self.prefix_cache.evict(
-                max(0, needed_pages - free_pages, needed_states - free_states) * self.page_size
-            )
+            needed_evict = max(
+                0, needed_pages - free_pages, needed_states - free_states
+            ) * self.page_size
+            evictable = self.prefix_cache.size_info.evictable_size
+            if needed_evict > evictable:
+                raise RuntimeError(
+                    "Insufficient evictable cache capacity:"
+                    f" need_pages={needed_pages}, free_pages={free_pages},"
+                    f" need_states={needed_states}, free_states={free_states},"
+                    f" need_evict_tokens={needed_evict},"
+                    f" evictable_tokens={evictable},"
+                    f" protected_tokens={self.prefix_cache.size_info.protected_size}."
+                )
+            evicted_pages, evicted_states = self.prefix_cache.evict(needed_evict)
             self.free_pages = torch.cat([self.free_pages, evicted_pages[:: self.page_size]])
             if self.state_pool is not None and evicted_states is not None:
                 self.free_states = torch.cat([self.free_states, evicted_states])

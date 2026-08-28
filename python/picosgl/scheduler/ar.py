@@ -48,9 +48,12 @@ class ARManagerBase:
     @property
     def need_tokens(self) -> int:
         return sum(
-            align_ceil(req.remain_len, self.page_size)
+            align_ceil(self._reserve_remain_len(req), self.page_size)
             for req in self.running_reqs.values()
         )
+
+    def _reserve_remain_len(self, req: Request) -> int:
+        return req.remain_len
 
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
         inflight: bool = uid in self.inflight_uids[1]
