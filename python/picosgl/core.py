@@ -35,15 +35,14 @@ class Request:
     uid            : int
     sampling_params: SamplingParams
     cache_handle   : BaseCacheHandle
-    device_len     : int = field(init=False)
-    max_device_len : int = field(init=False)
-    baseline_slot  : int = field(default=-1, init=False)  # for verify
+    max_device_len : int
+    device_len     : int  = field(init=False)
+    baseline_slot  : int  = field(default=-1, init=False)  # for verify
     aborted        : bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
-        self.max_device_len = self.device_len + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
     def __lt__(self, other: Request) -> bool:

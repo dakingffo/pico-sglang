@@ -38,6 +38,7 @@ def make_req(input_len, table_idx, output_len=10):
         uid=table_idx,
         sampling_params=SamplingParams(),
         cache_handle=None,
+        max_device_len=input_len + output_len,
     )
 
 

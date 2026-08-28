@@ -257,6 +257,7 @@ def run():
             input_ids=torch.tensor([0] * device_len, dtype=torch.int32),
             table_idx=table_idx, cached_len=cached_len, output_len=4,
             uid=table_idx, sampling_params=None, cache_handle=None,
+            max_device_len=device_len + 4,
         )
 
     def make_batch(req):

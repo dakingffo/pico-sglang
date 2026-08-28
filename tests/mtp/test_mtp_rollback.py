@@ -160,6 +160,7 @@ def main():
             input_ids=ids[:n_tokens].cpu(), table_idx=tidx, cached_len=cached_len,
             output_len=16, uid=tidx, sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
+            max_device_len=n_tokens + 16,
         )
 
     def run_prefill(tidx, n):

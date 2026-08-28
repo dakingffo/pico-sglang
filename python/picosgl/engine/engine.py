@@ -196,6 +196,7 @@ class Engine:
             uid=-1,
             sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
+            max_device_len=2,
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
 

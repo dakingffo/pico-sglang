@@ -176,6 +176,7 @@ def test_variable_length_layer_batch_matches_per_request():
             uid=table_idx,
             sampling_params=None,
             cache_handle=None,
+            max_device_len=10 + seq_len + 4,
         )
         req.baseline_slot = baseline
         reqs.append(req)

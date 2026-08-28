@@ -110,6 +110,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            max_device_len=len(pending_req.input_ids) + pending_req.output_len,
         )
 
     def try_add_one(self, pending_req: PendingRequest) -> Request | ChunkedRequest | None:
@@ -139,15 +140,24 @@ class PrefillAdder:
 class PrefillManager:
     def __init__(
         self,
-        token_pool   : torch.Tensor,
+        token_pool : torch.Tensor,
+        page_size  : int
     ):
         self.token_pool = token_pool
         self.pending_list: list[PendingRequest] = []
         self.inflight_reqs: dict[int, Request] = dict()
+        self.page_size = page_size
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingRequest(req.uid, req.input_ids, req.sampling_params))
 
+    @property
+    def need_tokens(self) -> int:
+        return sum(
+            align_ceil(req.remain_len, self.page_size)
+            for req in self.inflight_reqs.values()
+        )
+        
     def schedule_next_batch(self, adder: PrefillAdder) -> Batch | None:
         self.inflight_reqs.clear()
         if len(self.pending_list) == 0:

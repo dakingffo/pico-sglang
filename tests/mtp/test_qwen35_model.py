@@ -82,6 +82,7 @@ def make_req(table_idx, cached_len, device_len, output_len=4):
         uid=table_idx,
         sampling_params=None,  # type: ignore
         cache_handle=None,  # type: ignore
+        max_device_len=device_len + output_len,
     )
 
 
@@ -276,6 +277,7 @@ def test3_full_model(mcfg, loaded=None):
             input_ids=id_t[:n_tokens].cpu(), table_idx=table_idx, cached_len=cached_len,
             output_len=64, uid=uid, sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
+            max_device_len=n_tokens + 64,
         )
 
     # reference per-position logits via fresh prefill 0..i

@@ -42,6 +42,7 @@ def make_req(table_idx, cached_len):
         input_ids=torch.arange(200, dtype=torch.int32),
         table_idx=table_idx, cached_len=cached_len, output_len=10, uid=table_idx,
         sampling_params=SamplingParams(), cache_handle=None,
+        max_device_len=210,
     )
 
 
