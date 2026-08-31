@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from time import perf_counter_ns
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from picosgl.distributed import get_tp_info
-from picosgl.utils import init_logger
+from picosgl.utils import init_logger, nvtx_annotate
 
 if TYPE_CHECKING:
     from picosgl.core import Batch
@@ -85,11 +86,6 @@ class SchedulerProfiler:
     Set ``PICOSGL_PROFILE_SCHEDULER=1`` to collect aggregate CPU, CUDA-event,
     batch-size, padding and graph-hit statistics.  CUDA timings are harvested
     asynchronously, so serving does not synchronize once per forward.
-
-    ``PICOSGL_PROFILE_CUDA_START`` and ``PICOSGL_PROFILE_CUDA_STOP`` select an
-    inclusive range of AR forwards for Nsight Systems capture with
-    ``--capture-range=cudaProfilerApi``.  Stopping the capture synchronizes once
-    after the final selected forward, which is acceptable in profiling mode.
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -97,8 +93,6 @@ class SchedulerProfiler:
         self.device = device
         self.path = os.getenv("PICOSGL_PROFILE_SCHEDULER_PATH")
         self.flush_interval = _env_int("PICOSGL_PROFILE_FLUSH_INTERVAL")
-        self.cuda_capture_start = _env_int("PICOSGL_PROFILE_CUDA_START")
-        self.cuda_capture_stop = _env_int("PICOSGL_PROFILE_CUDA_STOP")
         self.ar_forward_count = 0
         self.ar_no_batch = 0
         self.last_flushed_forward = 0
@@ -106,25 +100,43 @@ class SchedulerProfiler:
             phase: _PhaseProfile() for phase in ("prefill", "decode", "verify")
         }
         self.pending_gpu: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self.schedule_ns = 0
 
     @contextmanager
-    def nvtx_range(self, name: str):
-        if self.enabled:
-            with torch.cuda.nvtx.range(name):
-                yield
-        else:
+    @nvtx_annotate("Scheduler::schedule")
+    def record_schedule(self):
+        if not self.enabled:
             yield
+            return
+        tic = perf_counter_ns()
+        try:
+            yield
+        finally:
+            self.schedule_ns = perf_counter_ns() - tic
 
-    def record_batch(
+    @contextmanager
+    @nvtx_annotate("Scheduler::prepare_batch")
+    def record_prepare(
         self,
         batch: Batch,
         *,
-        schedule_ns: int,
-        prepare_ns: int,
         graph_used: bool,
-    ) -> None:
+    ):
         if not self.enabled:
+            yield
             return
+        tic = perf_counter_ns()
+        try:
+            yield
+        finally:
+            self._record_batch(batch, perf_counter_ns() - tic, graph_used)
+
+    def _record_batch(
+        self,
+        batch       : Batch,
+        prepare_ns  : int,
+        graph_used  : bool,
+    ) -> None:
         profile = self.phases[batch.phase]
         profile.batches += 1
         profile.logical_rows += batch.size
@@ -132,52 +144,66 @@ class SchedulerProfiler:
         profile.logical_tokens += sum(req.extend_len for req in batch.reqs)
         profile.padded_tokens += sum(req.extend_len for req in batch.padded_reqs)
         profile.graph_batches += int(graph_used)
-        profile.schedule_ns += schedule_ns
+        profile.schedule_ns += self.schedule_ns
         profile.prepare_ns += prepare_ns
         profile.logical_bs[batch.size] += 1
         profile.padded_bs[batch.padded_size] += 1
 
-    def begin_submit(
-        self, phase: str
-    ) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+    @contextmanager
+    @nvtx_annotate("Scheduler::forward(submit)")
+    def record_submit(self, phase: str):
         if not self.enabled:
-            return None
+            yield
+            return
+        tic = perf_counter_ns()
+        events = self._begin_submit(phase)
+        try:
+            yield
+        finally:
+            self._finish_submit(phase, events, perf_counter_ns() - tic)
+
+    def _begin_submit(self, phase: str) -> tuple[torch.cuda.Event, torch.cuda.Event]:
         if phase in ("decode", "verify"):
             self.ar_forward_count += 1
-            if self.ar_forward_count == self.cuda_capture_start:
-                torch.cuda.profiler.start()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         return start, end
 
-    def finish_submit(
+    def _finish_submit(
         self,
         phase    : str,
-        events   : tuple[torch.cuda.Event, torch.cuda.Event] | None,
+        events   : tuple[torch.cuda.Event, torch.cuda.Event],
         submit_ns: int,
     ) -> None:
-        if not self.enabled:
-            return
         self.phases[phase].submit_ns += submit_ns
-        assert events is not None
         start, end = events
         end.record()
         self.pending_gpu.append((phase, start, end))
-        if (
-            phase in ("decode", "verify")
-            and self.ar_forward_count == self.cuda_capture_stop
-        ):
-            end.synchronize()
-            torch.cuda.profiler.stop()
 
-    def record_wait(self, phase: str, wait_ns: int) -> None:
-        if self.enabled:
-            self.phases[phase].wait_ns += wait_ns
+    @contextmanager
+    @nvtx_annotate("Scheduler::wait_output")
+    def record_wait(self, phase: str):
+        if not self.enabled:
+            yield
+            return
+        tic = perf_counter_ns()
+        try:
+            yield
+        finally:
+            self.phases[phase].wait_ns += perf_counter_ns() - tic
 
-    def record_process(self, phase: str, process_ns: int) -> None:
-        if self.enabled:
-            self.phases[phase].process_ns += process_ns
+    @contextmanager
+    @nvtx_annotate("Scheduler::process_output")
+    def record_process(self, phase: str):
+        if not self.enabled:
+            yield
+            return
+        tic = perf_counter_ns()
+        try:
+            yield
+        finally:
+            self.phases[phase].process_ns += perf_counter_ns() - tic
 
     def record_ar_no_batch(self) -> None:
         if self.enabled:
