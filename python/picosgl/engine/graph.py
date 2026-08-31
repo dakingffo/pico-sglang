@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from picosgl.core import Batch, Request, get_global_ctx
 from picosgl.distributed import get_tp_info
-from picosgl.utils import init_logger
+from picosgl.utils import init_logger, nvtx_annotate
 
 if TYPE_CHECKING:
     from picosgl.layers.attention_backend import BaseAttnBackend
@@ -36,6 +36,7 @@ class GraphCaptureBuffer:
         batch.out_loc = self.out_loc[0:batch.padded_size]
         batch.positions = self.positions[0:batch.padded_size]
 
+    @nvtx_annotate("Graph::copy_inputs")
     def copy_from(self, batch: Batch) -> None:
         self.input_ids[0:batch.padded_size] = batch.input_ids
         self.out_loc[0:batch.padded_size] = batch.out_loc
@@ -143,6 +144,7 @@ class GraphRunner:
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
+    @nvtx_annotate("Graph::replay")
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)

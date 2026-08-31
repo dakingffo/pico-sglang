@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, NoReturn
 
 import torch
@@ -22,6 +23,7 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import PrefillAdder, PrefillManager
+from .profile import SchedulerProfiler
 from .table import TableManager
 from .verify import VerifyManager
 
@@ -86,12 +88,14 @@ class Scheduler(SchedulerIOMixin):
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool, config.page_size)
         self.prefill_budget = config.max_prefill_tokens
+        self.profiler = SchedulerProfiler(self.device)
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
+        self.profiler.poll()
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -105,7 +109,15 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                tic = perf_counter_ns()
+                events = self.profiler.begin_submit(forward_input.batch.phase)
+                with self.profiler.nvtx_range("Scheduler::forward"):
+                    ongoing_data = (forward_input, self._forward(forward_input))
+                self.profiler.finish_submit(
+                    forward_input.batch.phase,
+                    events,
+                    perf_counter_ns() - tic,
+                )
 
         self._process_last_data(last_data)
         return ongoing_data
@@ -119,6 +131,7 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        self.profiler.dump()
         if self.speculator_client is not None:
             self.speculator_client.destroy()
         self.sync_all_ranks()
@@ -128,11 +141,20 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
         last_input, last_output = last_data
-        last_output.copy_done_event.synchronize()
-        reply, finished_reqs = self.ar_manager.process(self.engine.ctx, last_input, last_output)
+        tic = perf_counter_ns()
+        with self.profiler.nvtx_range("Scheduler::wait_output"):
+            last_output.copy_done_event.synchronize()
+        self.profiler.record_wait(last_input.batch.phase, perf_counter_ns() - tic)
+
+        tic = perf_counter_ns()
+        with self.profiler.nvtx_range("Scheduler::process_output"):
+            reply, finished_reqs = self.ar_manager.process(
+                self.engine.ctx, last_input, last_output
+            )
         self.send_result(reply)
         for req in finished_reqs:
             self._free_req_resources(req)
+        self.profiler.record_process(last_input.batch.phase, perf_counter_ns() - tic)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -182,18 +204,37 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        batch = (
-            self.prefill_manager.schedule_next_batch(
-                PrefillAdder(
-                    token_budget=self.prefill_budget,
-                    reserved_size=self.ar_manager.need_tokens + self.prefill_manager.need_tokens,
-                    cache_manager=self.cache_manager,
-                    table_manager=self.table_manager,
-                )
-            ) or
-            self.ar_manager.schedule_next_batch()
+        tic = perf_counter_ns()
+        with self.profiler.nvtx_range("Scheduler::schedule"):
+            batch = (
+                self.prefill_manager.schedule_next_batch(
+                    PrefillAdder(
+                        token_budget=self.prefill_budget,
+                        reserved_size=self.ar_manager.need_tokens + self.prefill_manager.need_tokens,
+                        cache_manager=self.cache_manager,
+                        table_manager=self.table_manager,
+                    )
+                ) or
+                self.ar_manager.schedule_next_batch()
+            )
+        schedule_ns = perf_counter_ns() - tic
+        if batch is None:
+            if self.ar_manager.runnable and not self.prefill_manager.runnable:
+                self.profiler.record_ar_no_batch()
+            return None
+
+        tic = perf_counter_ns()
+        with self.profiler.nvtx_range("Scheduler::prepare_batch"):
+            forward_input = self.engine.prepare_batch(batch, self.cache_manager)
+        prepare_ns = perf_counter_ns() - tic
+        graph_used = batch.is_decode and self.engine.graph_runner.can_use_cuda_graph(batch)
+        self.profiler.record_batch(
+            batch,
+            schedule_ns=schedule_ns,
+            prepare_ns=prepare_ns,
+            graph_used=graph_used,
         )
-        return self.engine.prepare_batch(batch, self.cache_manager) if batch else None
+        return forward_input
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, _ = forward_input
