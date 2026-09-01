@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from itertools import chain
 
 import torch
 
-from picosgl.core import Request, ChunkedRequest, Context
+from picosgl.core import Request, ChunkedRequest, Batch, Context
 from picosgl.engine import ForwardInput, ForwardOutput
 from picosgl.message import DetokenizeMsg
 from picosgl.utils import align_ceil
@@ -73,6 +72,10 @@ class ARManagerBase:
         """Prefill -> AR handoff hook. Decode does not need speculator features."""
         return None
 
+    def advance_for_overlap(self, batch: Batch) -> None:
+        """Decode -> decode overlap hook. Verify can not advance for overlap."""
+        return None
+
     def process(
         self,
         ctx          : Context,
@@ -86,9 +89,7 @@ class ARManagerBase:
 
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedRequest):
-                    continue
-                if req.aborted:
+                if isinstance(req, ChunkedRequest) or req.aborted:
                     continue
                 if not batch.is_prefill and req.uid not in self.running_reqs:
                     continue
@@ -103,7 +104,10 @@ class ARManagerBase:
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 if finished and req not in self.finished_reqs:
-                    self._finish_req(req)
+                    if req not in self.inflight_uids[1]:
+                        self._finish_req(req)
+                    else:
+                        self.abort_req(req.uid)
                     new_finished.add(req)
                 elif batch.is_prefill:
                     if req.can_decode:

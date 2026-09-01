@@ -18,13 +18,13 @@ if TYPE_CHECKING:
 class AttentionLayer(StateLessOP):
     def __init__(
         self,
-        layer_id: int,
-        num_qo_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
+        layer_id     : int,
+        num_qo_heads : int,
+        num_kv_heads : int,
+        head_dim     : int,
         rotary_config: RotaryConfig,
-        q_norm: RMSNorm | None = None,
-        k_norm: RMSNorm | None = None,
+        q_norm       : RMSNorm | None = None,
+        k_norm       : RMSNorm | None = None,
     ):
         assert num_qo_heads % num_kv_heads == 0
         self.layer_id = layer_id
@@ -44,7 +44,10 @@ class AttentionLayer(StateLessOP):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        qkv: torch.Tensor # [N, D_qo + D_kv + D_kv]
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
@@ -52,6 +55,6 @@ class AttentionLayer(StateLessOP):
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
-        q = q.view(-1, self.num_qo_heads, self.head_dim)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
-        return o.view(-1, self.qo_attn_dim)
+        q = q.view(-1, self.num_qo_heads, self.head_dim) # [N, N_qo_head, D_qo_head]
+        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch) # [N, N_qo_head, D_qo_head]
+        return o.view(-1, self.qo_attn_dim) # [N, D_qo]

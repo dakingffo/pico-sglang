@@ -27,6 +27,7 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        self._idle = False
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -45,6 +46,10 @@ class SchedulerIOMixin:
             )
 
         if tp_info.size > 1:
+            distributed_timeout_ms = int(config.distributed_timeout * 1000)
+            self._collective_idle_poll_ms: Final = max(
+                1, min(1000, distributed_timeout_ms // 4)
+            )
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
                 send = self._reply_tokenizer_rank0
@@ -80,21 +85,32 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
+    def _enter_idle(self) -> None:
+        if not self._idle:
+            self.run_when_idle()
+            self._idle = True
+
+    def _leave_idle(self, received: bool) -> None:
+        if received:
+            self._idle = False
+
     def _recv_msg_single_rank(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
+            self._enter_idle()
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
+        self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
         pending_raw_msgs: list[bytes] = []
         if blocking:
-            self.run_when_idle()
-            pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
+            self._enter_idle()
+            if self._recv_from_tokenizer.wait(self._collective_idle_poll_ms):
+                pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
@@ -105,12 +121,13 @@ class SchedulerIOMixin:
         for raw in pending_raw_msgs:
             self._send_into_ranks.put_raw(raw)
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+        self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
+            self._enter_idle()
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)
@@ -119,6 +136,7 @@ class SchedulerIOMixin:
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())
+        self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
     def _reply_tokenizer_rank0(self, reply: list[DetokenizeMsg]) -> None:

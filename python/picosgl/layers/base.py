@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import Any, Dict, Generic, List, TypeAlias, TypeVar
+from typing import Any, Generic, TypeAlias, TypeVar
 
 import torch
 
-_STATE_DICT: TypeAlias = Dict[str, torch.Tensor]
+_STATE_DICT: TypeAlias = dict[str, torch.Tensor]
 
 
 def _concat_prefix(prefix: str, name: str) -> str:
@@ -16,7 +16,12 @@ class BaseOP:
     @abstractmethod
     def forward(self, *args: Any, **kwargs: Any) -> Any: ...
 
-    def state_dict(self, *, prefix: str = "", result: _STATE_DICT | None = None) -> _STATE_DICT:
+    def state_dict(
+        self, 
+        *, 
+        prefix: str = "", 
+        result: _STATE_DICT | None = None
+    ) -> _STATE_DICT:
         result = result if result is not None else {}
 
         for name, param in self.__dict__.items():
@@ -33,8 +38,8 @@ class BaseOP:
         self,
         state_dict: _STATE_DICT,
         *,
-        prefix: str = "",
-        _internal: bool = False,
+        prefix    : str  = "",
+        _internal : bool = False,
     ) -> None:
         for name, param in self.__dict__.items():
             if name.startswith("_"):
@@ -66,7 +71,7 @@ class StateLessOP(BaseOP):
         self,
         state_dict: _STATE_DICT,
         *,
-        prefix: str = "",
+        prefix   : str = "",
         _internal: bool = False,
     ) -> None:
         if not _internal and state_dict:
@@ -77,14 +82,17 @@ class StateLessOP(BaseOP):
 
 
 T = TypeVar("T", bound=BaseOP)
-
-
-class OPList(BaseOP, Generic[T]):
-    def __init__(self, ops: List[T]):
+class OPlist(BaseOP, Generic[T]):
+    def __init__(self, ops: list[T]):
         super().__init__()
         self.op_list = ops
 
-    def state_dict(self, *, prefix: str = "", result: _STATE_DICT | None = None) -> _STATE_DICT:
+    def state_dict(
+        self, 
+        *, 
+        prefix: str = "", 
+        result: _STATE_DICT | None = None
+    ) -> _STATE_DICT:
         result = result if result is not None else {}
         for i, op in enumerate(self.op_list):
             op.state_dict(prefix=_concat_prefix(prefix, str(i)), result=result)
@@ -94,7 +102,7 @@ class OPList(BaseOP, Generic[T]):
         self,
         state_dict: _STATE_DICT,
         *,
-        prefix: str = "",
+        prefix   : str = "",
         _internal: bool = False,
     ) -> None:
         for i, op in enumerate(self.op_list):

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Dict
-
 import torch
 import torch.nn.functional as F
 from picosgl.core import get_global_ctx
@@ -15,7 +13,7 @@ class VocabParallelEmbedding(BaseOP):
     def __init__(
         self,
         num_embeddings: int,
-        embedding_dim: int,
+        embedding_dim : int,
     ):
         super().__init__()
         tp_info = get_tp_info()
@@ -30,7 +28,10 @@ class VocabParallelEmbedding(BaseOP):
         self._comm = DistributedCommunicator()
 
     @nvtx_annotate("Embedding")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor # [N]
+    ) -> torch.Tensor:  # [N, D]
         from picosgl.kernel import indexing
 
         y = indexing(
@@ -45,11 +46,11 @@ class VocabParallelEmbedding(BaseOP):
 class ParallelLMHead(VocabParallelEmbedding):
     def __init__(
         self,
-        num_embeddings: int,
-        embedding_dim: int,
-        bias: bool = False,
+        num_embeddings     : int,
+        embedding_dim      : int,
+        bias               : bool = False,
         tie_word_embeddings: bool = False,
-        tied_embedding: VocabParallelEmbedding | None = None,
+        tied_embedding     : VocabParallelEmbedding | None = None,
     ):
         super().__init__(num_embeddings, embedding_dim)
         self.bias = torch.empty(self.num_embeddings_tp) if bias else None
@@ -58,9 +59,9 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def load_state_dict(
         self,
-        state_dict: Dict[str, torch.Tensor],
+        state_dict: dict[str, torch.Tensor],
         *,
-        prefix: str = "",
+        prefix   : str  = "",
         _internal: bool = False,
     ) -> None:
         if not self.tied_embedding:
@@ -78,14 +79,17 @@ class ParallelLMHead(VocabParallelEmbedding):
         self,
         *,
         prefix: str = "",
-        result: Dict[str, torch.Tensor] | None = None,
-    ) -> Dict[str, torch.Tensor]:
+        result: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         if not self.tied_embedding:
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
     @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor # [N, D]
+    ) -> torch.Tensor:  # [N, V]
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
@@ -98,16 +102,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
-        input_shape = logits.shape
-        output_tensor = self._comm.all_gather(logits)
+        input_shape = logits.shape # [N, V_tp]
+        output_tensor = self._comm.all_gather(logits) # [TP * N, V_tp]
 
-        if bs == 1 and input_shape[0] == 1:
+        if bs == 1 and input_shape[0] == 1: # [TP, V_tp]
             # single-token decode fast path; only valid when the gather input really is
             # one row per rank (an MTP verify batch is bs==1 but T = n_drafts+1 rows, so
             # it must fall through to the general reshape below)
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
-        output_tensor = output_tensor.view((self.tp_size,) + input_shape)
-        output_tensor = output_tensor.permute(1, 0, 2).contiguous()
-        output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
+        output_tensor = output_tensor.view((self.tp_size,) + input_shape) # [TP, N, V_tp]
+        output_tensor = output_tensor.permute(1, 0, 2).contiguous() # [N, TP, V_tp]
+        output_tensor = output_tensor.reshape((input_shape[0], self.tp_size * input_shape[1],)) # [N, V]
         return output_tensor[:, : self.num_embeddings]

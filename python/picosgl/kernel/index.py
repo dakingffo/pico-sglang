@@ -36,7 +36,7 @@ def _jit_index_module(
 
 
 def indexing(
-    weights    : torch.Tensor, # [V / tp_size, D]
+    weights    : torch.Tensor, # [V_tp, D]
     indices    : torch.Tensor, # [L]
     *,
     output     : torch.Tensor    | None = None,  # [L, D]

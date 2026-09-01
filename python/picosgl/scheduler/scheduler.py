@@ -110,6 +110,7 @@ class Scheduler(SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 with self.profiler.record_submit(forward_input.batch.phase):
                     ongoing_data = (forward_input, self._forward(forward_input))
+                    self.ar_manager.advance_for_overlap(forward_input.batch)
 
         self._process_last_data(last_data)
         return ongoing_data

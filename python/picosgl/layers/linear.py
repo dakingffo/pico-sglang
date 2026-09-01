@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List
-
 import torch
 import torch.nn.functional as F
 from picosgl.distributed import DistributedCommunicator, get_tp_info
@@ -15,11 +13,11 @@ class _LinearTPImpl(BaseOP):
 
     def __init__(
         self,
-        full_isize: int,
-        full_osize: int,
+        full_isize : int,
+        full_osize : int,
         local_isize: int,
         local_osize: int,
-        has_bias: bool,
+        has_bias   : bool,
     ):
         self.full_input_size = full_isize
         self.full_output_size = full_osize
@@ -28,8 +26,11 @@ class _LinearTPImpl(BaseOP):
         self.weight = torch.empty(local_osize, local_isize)
         self.bias = torch.empty(local_osize) if has_bias else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+    def forward(
+        self, 
+        x: torch.Tensor # [N, D]
+    ) -> torch.Tensor: # [N, D']
+        return F.linear(x, self.weight, self.bias) # [N, D] @ [D, D']
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -40,9 +41,9 @@ class LinearReplicated(_LinearTPImpl):
 
     def __init__(
         self,
-        input_size: int,
+        input_size : int,
         output_size: int,
-        has_bias: bool,
+        has_bias   : bool,
     ):
         super().__init__(
             full_isize=input_size,
@@ -56,14 +57,14 @@ class LinearReplicated(_LinearTPImpl):
 class LinearColParallelMerged(_LinearTPImpl):
     def __init__(
         self,
-        input_size: int,
-        output_sizes: List[int],
-        has_bias: bool,
+        input_size  : int,
+        output_sizes: list[int],
+        has_bias    : bool,
     ):
+        output_size = sum(output_sizes)
         # check that all output sizes are divisible by tp_size
         tp_info = get_tp_info()
         tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
-        output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(input_size, output_size, input_size, tp_output_size, has_bias)
 
