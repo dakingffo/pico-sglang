@@ -9,10 +9,11 @@ from picosgl.layers import (
     LinearColumnParallel,
     OPList,
     ParallelLMHead,
+    RMSNorm,
     VocabParallelEmbedding,
 )
-from picosgl.layers.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 from picosgl.models import load_weight
+from picosgl.models.qwen3_5 import Qwen3_5DecoderLayer
 
 from .base import BaseDrafterModel
 
@@ -27,24 +28,31 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
     ``model.embed_tokens.weight``, loaded by ``load_weights``.
 
     Weight keys keep the ``mtp.*`` prefix so the drafter loads exactly the ``mtp.*``
-    slice of a Qwen3.5 checkpoint (``load_state_dict(..., prefix="mtp")``). Runs at tp=1
-    in its own process; ``draft`` never reads ``ctx.batch``.
+    slice of a Qwen3.5 checkpoint (``load_state_dict(..., prefix="mtp")``). It runs at
+    tp=1 in the speculator process and exposes projection/finalization primitives to the
+    batched MTP engine.
     """
 
     def __init__(self, config: ModelConfig):
-        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
+        )
+        self.pre_fc_norm_hidden = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
+        )
         # Input is the cat([embedding; hidden]) — full width on every rank — so the fc
         # must be output-split (LinearColumnParallel). tp=1 drafter, kept as-is.
         self.fc = LinearColumnParallel(config.hidden_size * 2, config.hidden_size, has_bias=False)
         self.layers = OPList(
             [
                 Qwen3_5DecoderLayer(
-                    config, 0, block_type="full_attention", paged=False
+                    config, 0, block_type="full_attention"
                 )
             ]
         )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
+        )
         # Own embedding + LM head. Underscore-named: excluded from BaseOP.state_dict, so
         # the drafter's state_dict is exactly the mtp.* checkpoint slice; embed/lm_head
         # are filled by load_weights (a tied lm_head aliases the embedding).
@@ -80,20 +88,6 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
             )
             self._lm_head.weight = lm_head.to(self._lm_head.weight.dtype)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        emb = self._embed_tokens.forward(input_ids)
-        emb = self.pre_fc_norm_embedding.forward(emb)
-        h = self.pre_fc_norm_hidden.forward(hidden_states)
-        h = torch.cat([emb, h], dim=-1)
-        h = self.fc.forward(h)
-        h = self.layers.op_list[0].forward(h, positions)
-        return self.norm.forward(h)
-
     def get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project MTP output to vocab logits via the drafter's own lm_head.
 
@@ -113,75 +107,6 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
                 input_shape[:1] + (self._lm_head.tp_size * input_shape[1],)
             )[:, : module.num_embeddings]
         return logits
-
-    def draft(self, input_ids, positions, hidden_states, past_kv=None):
-        """Single MTP draft step, returns (next_token, logits, hidden, kv).
-
-        Step-0 (past_kv=None): feed the carry window (last W accepted tokens + their target
-        hidden); the last row's logits predict the next token -> draft_0, and the window's
-        KV is returned for carry. Step-j (j>=1): feed [draft_{j-1}] + this predictor's own
-        hidden from step j-1, attending to the carried KV -> draft_j.
-
-        next_token is greedy (argmax); p_draft is recovered from ``logits`` by the caller.
-        """
-        emb = self._embed_tokens.forward(input_ids)
-        emb = self.pre_fc_norm_embedding.forward(emb)
-        h = self.pre_fc_norm_hidden.forward(hidden_states)
-        h = torch.cat([emb, h], dim=-1)
-        h = self.fc.forward(h)
-
-        layer = self.layers.op_list[0]
-        residual = h
-        h = layer.input_layernorm.forward(h)
-        h, kv = layer.self_attn.forward_with_kv(h, positions, past_kv)
-        h = residual + h
-        residual = h
-        h = layer.post_attention_layernorm.forward(h)
-        h = layer.mlp.forward(h)
-        h = residual + h
-        h = self.norm.forward(h)
-
-        logits = self.get_logits(h)
-        return logits.argmax(dim=-1), logits, h, kv
-
-    def draft_batch(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        valid_mask: torch.Tensor,
-        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-        past_valid_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-        """Run one dense batched MTP step without consulting the global engine context."""
-        assert input_ids.ndim == 2
-        assert hidden_states.shape[:2] == input_ids.shape
-        batch_size, seq_len = input_ids.shape
-        # The custom embedding kernel consumes a flat token vector.
-        emb = self._embed_tokens.forward(input_ids.reshape(-1)).view(
-            batch_size, seq_len, -1
-        )
-        emb = self.pre_fc_norm_embedding.forward(emb)
-        h = self.pre_fc_norm_hidden.forward(hidden_states)
-        h = torch.cat([emb, h], dim=-1)
-        h = self.fc.forward(h)
-
-        layer = self.layers.op_list[0]
-        residual = h
-        h = layer.input_layernorm.forward(h)
-        h, kv, key_valid = layer.self_attn.forward_with_kv_batch(
-            h, positions, valid_mask, past_kv, past_valid_mask
-        )
-        h = residual + h
-        residual = h
-        h = layer.post_attention_layernorm.forward(h)
-        h = layer.mlp.forward(h)
-        h = self.norm.forward(residual + h)
-
-        # Every carry window is left-padded, so the predicting row is always the last
-        # one. Avoid materializing the prohibitively large (B, T, vocab) tensor.
-        logits = self.get_logits(h[:, -1])
-        return logits, h, kv, key_valid
 
     def prepare_cache_rows(
         self,

@@ -11,7 +11,7 @@ from picosgl.utils import div_ceil, load_model_config, resolve_model_path
 from tqdm import tqdm
 
 _SPLIT_DIM_0 = [
-    ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj",
+    ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".gate_up_proj",
     # Qwen3.5 linear attention / MTP
     ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
     ".conv1d.weight",
@@ -148,7 +148,8 @@ def load_weight(
                 )
                 del raw
 
-                if config.is_hybrid or (info := _get_merge_info(name)) is None:
+                info = _get_merge_info(name)
+                if info is None or (config.is_hybrid and ".qkv_proj" in info[0]):
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info

@@ -96,9 +96,11 @@ class ARManagerBase:
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                req.complete_n(1)
+                if batch.is_prefill:
+                    req.complete_n(1)
 
-                finished = not req.can_decode
+                finished = req.max_device_len - (req.device_len - (req.uid in self.inflight_uids[1])) <= 0
+                                                # real device len = devel_len - 1 if inflight
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))

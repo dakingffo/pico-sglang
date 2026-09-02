@@ -108,9 +108,11 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
-                with self.profiler.record_submit(forward_input.batch.phase):
+                batch = forward_input.batch
+                with self.profiler.record_submit(batch.phase):
                     ongoing_data = (forward_input, self._forward(forward_input))
-                    self.ar_manager.advance_for_overlap(forward_input.batch)
+                    if not batch.is_prefill:
+                        self.ar_manager.advance_for_overlap(batch)
 
         self._process_last_data(last_data)
         return ongoing_data

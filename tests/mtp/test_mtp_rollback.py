@@ -80,7 +80,7 @@ def main():
 
     loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
-        model = Qwen3_5ForCausalLM(mcfg, paged=True)
+        model = Qwen3_5ForCausalLM(mcfg)
     model.load_state_dict(dict(loaded))
     del loaded
     to_device(model, device)

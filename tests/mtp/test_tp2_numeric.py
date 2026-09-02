@@ -25,6 +25,7 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
 import torch
+import torch.nn.functional as F
 
 from picosgl.distributed import DistributedInfo, set_tp_info
 from picosgl.distributed.impl import DistributedCommunicator, DistributedImpl, NoopDistributedImpl
@@ -120,7 +121,7 @@ def build_full_sd(config: ModelConfig, seed: int) -> dict:
     torch.manual_seed(seed)
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
 
-    model = Qwen3_5ForCausalLM(config, paged=False)
+    model = Qwen3_5ForCausalLM(config)
     for name, p in model.state_dict().items():
         _set_tree(model, name, torch.randn_like(p) * 0.02)
     return {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -201,48 +202,99 @@ def run():
         "sum",
     )
 
-    # ---------------- Qwen3_5MLP ----------------
+    # ---------------- GatedMLP ----------------
     print("=" * 60)
-    print("Qwen3_5MLP (down_proj all_reduce)")
-    from picosgl.layers.qwen3_5.mlp import Qwen3_5MLP
+    print("GatedMLP (down_proj all_reduce)")
+    from picosgl.layers import GatedMLP
 
     reset_tp(0, 1)
-    mlp_full = Qwen3_5MLP(config)
+    mlp_kwargs = dict(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        hidden_act=config.hidden_act,
+    )
+    mlp_full = GatedMLP(**mlp_kwargs)
     _load_from(mlp_full, full_sd, "model.layers.1.mlp.")
     x = torch.randn(T, config.hidden_size, device=device)
     run_tp2(
-        Qwen3_5MLP,
-        dict(config=config),
+        GatedMLP,
+        mlp_kwargs,
         "model.layers.1.mlp.",
         mlp_full,
         lambda m: m.forward(x),
         "sum",
     )
 
-    # ---------------- Qwen3_5Attention (dense, paged=False) ----------------
+    # ---------------- GatedRotaryAttention (local reference attention) ----------------
     print("=" * 60)
-    print("Qwen3_5Attention eager (o_proj all_reduce)")
-    from picosgl.layers.qwen3_5.attention import Qwen3_5Attention
+    print("GatedRotaryAttention projection + o_proj all_reduce")
+    from picosgl.layers import GatedRotaryAttention
 
     positions = torch.arange(T, dtype=torch.int64, device=device)
+    rotary_config = config.rotary_config
+    attention_kwargs = dict(
+        hidden_size=config.hidden_size,
+        head_dim=config.head_dim,
+        num_qo_heads=config.num_qo_heads,
+        num_kv_heads=config.num_kv_heads,
+        layer_id=1,
+        rotary_dim=rotary_config.rotary_dim,
+        max_position=rotary_config.max_position,
+        rope_base=rotary_config.base,
+        rope_scaling=(
+            tuple(rotary_config.scaling.items()) if rotary_config.scaling else None
+        ),
+        qk_norm_eps=config.rms_norm_eps,
+        zero_centered_norm=True,
+    )
     reset_tp(0, 1)
-    attn_full = Qwen3_5Attention(config, layer_id=1, paged=False)
+    attn_full = GatedRotaryAttention(**attention_kwargs)
     _load_from(attn_full, full_sd, "model.layers.1.self_attn.")
+
+    def attention_forward(module):
+        query, gate, key, value = module.project_for_cache(x, positions)
+        num_repeats = module.num_qo_heads // module.num_kv_heads
+        key = key.repeat_interleave(num_repeats, dim=1).transpose(0, 1)
+        value = value.repeat_interleave(num_repeats, dim=1).transpose(0, 1)
+        query = query.transpose(0, 1)
+        score = torch.matmul(query, key.transpose(-1, -2)) * module.head_dim**-0.5
+        mask = torch.triu(
+            torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
+        )
+        score = F.softmax(
+            score.masked_fill(mask, float("-inf")), dim=-1, dtype=torch.float32
+        )
+        output = torch.matmul(score.to(value.dtype), value).transpose(0, 1)
+        output *= torch.sigmoid(gate)
+        return module.o_proj.forward(output.flatten(-2))
+
     run_tp2(
-        Qwen3_5Attention,
-        dict(config=config, layer_id=1, paged=False),
+        GatedRotaryAttention,
+        attention_kwargs,
         "model.layers.1.self_attn.",
         attn_full,
-        lambda m: m.forward(x, positions),
+        attention_forward,
         "sum",
     )
 
-    # ---------------- Qwen3_5GatedDeltaNet (out_proj all_reduce) ----------------
+    # ---------------- GatedDeltaNet (out_proj all_reduce) ----------------
     print("=" * 60)
-    print("Qwen3_5GatedDeltaNet prefill (out_proj all_reduce)")
+    print("GatedDeltaNet prefill (out_proj all_reduce)")
     from picosgl.cache.linear.state_pool import LinearStatePool
     from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-    from picosgl.layers.qwen3_5.gated_delta_net import Qwen3_5GatedDeltaNet
+    from picosgl.layers import GatedDeltaNet
+
+    def make_gated_delta_net():
+        return GatedDeltaNet(
+            hidden_size=config.hidden_size,
+            num_key_heads=config.linear_num_key_heads,
+            num_value_heads=config.linear_num_value_heads,
+            head_k_dim=config.linear_key_head_dim,
+            head_v_dim=config.linear_value_head_dim,
+            conv_kernel_size=config.linear_conv_kernel_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            layer_idx=0,
+        )
 
     conv_dim_full = (
         config.linear_num_key_heads * config.linear_key_head_dim * 2
@@ -286,7 +338,7 @@ def run():
     req = make_req(0, 0, L)
 
     reset_tp(0, 1)
-    gdn_full = Qwen3_5GatedDeltaNet(config, linear_layer_idx=0)
+    gdn_full = make_gated_delta_net()
     _load_from(gdn_full, full_sd, "model.layers.0.linear_attn.")
     ctx = setup_ctx(conv_dim_full, config.linear_num_value_heads)
     with ctx.forward_batch(make_batch(req)):
@@ -296,7 +348,7 @@ def run():
     gdn_parts = []
     for r in range(n):
         reset_tp(r, n)
-        gdn = Qwen3_5GatedDeltaNet(config, linear_layer_idx=0)
+        gdn = make_gated_delta_net()
         _load_from(gdn, shard_sd(full_sd, r, n, num_kv_heads, config), "model.layers.0.linear_attn.")
         ctx = setup_ctx(conv_dim_local, config.linear_num_value_heads // n)
         recs = []

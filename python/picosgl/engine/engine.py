@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 import torch
 
 from picosgl.layers.attention_backend import make_attention_backend
+from picosgl.layers.linear_attention_backend import make_linear_attention_backend
 from picosgl.layers.moe_backend import make_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
 from picosgl.distributed import (
@@ -178,6 +179,10 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = make_attention_backend(
             config.attention_backend, config.model_config
         )
+        if config.model_config.is_hybrid:
+            self.ctx.linear_attn_backend = self.linear_attn_backend = (
+                make_linear_attention_backend(config.linear_attention_backend)
+            )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = make_moe_backend(config.moe_backend)
 
@@ -425,6 +430,14 @@ def _adjust_config(config: EngineConfig):
         backend = "trtllm" if is_sm100_supported() else "fa,fi" if is_sm90_supported() else "fi"
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
+
+    if config.linear_attention_backend == "auto":
+        backend = "fla" if config.model_config.is_hybrid else "native"
+        override("linear_attention_backend", backend)
+        if config.model_config.is_hybrid:
+            logger.info_rank0(
+                f"Auto-selected linear attention backend: {config.linear_attention_backend}"
+            )
 
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64, 128]:
         override("page_size", 64)

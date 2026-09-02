@@ -6,11 +6,14 @@ import torch
 from picosgl.core import get_global_ctx
 from picosgl.layers import (
     BaseOP,
+    GatedDeltaNet,
+    GatedMLP,
+    GatedRotaryAttention,
     OPList,
     ParallelLMHead,
+    RMSNorm,
     VocabParallelEmbedding,
 )
-from picosgl.layers.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
@@ -19,8 +22,79 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+class Qwen3_5DecoderLayer(BaseOP):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        *,
+        block_type     : str | None = None,
+        full_attn_idx  : int = 0,
+        linear_attn_idx: int = 0,
+    ):
+        self.block_type = block_type or config.layer_types[layer_id]
+        self._layer_id = layer_id
+        if self.block_type == "linear_attention":
+            self.linear_attn = GatedDeltaNet(
+                hidden_size=config.hidden_size,
+                num_key_heads=config.linear_num_key_heads,
+                num_value_heads=config.linear_num_value_heads,
+                head_k_dim=config.linear_key_head_dim,
+                head_v_dim=config.linear_value_head_dim,
+                conv_kernel_size=config.linear_conv_kernel_dim,
+                rms_norm_eps=config.rms_norm_eps,
+                layer_idx=linear_attn_idx,
+            )
+        elif self.block_type == "full_attention":
+            rotary_config = config.rotary_config
+            self.self_attn = GatedRotaryAttention(
+                hidden_size=config.hidden_size,
+                head_dim=config.head_dim,
+                num_qo_heads=config.num_qo_heads,
+                num_kv_heads=config.num_kv_heads,
+                layer_id=full_attn_idx,
+                rotary_dim=rotary_config.rotary_dim,
+                max_position=rotary_config.max_position,
+                rope_base=rotary_config.base,
+                rope_scaling=(
+                    tuple(rotary_config.scaling.items())
+                    if rotary_config.scaling else None
+                ),
+                qk_norm_eps=config.rms_norm_eps,
+                zero_centered_norm=True,
+            )
+        else:
+            raise ValueError(f"Invalid layer type {self.block_type}")
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
+        )
+
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        residual = x
+        h = self.input_layernorm.forward(x)
+        if self.block_type == "linear_attention":
+            h = self.linear_attn.forward(h)
+        else:
+            h = self.self_attn.forward(h, positions)
+        h = residual + h
+
+        residual = h
+        h = self.post_attention_layernorm.forward(h)
+        h = self.mlp.forward(h)
+        return residual + h
+
+
 class Qwen3_5Model(BaseOP):
-    def __init__(self, config: ModelConfig, paged: bool = True):
+    def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         layers = []
         full_idx = 0
@@ -28,7 +102,7 @@ class Qwen3_5Model(BaseOP):
         for i, layer_type in enumerate(config.layer_types):
             if layer_type == "full_attention":
                 layers.append(
-                    Qwen3_5DecoderLayer(config, i, full_attn_idx=full_idx, paged=paged)
+                    Qwen3_5DecoderLayer(config, i, full_attn_idx=full_idx)
                 )
                 full_idx += 1
             else:
@@ -37,7 +111,9 @@ class Qwen3_5Model(BaseOP):
                 )
                 linear_idx += 1
         self.layers = OPList(layers)
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
+        )
 
     @nvtx_annotate("Model")
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -49,8 +125,8 @@ class Qwen3_5Model(BaseOP):
 
 
 class Qwen3_5ForCausalLM(BaseLLMModel):
-    def __init__(self, config: ModelConfig, paged: bool = True):
-        self.model = Qwen3_5Model(config, paged=paged)
+    def __init__(self, config: ModelConfig):
+        self.model = Qwen3_5Model(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -76,4 +152,4 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
         return output, logits
 
 
-__all__ = ["Qwen3_5ForCausalLM"]
+__all__ = ["Qwen3_5DecoderLayer", "Qwen3_5ForCausalLM"]

@@ -5,10 +5,8 @@ from picosgl.cache.linear.state_pool import LinearStatePool
 from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
-from picosgl.layers.qwen3_5.gated_delta_net import (
-    Qwen3_5GatedDeltaNet,
-    _l2norm,
-)
+from picosgl.layers import GatedDeltaNet
+from picosgl.layers.linear_attention_backend.reference import _l2norm
 from picosgl.models.config import ModelConfig, RotaryConfig
 from picosgl.utils import torch_dtype
 
@@ -121,7 +119,16 @@ def test_variable_length_layer_batch_matches_per_request():
     device = torch.device("cuda")
     with tp_override(DistributedInfo(rank=0, size=1)):
         with torch.device(device), torch_dtype(torch.bfloat16):
-            layer = Qwen3_5GatedDeltaNet(config, linear_layer_idx=0)
+            layer = GatedDeltaNet(
+                hidden_size=config.hidden_size,
+                num_key_heads=config.linear_num_key_heads,
+                num_value_heads=config.linear_num_value_heads,
+                head_k_dim=config.linear_key_head_dim,
+                head_v_dim=config.linear_value_head_dim,
+                conv_kernel_size=config.linear_conv_kernel_dim,
+                rms_norm_eps=config.rms_norm_eps,
+                layer_idx=0,
+            )
 
     torch.manual_seed(1)
     for name, param in layer.state_dict().items():
@@ -207,8 +214,8 @@ def test_variable_length_layer_batch_matches_per_request():
         for req, seq_len in zip(reqs, lengths):
             one_batch = Batch(reqs=[req], phase="verify")
             with reference_ctx.forward_batch(one_batch):
-                reference_output[offset : offset + seq_len] = layer._forward_verify(
-                    x[offset : offset + seq_len], one_batch, reference_pool, 0
+                reference_output[offset : offset + seq_len] = layer.forward(
+                    x[offset : offset + seq_len]
                 )
             offset += seq_len
     finally:

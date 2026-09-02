@@ -18,20 +18,21 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class EngineConfig:
-    model_path          : str
-    tp_info             : DistributedInfo
-    dtype               : torch.dtype
-    max_running_req     : int              = 128
-    attention_backend   : str              = "auto"
-    moe_backend         : str              = "auto"
-    cuda_graph_bs       : list[int] | None = None
-    cuda_graph_max_bs   : int | None       = None
-    page_size           : int              = 256
-    memory_ratio        : float            = 0.85
-    distributed_timeout : float            = 60.0
-    use_dummy_weight    : bool             = False
-    max_seq_len_override: int | None       = None
-    num_page_override   : int | None       = None  # if not None, will override the number of pages
+    model_path              : str
+    tp_info                 : DistributedInfo
+    dtype                   : torch.dtype
+    max_running_req         : int              = 128
+    attention_backend       : str              = "auto"
+    linear_attention_backend: str              = "auto"
+    moe_backend             : str              = "auto"
+    cuda_graph_bs           : list[int] | None = None
+    cuda_graph_max_bs       : int | None       = None
+    page_size               : int              = 256
+    memory_ratio            : float            = 0.85
+    distributed_timeout     : float            = 60.0
+    use_dummy_weight        : bool             = False
+    max_seq_len_override    : int | None       = None
+    num_page_override       : int | None       = None  # if not None, will override the number of pages
 
     speculative_algorithm        : str | None                  = None
     speculative_draft_model_path : str | None                  = None

@@ -11,11 +11,6 @@ class DecodeManager(ARManagerBase):
     def schedule_next_batch(self) -> Batch | None:
         self.inflight_uids[0] = self.inflight_uids[1]
         self.inflight_uids[1] = set()
-        
-        if (0 < len(self.inflight_uids[0]) < self.token_budget 
-            and len(self.running_reqs) > len(self.inflight_uids[0])):
-            # skip one iteration to try achieving a larger batch size
-            return None
 
         scheduled_token = 0
         reqs = []
@@ -26,9 +21,10 @@ class DecodeManager(ARManagerBase):
         ):
             if scheduled_token >= self.token_budget:
                 break
-            self.inflight_uids[1].add(uid)
-            reqs.append(req)
-            scheduled_token += 1
+            if req.can_decode:
+                self.inflight_uids[1].add(uid)
+                reqs.append(req)
+                scheduled_token += 1
 
         if reqs:
             return Batch(reqs=reqs, phase="decode")

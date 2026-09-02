@@ -4,12 +4,18 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from picosgl.core import get_global_ctx
-from picosgl.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
+from picosgl.layers import (
+    BaseOP,
+    GatedMLP as Qwen3MLP,
+    OPList,
+    ParallelLMHead,
+    RMSNormFused,
+    RotaryAttention,
+    VocabParallelEmbedding,
+)
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
-from .utils import GatedMLP as Qwen3MLP
-from .utils import RopeAttn as Qwen3Attn
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -17,8 +23,26 @@ if TYPE_CHECKING:
 
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
-        self.mlp = Qwen3MLP(config)
+        rotary_config = config.rotary_config
+        self.self_attn = RotaryAttention(
+            hidden_size=config.hidden_size,
+            head_dim=config.head_dim,
+            num_qo_heads=config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            layer_id=layer_id,
+            rotary_dim=rotary_config.rotary_dim,
+            max_position=rotary_config.max_position,
+            rope_base=rotary_config.base,
+            rope_scaling=(
+                tuple(rotary_config.scaling.items()) if rotary_config.scaling else None
+            ),
+            qk_norm_eps=config.rms_norm_eps,
+        )
+        self.mlp = Qwen3MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+        )
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,

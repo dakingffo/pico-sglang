@@ -82,7 +82,7 @@ class StateLessOP(BaseOP):
 
 
 T = TypeVar("T", bound=BaseOP)
-class OPlist(BaseOP, Generic[T]):
+class OPList(BaseOP, Generic[T]):
     def __init__(self, ops: list[T]):
         super().__init__()
         self.op_list = ops

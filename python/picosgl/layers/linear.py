@@ -72,11 +72,11 @@ class LinearColParallelMerged(_LinearTPImpl):
 class LinearQKVMerged(_LinearTPImpl):
     def __init__(
         self,
-        hidden_size: int,
-        head_dim: int,
+        hidden_size : int,
+        head_dim    : int,
         num_qo_heads: int,
         num_kv_heads: int,
-        has_bias: bool,
+        has_bias    : bool,
     ):
         tp_info = get_tp_info()
 
@@ -90,7 +90,12 @@ class LinearQKVMerged(_LinearTPImpl):
 
 
 class LinearOProj(_LinearTPImpl):
-    def __init__(self, input_size: int, output_size: int, has_bias: bool):
+    def __init__(
+        self,
+        input_size : int,
+        output_size: int,
+        has_bias   : bool
+    ):
         tp_info = get_tp_info()
         full_isize = input_size
         full_osize = output_size
@@ -100,7 +105,10 @@ class LinearOProj(_LinearTPImpl):
         self._tp_size = tp_info.size
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
@@ -110,9 +118,9 @@ class LinearOProj(_LinearTPImpl):
 class LinearRowParallel(_LinearTPImpl):
     def __init__(
         self,
-        input_size: int,
+        input_size : int,
         output_size: int,
-        has_bias: bool,
+        has_bias   : bool,
     ):
         tp_info = get_tp_info()
         local_input_size = div_even(input_size, tp_info.size)
@@ -121,7 +129,10 @@ class LinearRowParallel(_LinearTPImpl):
         self._tp_size = tp_info.size
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
@@ -139,9 +150,9 @@ class LinearColumnParallel(_LinearTPImpl):
 
     def __init__(
         self,
-        input_size: int,
+        input_size : int,
         output_size: int,
-        has_bias: bool,
+        has_bias   : bool,
     ):
         tp_info = get_tp_info()
         local_input_size = input_size
@@ -150,13 +161,16 @@ class LinearColumnParallel(_LinearTPImpl):
         self._tp_size = tp_info.size
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+    def forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        y = F.linear(x, self.weight, self.bias) # [N, D_tp]
         if self._tp_size > 1:
             # all_gather concatenates the per-rank output slices along dim 0
             # (rank-contiguous): (T*tp, out/tp) -> view(tp, T, out/tp) -> (T, out).
-            gathered = self._comm.all_gather(y)
-            gathered = gathered.view((self._tp_size,) + y.shape)
-            gathered = gathered.permute(1, 0, 2).contiguous()
-            y = gathered.reshape(y.shape[:1] + (self._tp_size * y.shape[1],))
+            gathered = self._comm.all_gather(y) # [N * TP, D_tp]
+            gathered = gathered.view((self._tp_size,) + y.shape) # [TP, N, D_tp]
+            gathered = gathered.permute(1, 0, 2).contiguous() # [N, TP, D_tp]
+            y = gathered.reshape((y.shape[0], self._tp_size * y.shape[1])) # [N, D]
         return y

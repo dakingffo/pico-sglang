@@ -35,14 +35,14 @@ def setup():
     return mcfg
 
 
-def load_model(mcfg, paged=True, loaded=None):
+def load_model(mcfg, loaded=None):
     from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
     from picosgl.models.weight import load_target_weight
 
     if loaded is None:
         loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
-        model = Qwen3_5ForCausalLM(mcfg, paged=paged)
+        model = Qwen3_5ForCausalLM(mcfg)
     # load_state_dict pops keys from the passed dict; pass a copy to keep `loaded` intact
     model.load_state_dict(dict(loaded))
     return model, loaded
@@ -138,7 +138,7 @@ def test2_gated_delta_net_math(mcfg):
     print("Test 2: GatedDeltaNet prefill vs decode math (random weights)")
     from picosgl.core import Context, get_global_ctx, set_global_ctx
     from picosgl.cache import LinearStatePool
-    from picosgl.layers.qwen3_5 import Qwen3_5GatedDeltaNet
+    from picosgl.layers import GatedDeltaNet
 
     hidden = mcfg.hidden_size
     conv_dim = (
@@ -165,7 +165,16 @@ def test2_gated_delta_net_math(mcfg):
     set_global_ctx(ctx)
 
     torch.manual_seed(0)
-    layer = Qwen3_5GatedDeltaNet(mcfg, linear_layer_idx=0)
+    layer = GatedDeltaNet(
+        hidden_size=mcfg.hidden_size,
+        num_key_heads=mcfg.linear_num_key_heads,
+        num_value_heads=mcfg.linear_num_value_heads,
+        head_k_dim=mcfg.linear_key_head_dim,
+        head_v_dim=mcfg.linear_value_head_dim,
+        conv_kernel_size=mcfg.linear_conv_kernel_dim,
+        rms_norm_eps=mcfg.rms_norm_eps,
+        layer_idx=0,
+    )
     # random fp32 weights (nested params via _set_tree)
     for name, p in layer.state_dict().items():
         _set_tree(layer, name, torch.randn_like(p) * 0.02)
@@ -221,7 +230,7 @@ def test3_full_model(mcfg, loaded=None):
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    model, loaded = load_model(mcfg, paged=True, loaded=loaded)
+    model, loaded = load_model(mcfg, loaded=loaded)
     # move weights cpu->device in place (double-copy load_state_dict peaks at 2x model = OOM)
     to_device(model, device)
 

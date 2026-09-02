@@ -33,6 +33,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         EngineConfig instance with parsed arguments
     """
     from picosgl.layers.attention_backend import validate_attn_backend
+    from picosgl.layers.linear_attention_backend import SUPPORTED_LINEAR_ATTENTION_BACKENDS
     from picosgl.cache import SUPPORTED_CACHE_MANAGER
     from picosgl.layers.moe_backend import SUPPORTED_MOE_BACKENDS
     from picosgl.speculator.drafters import (
@@ -184,6 +185,13 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         default=ServerArgs.attention_backend,
         help="The attention backend to use. If two backends are specified,"
         " the first one is used for prefill and the second one for decode.",
+    )
+
+    parser.add_argument(
+        "--linear-attention-backend",
+        default=ServerArgs.linear_attention_backend,
+        choices=["auto"] + SUPPORTED_LINEAR_ATTENTION_BACKENDS.supported_names(),
+        help="The linear attention backend used by hybrid models.",
     )
 
     parser.add_argument(

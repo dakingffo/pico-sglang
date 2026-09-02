@@ -9,8 +9,15 @@ import torch
 if TYPE_CHECKING:
     from picosgl.cache import BaseCacheHandle, BaseKVCachePool, LinearStatePool
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
+    from picosgl.layers.linear_attention_backend import BaseLinearAttentionBackend
     from picosgl.layers.moe_backend import BaseMoeBackend
     from picosgl.speculator import SpeculatorHiddenBase
+
+
+def _make_default_linear_attention_backend():
+    from picosgl.layers.linear_attention_backend import make_linear_attention_backend
+
+    return make_linear_attention_backend("native")
 
 
 @dataclass
@@ -132,11 +139,15 @@ class Batch:
 @dataclass
 class Context:
     page_size: int
-    page_table  : torch.Tensor    = field(init=False)
-    attn_backend: BaseAttnBackend = field(init=False)
-    moe_backend : BaseMoeBackend  = field(init=False)
-    kv_cache    : BaseKVCachePool = field(init=False)   # full attention
-    linear_state: LinearStatePool = field(init=False)   # linear attention
+    page_table         : torch.Tensor               = field(init=False)
+    attn_backend       : BaseAttnBackend            = field(init=False)
+    linear_attn_backend: BaseLinearAttentionBackend = field(
+        default_factory=_make_default_linear_attention_backend,
+        init=False,
+    )
+    moe_backend        : BaseMoeBackend             = field(init=False)
+    kv_cache           : BaseKVCachePool            = field(init=False)   # full attention
+    linear_state       : LinearStatePool            = field(init=False)   # linear attention
 
     state_table : torch.Tensor | None = field(default=None, init=False)
     draft_offset : int | None         = field(default=None, init=False)
