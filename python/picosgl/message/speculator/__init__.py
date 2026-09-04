@@ -24,7 +24,7 @@ from .base import (
 from . import mtp as _mtp
 
 if TYPE_CHECKING:
-    from picosgl.speculator import BaseSpeculatorConfig, SpeculatorHiddenBase
+    from picosgl.speculator import BaseSpeculatorConfig, HiddenCaptorBase
 
 
 HandshakeMessageCreator = Callable[
@@ -38,7 +38,7 @@ InitMessageCreator = Callable[
         int,
         int,
         torch.Tensor,
-        "SpeculatorHiddenBase",
+        "HiddenCaptorBase",
         SamplingParams,
     ],
     tuple[SpeculatorInitMsg, torch.Tensor],
@@ -78,7 +78,7 @@ def make_init_message(
     table_idx        : int,
     end_position     : int,
     token_ids        : torch.Tensor,
-    hidden_feature   : SpeculatorHiddenBase,
+    hidden_captor    : HiddenCaptorBase,
     sampling_params  : SamplingParams,
 ) -> tuple[SpeculatorInitMsg, torch.Tensor]:
     return SUPPORTED_INIT_MESSAGE[algorithm](
@@ -87,7 +87,7 @@ def make_init_message(
         table_idx,
         end_position,
         token_ids,
-        hidden_feature,
+        hidden_captor,
         sampling_params,
     )
 

@@ -17,6 +17,7 @@ from picosgl.layers import (
     RMSNorm,
     VocabParallelEmbedding,
 )
+from picosgl.speculator.hidden_captor import HiddenCapturePoint, with_speculator
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
@@ -212,6 +213,10 @@ class Qwen3NextDecoderLayer(BaseOP):
         )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    @with_speculator(
+        HiddenCapturePoint.DECODER_INPUT,
+        layer_id_field="_layer_id",
+    )
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         residual = x
         h = self.input_layernorm.forward(x)
@@ -272,18 +277,6 @@ class Qwen3NextForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)
         return logits
-
-    def forward_verify(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward returning (full_hidden, logits).
-
-        Used for verify batches (full per-position logits, since is_prefill=False) and, in
-        MTP mode, for prefill batches too (last-token logits via the LMHead gather) so the
-        prefill->verify handoff can capture the full hidden states.
-        """
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        logits = self.lm_head.forward(output)
-        return output, logits
-
 
 __all__ = [
     "Qwen3_5Config",

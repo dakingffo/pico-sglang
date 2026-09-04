@@ -14,7 +14,7 @@ from .base import (
 if TYPE_CHECKING:
     import torch
 
-    from picosgl.speculator import BaseSpeculatorConfig, SpeculatorHiddenBase
+    from picosgl.speculator import BaseSpeculatorConfig, HiddenCaptorBase
 
 
 @dataclass
@@ -63,17 +63,17 @@ def make_mtp_init_message(
     table_idx        : int,
     end_position     : int,
     token_ids        : torch.Tensor,
-    hidden_feature   : SpeculatorHiddenBase,
+    hidden_captor    : HiddenCaptorBase,
     sampling_params  : SamplingParams,
 ) -> tuple[MTPInitMsg, torch.Tensor]:
     from picosgl.speculator.drafters.mtp import (
-        MTPHiddenFeature,
+        MTPHiddenCaptor,
         MTPSpeculatorConfig,
     )
 
     assert isinstance(speculator_config, MTPSpeculatorConfig)
-    assert isinstance(hidden_feature, MTPHiddenFeature)
-    full_hidden = hidden_feature.full_hidden
+    assert isinstance(hidden_captor, MTPHiddenCaptor)
+    full_hidden = hidden_captor.full_hidden
     window_len = min(speculator_config.window_size, full_hidden.shape[0])
     positions = list(range(end_position + 1 - window_len, end_position + 1))
     return (

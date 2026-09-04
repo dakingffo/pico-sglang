@@ -15,6 +15,7 @@ from picosgl.layers import (
     RotaryAttention,
     VocabParallelEmbedding,
 )
+from picosgl.speculator.hidden_captor import HiddenCapturePoint, with_speculator
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
@@ -70,6 +71,10 @@ class Qwen2DecoderLayer(BaseOP):
         self._layer_id = layer_id
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    @with_speculator(
+        HiddenCapturePoint.DECODER_INPUT,
+        layer_id_field="_layer_id",
+    )
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:

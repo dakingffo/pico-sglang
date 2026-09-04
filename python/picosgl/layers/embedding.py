@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from picosgl.core import get_global_ctx
 from picosgl.distributed import DistributedCommunicator, get_tp_info
+from picosgl.speculator.hidden_captor import HiddenCapturePoint, with_speculator
 from picosgl.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
@@ -85,6 +86,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         return {} if result is None else result
 
     @nvtx_annotate("LMHead")
+    @with_speculator(HiddenCapturePoint.LM_HEAD_INPUT)
     def forward(
         self, 
         x: torch.Tensor # [N, D]

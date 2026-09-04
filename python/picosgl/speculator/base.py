@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import TYPE_CHECKING, ClassVar
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -19,11 +19,6 @@ if TYPE_CHECKING:
     from picosgl.models.drafters import BaseDrafterModel
 
 
-class SpeculatorHiddenBase(ABC):
-    @abstractmethod
-    def select(self, index) -> Self: ...
-
-
 @dataclass(frozen=True)
 class SpeculatorReserve:
     num_state_slots        : int = 0
@@ -40,9 +35,6 @@ class BaseSpeculatorConfig(ABC):
 
     @abstractmethod
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve: ...
-
-    @abstractmethod
-    def make_hidden_feature(self, full_hidden: torch.Tensor) -> SpeculatorHiddenBase: ...
 
     @abstractmethod
     def validate(self, config: EngineConfig) -> None: ...

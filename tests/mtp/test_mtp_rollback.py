@@ -173,7 +173,7 @@ def main():
         pb.out_loc = ctx.page_table[tidx, :n]
         ctx.attn_backend.prepare_metadata(pb)
         with ctx.forward_batch(pb):
-            model.forward_verify()
+            model.forward()
         return req
 
     def run_verify(tidx, C, toks):
@@ -189,7 +189,7 @@ def main():
         vb.out_loc = ctx.page_table[tidx, C : C + n]
         ctx.attn_backend.prepare_metadata(vb)
         with ctx.forward_batch(vb):
-            model.forward_verify()
+            model.forward()
         return req, n
 
     def run_decode(tidx, pos, tok):

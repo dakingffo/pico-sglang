@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from picosgl.layers.linear_attention_backend import BaseLinearAttentionBackend
     from picosgl.layers.moe_backend import BaseMoeBackend
-    from picosgl.speculator import SpeculatorHiddenBase
+    from picosgl.speculator.hidden_captor import HiddenCaptorBase
 
 
 def _make_default_linear_attention_backend():
@@ -110,7 +110,7 @@ class Batch:
     # step, used for the residual rejection sampling (needs the full distribution).
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
-    hidden_feature: SpeculatorHiddenBase | None = field(init=False, default=None)
+    hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
     linear_verify_metadata: dict[
         int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ] | None = field(init=False, default=None)

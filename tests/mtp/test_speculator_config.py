@@ -8,8 +8,9 @@ from picosgl.speculator import (
     SpeculatorReserve,
     make_data_plane_sizes,
 )
-from picosgl.speculator.drafters import make_speculator_argument_parser
-from picosgl.speculator.drafters.mtp import MTPHiddenFeature, MTPSpeculatorConfig
+from picosgl.speculator.drafters import make_hidden_captor, make_speculator_argument_parser
+from picosgl.speculator.drafters.mtp import MTPHiddenCaptor, MTPSpeculatorConfig
+from picosgl.speculator.hidden_captor import HiddenCapturePoint
 
 
 def test_mtp_speculator_config() -> None:
@@ -40,10 +41,16 @@ def test_mtp_speculator_config() -> None:
     )
 
     hidden = torch.arange(12).view(4, 3)
-    hidden_feature = speculator_config.make_hidden_feature(hidden)
-    assert isinstance(hidden_feature, MTPHiddenFeature)
-    selected = hidden_feature.select(slice(1, 3))
+    hidden_captor = make_hidden_captor("MTP", speculator_config)
+    hidden_captor.capture(HiddenCapturePoint.DECODER_INPUT, 0, hidden + 1)
+    hidden_captor.capture(HiddenCapturePoint.LM_HEAD_INPUT, None, hidden)
+    assert isinstance(hidden_captor, MTPHiddenCaptor)
+    selected = hidden_captor.select(slice(1, 3))
     assert torch.equal(selected.full_hidden, hidden[1:3])
+    assert torch.equal(
+        hidden_captor.get_carry_hidden(slice(1, 3)),
+        hidden[1:3],
+    )
 
 
 def test_mtp_argument_parser_is_independent(tmp_path) -> None:

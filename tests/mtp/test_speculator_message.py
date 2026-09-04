@@ -18,9 +18,10 @@ from picosgl.message.speculator.mtp import (
 )
 from picosgl.speculator.drafters.mtp import (
     MTPDraftManager,
-    MTPHiddenFeature,
+    MTPHiddenCaptor,
     MTPSpeculatorConfig,
 )
+from picosgl.speculator.hidden_captor import HiddenCapturePoint
 
 
 class FakeEngine:
@@ -38,6 +39,8 @@ def test_mtp_message_factories_and_roundtrip():
     assert handshake == MTPHandshakeMsg(b"id", 8, 4, 16, 32, 3)
 
     full_hidden = torch.arange(20).reshape(5, 4)
+    hidden_captor = MTPHiddenCaptor(config)
+    hidden_captor.capture(HiddenCapturePoint.LM_HEAD_INPUT, None, full_hidden)
     msg, hidden = make_init_message(
         "MTP",
         config,
@@ -45,7 +48,7 @@ def test_mtp_message_factories_and_roundtrip():
         2,
         4,
         torch.tensor([10, 11, 12, 13, 14]),
-        MTPHiddenFeature(full_hidden),
+        hidden_captor,
         SamplingParams(),
     )
     assert isinstance(msg, MTPInitMsg)
@@ -66,7 +69,7 @@ def test_mtp_types_are_not_exported_from_generic_packages():
     speculator_types = (
         "MTPDraftManager",
         "MTPEngine",
-        "MTPHiddenFeature",
+        "MTPHiddenCaptor",
         "MTPSpeculatorConfig",
         "MTPState",
     )

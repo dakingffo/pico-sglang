@@ -10,7 +10,7 @@ from picosgl.message import DetokenizeMsg
 from picosgl.utils import align_ceil
 
 if TYPE_CHECKING:
-    from picosgl.speculator import SpeculatorHiddenBase
+    from picosgl.speculator import HiddenCaptorBase
 
     from .cache import CacheManager
     from .config import SchedulerConfig
@@ -66,8 +66,8 @@ class ARManagerBase:
 
     def on_prefill_done(
         self,
-        req        : Request,
-        req_feature: SpeculatorHiddenBase,
+        req       : Request,
+        req_captor: HiddenCaptorBase,
     ) -> None:
         """Prefill -> AR handoff hook. Decode does not need speculator features."""
         return None
@@ -114,11 +114,11 @@ class ARManagerBase:
                 elif batch.is_prefill:
                     if req.can_decode:
                         self.running_reqs[req.uid] = req
-                        if batch.hidden_feature is not None:
+                        if batch.hidden_captor is not None:
                             mapping = forward_input.input_tuple[0]
                             self.on_prefill_done(
                                 req,
-                                batch.hidden_feature.select(mapping == req.table_idx)
+                                batch.hidden_captor.select(mapping == req.table_idx)
                             )
                     self.cache_manager.cache_req(req, finished=False)
 

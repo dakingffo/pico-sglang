@@ -3,10 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
-import torch
-
-from ...base import BaseSpeculatorConfig, SpeculatorHiddenBase, SpeculatorReserve
-from .state import MTPHiddenFeature
+from ...base import BaseSpeculatorConfig, SpeculatorReserve
 
 if TYPE_CHECKING:
     from picosgl.engine.config import EngineConfig
@@ -29,9 +26,6 @@ class MTPSpeculatorConfig(BaseSpeculatorConfig):
             num_state_slots=max_running_req * width,
             state_slots_per_request=width,
         )
-
-    def make_hidden_feature(self, full_hidden: torch.Tensor) -> SpeculatorHiddenBase:
-        return MTPHiddenFeature(full_hidden)
 
     def validate(self, config: EngineConfig) -> None:
         from picosgl.models.qwen3_next import Qwen3_5Config

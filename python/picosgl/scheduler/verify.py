@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.engine import VerifyOutput
+from picosgl.engine import ForwardOutput
 from picosgl.core import Batch, Request, Context
 from picosgl.message import (
     DetokenizeMsg,
@@ -13,7 +13,7 @@ from picosgl.message import (
     SpeculatorStepReq,
     make_init_message,
 )
-from picosgl.speculator import DraftState, SpeculatorHiddenBase
+from picosgl.speculator import DraftState, HiddenCaptorBase
 from picosgl.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
@@ -90,8 +90,8 @@ class VerifyManager(ARManagerBase):
 
     def on_prefill_done(
         self,
-        req        : Request,
-        req_feature: SpeculatorHiddenBase,
+        req       : Request,
+        req_captor: HiddenCaptorBase,
     ) -> None:
         msg, hidden = make_init_message(
             self.speculative_algorithm,
@@ -100,7 +100,7 @@ class VerifyManager(ARManagerBase):
             req.table_idx,
             req.cached_len,
             self.token_pool[req.table_idx],
-            req_feature,
+            req_captor,
             req.sampling_params,
         )
         self.client.init(msg, hidden)
@@ -200,14 +200,15 @@ class VerifyManager(ARManagerBase):
         self,
         ctx          : Context,
         forward_input: ForwardInput,
-        output       : VerifyOutput
+        output       : ForwardOutput,
     ) -> tuple[list[DetokenizeMsg], list[Request]]:
         batch = forward_input.batch
         if not batch.is_verify:
             return super().process(ctx, forward_input, output)  # prefill commit
 
         extend_token = output.next_tokens_gpu  # (bs, K+1) int32
-        full_hidden = output.full_hidden
+        hidden_captor = batch.hidden_captor
+        assert hidden_captor is not None
         offset = 0
         committed: list[tuple[int, int, list[int], int]] = [tuple()] * len(batch.reqs)
 
@@ -240,7 +241,9 @@ class VerifyManager(ARManagerBase):
             st.set_carry(
                 sampled_token,
                 list(range(C + 1, C + 1 + num_sampled)),
-                full_hidden[row_start: row_start + num_sampled],
+                hidden_captor.get_carry_hidden(
+                    slice(row_start, row_start + num_sampled)
+                ),
             )
             committed[i] = (C, num_sampled, sampled_token, n_drafts)
 

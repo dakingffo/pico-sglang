@@ -1,5 +1,5 @@
 from .config import EngineConfig
-from .engine import Engine, ForwardInput, ForwardOutput, VerifyOutput, ForwardData
+from .engine import Engine, ForwardInput, ForwardOutput, ForwardData
 from .sample import BatchSamplingArgs, Sampler
 
 __all__ = [
@@ -7,7 +7,6 @@ __all__ = [
     "EngineConfig", 
     "ForwardInput", 
     "ForwardOutput", 
-    "VerifyOutput", 
     "ForwardData", 
     "BatchSamplingArgs",
     "Sampler"

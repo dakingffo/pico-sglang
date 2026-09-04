@@ -52,13 +52,6 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
-class VerifyOutput(NamedTuple):
-    next_tokens_gpu: torch.Tensor
-    next_tokens_cpu: torch.Tensor
-    copy_done_event: torch.cuda.Event
-    full_hidden    : torch.Tensor
-
-
 ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 
@@ -348,18 +341,20 @@ class Engine:
 
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs
-    ) -> ForwardOutput | VerifyOutput:
+    ) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.config.enable_specualtive_decoding and (
+            batch.is_prefill or batch.is_verify
+        ):
+            from picosgl.speculator.drafters import make_hidden_captor
+
+            algorithm = self.config.speculative_algorithm
+            speculator_config = self.config.speculator_config
+            assert algorithm is not None and speculator_config is not None
+            batch.hidden_captor = make_hidden_captor(algorithm, speculator_config)
+
         with self.ctx.forward_batch(batch):
-            if batch.is_verify or (
-                self.config.enable_specualtive_decoding and batch.is_prefill
-            ):
-                hidden, logits = self.model.forward_verify()
-                if batch.is_prefill:
-                    speculator_config = self.config.speculator_config
-                    assert speculator_config is not None
-                    batch.hidden_feature = speculator_config.make_hidden_feature(hidden)
-            elif self.graph_runner.can_use_cuda_graph(batch):
+            if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -369,7 +364,7 @@ class Engine:
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
             copy_done_event = torch.cuda.Event()
             copy_done_event.record(self.stream)
-            return VerifyOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, hidden)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
         else: # prefill / decode
             next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
