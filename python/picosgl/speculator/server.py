@@ -23,6 +23,7 @@ from .data_plane import (
     make_data_plane_sizes,
 )
 from .drafters.mtp import MTPDraftManager, MTPEngine
+from .drafters.eagle3 import Eagle3DraftManager, Eagle3Engine
 from .runner import SpeculatorRunner
 from .client import (
     BroadcastSpeculatorClient,
@@ -39,6 +40,8 @@ SUPPORTED_DRAFT_MANAGER = Registry[type[DraftManagerBase]]("Draft Manager")
 SUPPORTED_DRAFTER_ENGINE = Registry[type[EngineBase]]("Drafter Engine")
 SUPPORTED_DRAFT_MANAGER.register("MTP")(MTPDraftManager)
 SUPPORTED_DRAFTER_ENGINE.register("MTP")(MTPEngine)
+SUPPORTED_DRAFT_MANAGER.register("EAGLE3")(Eagle3DraftManager)
+SUPPORTED_DRAFTER_ENGINE.register("EAGLE3")(Eagle3Engine)
 logger = init_logger(__name__)
 
 

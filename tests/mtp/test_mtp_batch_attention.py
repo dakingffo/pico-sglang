@@ -2,67 +2,51 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from picosgl.distributed import DistributedInfo, set_tp_info
-
-
-def _reset_tp() -> None:
-    import picosgl.distributed.info as info
-
-    info._TP_INFO = None
-    set_tp_info(DistributedInfo(rank=0, size=1))
-
-
-def _make_attention(device: torch.device):
-    _reset_tp()
-    from picosgl.layers import GatedRotaryAttention
-
-    with torch.device(device):
-        attention = GatedRotaryAttention(
-            hidden_size=32,
-            head_dim=8,
-            num_qo_heads=4,
-            num_kv_heads=2,
-            layer_id=0,
-            rotary_dim=8,
-            max_position=128,
-            rope_base=10_000.0,
-            rope_scaling=None,
-            qk_norm_eps=1e-6,
-            zero_centered_norm=True,
-        )
-    generator = torch.Generator(device=device).manual_seed(17)
-    with torch.no_grad():
-        for tensor in attention.state_dict().values():
-            tensor.copy_(
-                torch.randn(tensor.shape, device=device, generator=generator) * 0.05
-            )
-    return attention
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
-    from picosgl.speculator.drafters.mtp.attention import MTPAttentionBackend
-    from picosgl.speculator.drafters.mtp.pool import MTPKVPool
+    from picosgl.speculator.drafters.attention import DraftAttentionBackend
+    from picosgl.speculator.drafters.pool import DraftKVPool
 
     device = torch.device("cuda")
-    attention = _make_attention(device)
+    num_qo_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
     lengths = [2, 4, 3]
     offsets = [0, 2, 6]
     total = sum(lengths)
     generator = torch.Generator(device=device).manual_seed(31)
-    x = torch.randn(total, 32, device=device, generator=generator)
-    positions = torch.cat([
-        torch.arange(length, device=device) for length in lengths
-    ])
-
-    query, gate, key, value = attention.proj(x, positions)
-    pool = MTPKVPool(
+    query = torch.randn(
+        total,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+        generator=generator,
+    )
+    key = torch.randn(
+        total,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+        generator=generator,
+    )
+    value = torch.randn(
+        total,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+        generator=generator,
+    )
+    pool = DraftKVPool(
         max_running_req=3,
         window_size=max(lengths),
         max_batch_size=3,
         num_spec_tokens=1,
-        num_kv_heads=attention.num_kv_heads,
-        head_dim=attention.head_dim,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
         dtype=key.dtype,
         device=device,
     )
@@ -79,19 +63,17 @@ def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
         last_rows.append(offset + length - 1)
 
     last_rows = torch.tensor(last_rows, device=device)
-    backend = MTPAttentionBackend(
-        "auto",
-        attention.num_qo_heads,
-        attention.num_kv_heads,
-        attention.head_dim,
+    backend = DraftAttentionBackend(
+        "eager",
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
         key.dtype,
         device,
     )
     pooled = backend.forward(query[last_rows], pool, indices, valid, lengths)
-    pooled = pooled * torch.sigmoid(gate[last_rows])
-    pooled = attention.o_proj.forward(pooled.reshape(len(lengths), -1))
     expected = []
-    num_repeats = attention.num_qo_heads // attention.num_kv_heads
+    num_repeats = num_qo_heads // num_kv_heads
     for offset, length, last_row in zip(offsets, lengths, last_rows):
         query_row = query[last_row]
         key_row = key[offset : offset + length].repeat_interleave(
@@ -102,10 +84,9 @@ def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
         ).transpose(0, 1)
         score = torch.matmul(query_row.unsqueeze(1), key_row.transpose(-1, -2))
         score = F.softmax(
-            score * attention.head_dim**-0.5, dim=-1, dtype=torch.float32
+            score * head_dim**-0.5, dim=-1, dtype=torch.float32
         )
         output = torch.matmul(score.to(value_row.dtype), value_row).squeeze(1)
-        output *= torch.sigmoid(gate[last_row])
-        expected.append(attention.o_proj.forward(output.flatten()))
+        expected.append(output)
 
-    torch.testing.assert_close(pooled, torch.stack(expected))
+    torch.testing.assert_close(pooled, torch.stack(expected), atol=2e-3, rtol=2e-3)

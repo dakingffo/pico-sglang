@@ -9,9 +9,9 @@ from picosgl.engine import Sampler
 from picosgl.models.drafters import BaseDrafterModel, Qwen3_5MTPDrafter
 
 from ...base import EngineBase
-from .attention import MTPAttentionBackend
+from ..attention import DraftAttentionBackend
+from ..pool import DraftKVPool
 from .config import MTPSpeculatorConfig
-from .pool import MTPKVPool
 from .state import MTPState
 
 if TYPE_CHECKING:
@@ -41,7 +41,7 @@ class MTPEngine(EngineBase):
         self.sampler = Sampler(device, vocab_size)
 
         attention = self.drafter.layers.op_list[0].self_attn
-        self.pool = MTPKVPool(
+        self.pool = DraftKVPool(
             max_running_req=max_running_req,
             window_size=window_size,
             max_batch_size=max_batch_size,
@@ -51,7 +51,7 @@ class MTPEngine(EngineBase):
             dtype=attention.qkv_proj.weight.dtype,
             device=device,
         )
-        self.attention_backend = MTPAttentionBackend(
+        self.attention_backend = DraftAttentionBackend(
             backend_name=attention_backend,
             num_qo_heads=attention.num_qo_heads,
             num_kv_heads=attention.num_kv_heads,

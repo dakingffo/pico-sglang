@@ -3,12 +3,12 @@ from __future__ import annotations
 import torch
 
 
-class MTPKVPool:
-    """Fixed-capacity KV storage for the single-layer MTP transformer.
+class DraftKVPool:
+    """Fixed-capacity KV storage for a single-layer autoregressive drafter.
 
     Every target request owns ``window_size`` persistent slots.  Draft batches share a
     second region with ``num_spec_tokens`` slots per batch row; that region is ephemeral
-    and may be overwritten as soon as ``MTPEngine.draft`` returns.
+    and may be overwritten as soon as the current draft call returns.
 
     ``persistent_table`` and ``scratch_table`` contain physical token-slot indices.  The
     persistent rows are circular buffers, so advancing a full carry window never moves
@@ -206,5 +206,5 @@ class MTPKVPool:
 
     def _check_table_idx(self, table_idx: int) -> None:
         assert 0 <= table_idx < self.max_running_req, (
-            f"MTP table_idx {table_idx} outside [0, {self.max_running_req})"
+            f"Draft table_idx {table_idx} outside [0, {self.max_running_req})"
         )

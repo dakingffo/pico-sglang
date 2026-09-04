@@ -4,16 +4,16 @@ import torch
 
 from picosgl.utils import init_logger
 
-from .pool import MTPKVPool
+from .pool import DraftKVPool
 
 logger = init_logger(__name__)
 
 
-class MTPAttentionBackend:
-    """One-query paged attention over ``MTPKVPool``.
+class DraftAttentionBackend:
+    """One-query paged attention over ``DraftKVPool``.
 
     The FlashInfer adapter deliberately consumes only Q, physical page indices and the
-    MTP pool.  It does not construct a fake target ``Batch`` or touch global ``Context``.
+    drafter pool. It does not construct a fake target ``Batch`` or touch global ``Context``.
     Non-FlashInfer configurations retain the numerically equivalent eager implementation.
     """
 
@@ -54,12 +54,14 @@ class MTPAttentionBackend:
                 self.last_event = torch.cuda.Event()
                 self.last_event.record()
             except ImportError:
-                logger.warning("FlashInfer unavailable for MTP; using eager pooled attention.")
+                logger.warning(
+                    "FlashInfer unavailable for drafter; using eager pooled attention."
+                )
 
     def forward(
         self,
         query      : torch.Tensor,
-        pool       : MTPKVPool,
+        pool       : DraftKVPool,
         indices    : torch.Tensor,
         valid_mask : torch.Tensor,
         cache_lens : list[int],
@@ -71,7 +73,7 @@ class MTPAttentionBackend:
     def _forward_flashinfer(
         self,
         query     : torch.Tensor,
-        pool      : MTPKVPool,
+        pool      : DraftKVPool,
         indices   : torch.Tensor,
         cache_lens: list[int],
     ) -> torch.Tensor:
@@ -112,7 +114,7 @@ class MTPAttentionBackend:
     def _forward_eager(
         self,
         query     : torch.Tensor,
-        pool      : MTPKVPool,
+        pool      : DraftKVPool,
         indices   : torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:

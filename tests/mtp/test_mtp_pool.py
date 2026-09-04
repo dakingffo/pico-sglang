@@ -1,10 +1,10 @@
 import torch
 
-from picosgl.speculator.drafters.mtp.pool import MTPKVPool
+from picosgl.speculator.drafters.pool import DraftKVPool
 
 
-def _make_pool() -> MTPKVPool:
-    return MTPKVPool(
+def _make_pool() -> DraftKVPool:
+    return DraftKVPool(
         max_running_req=3,
         window_size=4,
         max_batch_size=2,

@@ -30,6 +30,10 @@ class BaseSpeculatorConfig(ABC):
     num_draft_tokens: int
 
     @property
+    def hidden_size_multiplier(self) -> int:
+        return 1
+
+    @property
     @abstractmethod
     def max_init_hidden_rows(self) -> int: ...
 

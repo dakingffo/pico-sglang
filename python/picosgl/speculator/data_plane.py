@@ -36,7 +36,7 @@ def make_data_plane_sizes(
     )
     return DataPlaneSizes(
         max(speculator_config.max_init_hidden_rows, max_batch_size * (K + 1)),
-        hidden_size,
+        hidden_size * speculator_config.hidden_size_multiplier,
         max_batch_size * K, vocab_size,
     )
 
