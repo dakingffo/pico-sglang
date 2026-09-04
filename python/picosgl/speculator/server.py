@@ -119,9 +119,9 @@ def speculator_worker(
     torch.cuda.set_stream(stream)
 
     # the drafter is always tp=1 (standalone rank 0): the split controls the DEVICE it
-    # runs on (--enable-dt-separation), not the drafter's TP sharding. The layer builders
-    # (LinearColumnParallel etc.) read the global TP info, which the main engine sets for
-    # itself — this process must set it before constructing the model.
+    # runs on (--enable-dt-separation), not the drafter's TP sharding. Layer builders
+    # read the global TP info, which the main engine sets for itself — this process must
+    # set it before constructing the model.
     with tp_override(DistributedInfo(0, 1)):
         speculator_config = args.speculator_config
         assert speculator_config is not None

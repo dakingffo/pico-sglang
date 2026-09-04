@@ -1,6 +1,6 @@
-"""Qwen3.5-2B verification for the pico-sglang qwen3_5 implementation.
+"""Qwen3.5 verification using a Qwen3.5-2B checkpoint.
 
-Run with: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_qwen35_model.py
+Run with: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_qwen3_5_model.py
 
 Tests:
   1. Weight loading: model.state_dict() keys vs checkpoint keys (no missing/unexpected).
@@ -16,9 +16,9 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
 import torch
 
-# Overridable so the same script verifies any Qwen3.5 size (e.g. 0.8B / 4B):
-#   QWEN35_MODEL=/path/to/Qwen3.5-0.8B python tests/mtp/test_qwen35_model.py
-MODEL_PATH = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
+# Qwen3.6 checkpoints use the same Hugging Face architecture implementation.
+#   QWEN3_5_MODEL=/path/to/model python tests/mtp/test_qwen3_5_model.py
+MODEL_PATH = os.environ.get("QWEN3_5_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
 
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
@@ -29,20 +29,20 @@ def setup():
     from picosgl.distributed import DistributedInfo, set_tp_info
 
     set_tp_info(DistributedInfo(rank=0, size=1))
-    from picosgl.models.config import ModelConfig
+    from picosgl.models import make_model_config
 
-    mcfg = ModelConfig.from_pretrained(load_model_config(MODEL_PATH))
+    mcfg = make_model_config(load_model_config(MODEL_PATH))
     return mcfg
 
 
 def load_model(mcfg, loaded=None):
-    from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
+    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
     from picosgl.models.weight import load_target_weight
 
     if loaded is None:
         loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
-        model = Qwen3_5ForCausalLM(mcfg)
+        model = Qwen3NextForCausalLM(mcfg)
     # load_state_dict pops keys from the passed dict; pass a copy to keep `loaded` intact
     model.load_state_dict(dict(loaded))
     return model, loaded
@@ -63,7 +63,7 @@ def test1_weight_loading(mcfg, model, loaded):
     # spot-check shapes on representative target-model layers
     lt = "model.layers.0.linear_attn"
     at = "model.layers.3.self_attn"
-    for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkv.weight", f"{at}.q_proj.weight",
+    for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkv.weight", f"{at}.qkv_proj.weight",
               f"{at}.q_norm.weight", "model.norm.weight"):
         assert k in sd, f"missing {k}"
         print(f"  {k}: {tuple(sd[k].shape)} {sd[k].dtype}")

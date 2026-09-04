@@ -15,7 +15,6 @@ class VocabParallelEmbedding(BaseOP):
         num_embeddings: int,
         embedding_dim : int,
     ):
-        super().__init__()
         tp_info = get_tp_info()
         tp_rank = tp_info.rank
         self.tp_size = tp_info.size

@@ -47,7 +47,7 @@ def load_model_config(
         return type(config)(**config.to_dict())
     except Exception:
         # Fallback for architectures not yet registered in this transformers version
-        # (e.g. Qwen3.5). Builds a lightweight attribute object mirroring the config;
+        # (e.g. Qwen3Next). Builds a lightweight attribute object mirroring the config;
         # picosgl only reads attributes off it, so this is sufficient.
         from types import SimpleNamespace
 

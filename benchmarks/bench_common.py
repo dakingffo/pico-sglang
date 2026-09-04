@@ -607,7 +607,7 @@ def summarize(
     content_chunks = [max(len(t) - 3, 0) for t in tics_all]
     # Actual generated token count:
     #  - MTP: each verify round commits num_sampled tokens; the server delivers the full
-    #    max_tokens budget. Verified on Qwen3.5-0.8B: max_tokens=8/16 -> 8/16 tokens.
+    #    max_tokens budget. Verified on Qwen3.5: max_tokens=8/16 -> 8/16 tokens.
     #  - non-MTP: one content chunk == one token, so ground truth == content chunks. The
     #    scheduler delivers the full budget (DecodeManager snapshots `finished` at
     #    complete_n time instead of reading the pipeline-advanced device_len).

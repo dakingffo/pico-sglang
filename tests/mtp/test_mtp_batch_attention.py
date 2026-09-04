@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -11,43 +12,50 @@ def _reset_tp() -> None:
     set_tp_info(DistributedInfo(rank=0, size=1))
 
 
-def _make_attention():
+def _make_attention(device: torch.device):
     _reset_tp()
     from picosgl.layers import GatedRotaryAttention
 
-    attention = GatedRotaryAttention(
-        hidden_size=32,
-        head_dim=8,
-        num_qo_heads=4,
-        num_kv_heads=2,
-        layer_id=0,
-        rotary_dim=8,
-        max_position=128,
-        rope_base=10_000.0,
-        rope_scaling=None,
-        qk_norm_eps=1e-6,
-        zero_centered_norm=True,
-    )
-    generator = torch.Generator().manual_seed(17)
+    with torch.device(device):
+        attention = GatedRotaryAttention(
+            hidden_size=32,
+            head_dim=8,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            layer_id=0,
+            rotary_dim=8,
+            max_position=128,
+            rope_base=10_000.0,
+            rope_scaling=None,
+            qk_norm_eps=1e-6,
+            zero_centered_norm=True,
+        )
+    generator = torch.Generator(device=device).manual_seed(17)
     with torch.no_grad():
         for tensor in attention.state_dict().values():
-            tensor.copy_(torch.randn(tensor.shape, generator=generator) * 0.05)
+            tensor.copy_(
+                torch.randn(tensor.shape, device=device, generator=generator) * 0.05
+            )
     return attention
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
     from picosgl.speculator.drafters.mtp.attention import MTPAttentionBackend
     from picosgl.speculator.drafters.mtp.pool import MTPKVPool
 
-    attention = _make_attention()
+    device = torch.device("cuda")
+    attention = _make_attention(device)
     lengths = [2, 4, 3]
     offsets = [0, 2, 6]
     total = sum(lengths)
-    generator = torch.Generator().manual_seed(31)
-    x = torch.randn(total, 32, generator=generator)
-    positions = torch.cat([torch.arange(length) for length in lengths])
+    generator = torch.Generator(device=device).manual_seed(31)
+    x = torch.randn(total, 32, device=device, generator=generator)
+    positions = torch.cat([
+        torch.arange(length, device=device) for length in lengths
+    ])
 
-    query, gate, key, value = attention.project_for_cache(x, positions)
+    query, gate, key, value = attention.proj(x, positions)
     pool = MTPKVPool(
         max_running_req=3,
         window_size=max(lengths),
@@ -56,26 +64,28 @@ def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
         num_kv_heads=attention.num_kv_heads,
         head_dim=attention.head_dim,
         dtype=key.dtype,
-        device=torch.device("cpu"),
+        device=device,
     )
     pool.k[:total].copy_(key)
     pool.v[:total].copy_(value)
-    indices = torch.zeros(3, max(lengths), dtype=torch.int32)
-    valid = torch.zeros(3, max(lengths), dtype=torch.bool)
+    indices = torch.zeros(3, max(lengths), dtype=torch.int32, device=device)
+    valid = torch.zeros(3, max(lengths), dtype=torch.bool, device=device)
     last_rows = []
     for i, (offset, length) in enumerate(zip(offsets, lengths)):
-        indices[i, :length] = torch.arange(offset, offset + length, dtype=torch.int32)
+        indices[i, :length] = torch.arange(
+            offset, offset + length, dtype=torch.int32, device=device
+        )
         valid[i, :length] = True
         last_rows.append(offset + length - 1)
 
-    last_rows = torch.tensor(last_rows)
+    last_rows = torch.tensor(last_rows, device=device)
     backend = MTPAttentionBackend(
         "auto",
         attention.num_qo_heads,
         attention.num_kv_heads,
         attention.head_dim,
         key.dtype,
-        torch.device("cpu"),
+        device,
     )
     pooled = backend.forward(query[last_rows], pool, indices, valid, lengths)
     pooled = pooled * torch.sigmoid(gate[last_rows])

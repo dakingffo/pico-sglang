@@ -6,10 +6,10 @@ from typing import Any, Callable
 
 import torch
 
-from .base import StateLessOP
+from .base import BaseOP
 
 
-class RotaryEmbedding(StateLessOP):
+class RotaryEmbedding(BaseOP):
     def __init__(
         self,
         head_size              : int,
@@ -18,7 +18,6 @@ class RotaryEmbedding(StateLessOP):
         base                   : float,
         post_process           : None | Callable[[torch.Tensor], torch.Tensor] = None,
     ) -> None:
-        super().__init__()
         self.head_size = head_size
         assert 0 < rotary_dim <= head_size
         assert rotary_dim % 2 == 0
@@ -31,26 +30,6 @@ class RotaryEmbedding(StateLessOP):
         sin = freqs.sin()
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
-
-    def _forward_torch(
-        self,
-        positions: torch.Tensor,
-        query    : torch.Tensor,
-        key      : torch.Tensor,
-    ) -> None:
-        rotary_dim = self._cos_sin_cache.shape[1]
-        half_dim = rotary_dim // 2
-        cos = self._cos_sin_cache[positions, :half_dim]
-        sin = self._cos_sin_cache[positions, half_dim:]
-        cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
-        sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
-
-        for tensor in (query, key):
-            heads = tensor.view(tensor.shape[0], -1, self.head_size)
-            x = heads[..., :rotary_dim]
-            x1, x2 = x.chunk(2, dim=-1)
-            rotated = torch.cat((-x2, x1), dim=-1)
-            x.copy_((x * cos + rotated * sin).to(x.dtype))
 
     def forward(
         self,
@@ -66,18 +45,18 @@ class RotaryEmbedding(StateLessOP):
             key = key.reshape(-1, key.shape[-2] * key.shape[-1])
         positions = positions.reshape(-1)
         assert query.shape[0] == key.shape[0] == positions.shape[0]
-        if query.is_cuda and self.head_size in (64, 128, 256, 512):
-            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+        assert query.is_cuda and key.is_cuda and positions.is_cuda
+        assert self.head_size in (64, 128, 256, 512)
 
-            apply_rope_with_cos_sin_cache_inplace(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
-                cos_sin_cache=self._cos_sin_cache,
-            )
-        else:
-            self._forward_torch(positions, query, key)
+        from flashinfer import apply_rope_with_cos_sin_cache_inplace
+
+        apply_rope_with_cos_sin_cache_inplace(
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            cos_sin_cache=self._cos_sin_cache,
+        )
         return query.reshape(query_shape), key.reshape(key_shape)
 
 
@@ -170,6 +149,3 @@ def get_rope(
         with torch.device(_ROPE_DEVICE):
             return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
     return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
-
-
-__all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]

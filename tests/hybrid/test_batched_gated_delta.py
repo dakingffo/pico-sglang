@@ -7,7 +7,8 @@ from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
 from picosgl.layers import GatedDeltaNet
 from picosgl.layers.linear_attention_backend.reference import _l2norm
-from picosgl.models.config import ModelConfig, RotaryConfig
+from picosgl.models.config import RotaryConfig
+from picosgl.models.qwen3_next import Qwen3_5Config
 from picosgl.utils import torch_dtype
 
 
@@ -76,8 +77,8 @@ def test_batched_kernel_matches_torch(shape):
     )
 
 
-def _tiny_config() -> ModelConfig:
-    return ModelConfig(
+def _tiny_config() -> Qwen3_5Config:
+    return Qwen3_5Config(
         num_layers=1,
         num_qo_heads=2,
         num_kv_heads=2,
@@ -86,14 +87,9 @@ def _tiny_config() -> ModelConfig:
         vocab_size=128,
         intermediate_size=128,
         rms_norm_eps=1e-6,
-        rotary_config=RotaryConfig(32, 32, 128, 10000.0, None),
+        rotary_config=RotaryConfig(32, 128, 10000.0, None),
         hidden_act="silu",
         tie_word_embeddings=False,
-        num_experts=0,
-        num_experts_per_tok=0,
-        moe_intermediate_size=0,
-        norm_topk_prob=False,
-        model_type="qwen3_5",
         architectures=["Qwen3_5ForCausalLM"],
         layer_types=["linear_attention"],
         linear_num_key_heads=2,
@@ -101,6 +97,14 @@ def _tiny_config() -> ModelConfig:
         linear_key_head_dim=32,
         linear_value_head_dim=32,
         linear_conv_kernel_dim=4,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        norm_topk_prob=False,
+        mlp_only_layers=[0],
+        decoder_sparse_step=1,
+        mtp_num_hidden_layers=0,
     )
 
 

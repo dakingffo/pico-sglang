@@ -1,6 +1,6 @@
 from .base import BaseLLMModel
 from .config import ModelConfig, RotaryConfig
-from .register import get_model_class
+from .register import get_model_class, make_model_config
 from .weight import load_target_weight, load_weight
 
 
@@ -8,4 +8,11 @@ def make_model(model_config: ModelConfig) -> BaseLLMModel:
     return get_model_class(model_config.architectures[0], model_config)
 
 
-__all__ = ["make_model", "load_target_weight", "load_weight", "RotaryConfig"]
+__all__ = [
+    "ModelConfig",
+    "RotaryConfig",
+    "load_target_weight",
+    "load_weight",
+    "make_model",
+    "make_model_config",
+]

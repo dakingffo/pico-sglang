@@ -48,7 +48,7 @@ class MTPEngine(EngineBase):
             num_spec_tokens=num_spec_tokens,
             num_kv_heads=attention.num_kv_heads,
             head_dim=attention.head_dim,
-            dtype=attention.k_proj.weight.dtype,
+            dtype=attention.qkv_proj.weight.dtype,
             device=device,
         )
         self.attention_backend = MTPAttentionBackend(
@@ -56,7 +56,7 @@ class MTPEngine(EngineBase):
             num_qo_heads=attention.num_qo_heads,
             num_kv_heads=attention.num_kv_heads,
             head_dim=attention.head_dim,
-            dtype=attention.k_proj.weight.dtype,
+            dtype=attention.qkv_proj.weight.dtype,
             device=device,
         )
 
@@ -85,8 +85,13 @@ class MTPEngine(EngineBase):
     def load_drafter(
         device: torch.device, config: EngineConfig
     ) -> Qwen3_5MTPDrafter:
+        from picosgl.layers import set_rope_device
+        from picosgl.models.qwen3_next import Qwen3_5Config
+
         mc = config.model_config
-        with torch_dtype(config.dtype):
+        assert isinstance(mc, Qwen3_5Config)
+        set_rope_device(device)
+        with torch.device("meta"), torch_dtype(config.dtype):
             drafter = Qwen3_5MTPDrafter(mc)
         model_path = config.speculative_draft_model_path
         assert model_path is not None

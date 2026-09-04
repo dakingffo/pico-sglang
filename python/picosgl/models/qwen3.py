@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from dataclasses import dataclass
+from typing import Tuple
 
 import torch
+from transformers import PretrainedConfig
 from picosgl.core import get_global_ctx
 from picosgl.layers import (
     BaseOP,
-    GatedMLP as Qwen3MLP,
+    GatedMLP,
+    MoEMLP,
     OPList,
     ParallelLMHead,
     RMSNormFused,
@@ -16,13 +19,56 @@ from picosgl.layers import (
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
+from .config import (
+    ModelConfig,
+    make_common_config_kwargs,
+    make_moe_config_kwargs,
+    unwrap_text_config,
+)
 
-if TYPE_CHECKING:
-    from .config import ModelConfig
+
+@dataclass(frozen=True)
+class Qwen3BaseConfig(ModelConfig):
+    pass
+
+
+@dataclass(frozen=True)
+class Qwen3Config(Qwen3BaseConfig):
+    intermediate_size: int
+    hidden_act       : str
+
+    @classmethod
+    def from_pretrained(cls, config: PretrainedConfig) -> Qwen3Config:
+        top, text = unwrap_text_config(config)
+        return cls(
+            **make_common_config_kwargs(top, text),
+            intermediate_size=text.intermediate_size,
+            hidden_act=text.hidden_act,
+        )
+
+
+@dataclass(frozen=True)
+class Qwen3MoeConfig(Qwen3BaseConfig):
+    num_experts          : int
+    num_experts_per_tok  : int
+    moe_intermediate_size: int
+    norm_topk_prob       : bool
+
+    @property
+    def is_moe(self) -> bool:
+        return True
+
+    @classmethod
+    def from_pretrained(cls, config: PretrainedConfig) -> Qwen3MoeConfig:
+        top, text = unwrap_text_config(config)
+        return cls(
+            **make_common_config_kwargs(top, text),
+            **make_moe_config_kwargs(text),
+        )
 
 
 class Qwen3DecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: Qwen3BaseConfig, layer_id: int):
         rotary_config = config.rotary_config
         self.self_attn = RotaryAttention(
             hidden_size=config.hidden_size,
@@ -38,11 +84,21 @@ class Qwen3DecoderLayer(BaseOP):
             ),
             qk_norm_eps=config.rms_norm_eps,
         )
-        self.mlp = Qwen3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        if isinstance(config, Qwen3MoeConfig):
+            self.mlp = MoEMLP(
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                renormalize=config.norm_topk_prob,
+            )
+        else:
+            assert isinstance(config, Qwen3Config)
+            self.mlp = GatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+            )
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -66,7 +122,7 @@ class Qwen3DecoderLayer(BaseOP):
 
 
 class Qwen3Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: Qwen3BaseConfig):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -88,7 +144,7 @@ class Qwen3Model(BaseOP):
 
 
 class Qwen3ForCausalLM(BaseLLMModel):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: Qwen3BaseConfig):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -96,7 +152,6 @@ class Qwen3ForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
-        super().__init__()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
@@ -104,4 +159,9 @@ class Qwen3ForCausalLM(BaseLLMModel):
         return logits
 
 
-__all__ = ["Qwen3ForCausalLM"]
+__all__ = [
+    "Qwen3BaseConfig",
+    "Qwen3Config",
+    "Qwen3ForCausalLM",
+    "Qwen3MoeConfig",
+]

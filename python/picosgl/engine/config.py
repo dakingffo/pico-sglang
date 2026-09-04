@@ -9,10 +9,9 @@ from transformers import PretrainedConfig
 
 from picosgl.distributed import DistributedInfo
 from picosgl.utils import load_model_config
-from picosgl.models import ModelConfig
+from picosgl.models import ModelConfig, make_model_config
 
 if TYPE_CHECKING:
-    from picosgl.models import ModelConfig
     from picosgl.speculator import BaseSpeculatorConfig
 
 
@@ -49,7 +48,7 @@ class EngineConfig:
 
     @cached_property
     def model_config(self) -> ModelConfig:
-        return ModelConfig.from_pretrained(self.pretrained_config)
+        return make_model_config(self.pretrained_config)
 
     @property
     def max_seq_len(self) -> int:

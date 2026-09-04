@@ -19,9 +19,10 @@ def test_store_cache():
     for bs in [2**n for n in range(0, 16)]:
         # NOTE: we cannot tolerate duplicate indices in this test
         indices = torch.randperm(NUM_TOKENS, device="cuda")[:bs].to(torch.int32)
+        k = torch.randn((bs, HEAD_SIZE), device="cuda", dtype=torch.float16)
         qkv = torch.randn((bs, HEAD_SIZE * 4), device="cuda", dtype=torch.float16)
-        k = qkv[:, :HEAD_SIZE]
         v = qkv[:, HEAD_SIZE : HEAD_SIZE * 2]
+        assert k.stride(0) != v.stride(0)
         store_cache(
             k_cache,
             v_cache,

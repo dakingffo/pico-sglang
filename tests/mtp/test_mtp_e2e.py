@@ -31,10 +31,10 @@ from picosgl.scheduler.scheduler import Scheduler
 from picosgl.speculator import make_local_data_plane_pair, speculator_worker
 from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
 
-MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
+MODEL = os.environ.get("QWEN3_NEXT_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 
-if os.environ.get("QWEN35_PROMPT"):
-    PROMPTS = [("single", os.environ["QWEN35_PROMPT"])]
+if os.environ.get("QWEN3_NEXT_PROMPT"):
+    PROMPTS = [("single", os.environ["QWEN3_NEXT_PROMPT"])]
 else:
     PROMPTS = [
     ("q1", "The meaning of life is"),
@@ -352,7 +352,7 @@ def main() -> None:
         # reported but do not fail the check. A single non-tie root = real bug.
         verdict: dict[str, str] = {}  # name -> "identical" | "near-tie" | "fail"
         for name in a["tokens"]:
-            # QWEN35_PROMPT override emits a single prompt named "single" (uid 0);
+            # QWEN3_NEXT_PROMPT override emits a single prompt named "single" (uid 0);
             # the standard suite names q1..q5. Match by name, else fall back to 0.
             uid = next((u for u, n in enumerate(PROMPTS) if n[0] == name), 0)
             ta, tb = a["tokens"][name], b["tokens"][name]

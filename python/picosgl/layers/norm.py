@@ -1,6 +1,6 @@
 import torch
-import torch.nn.functional as F
 
+from picosgl.kernel import rms_norm_gated
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseOP
@@ -13,36 +13,26 @@ class RMSNorm(BaseOP):
         eps          : float,
         zero_centered: bool = False,
     ) -> None:
+        from flashinfer import gemma_rmsnorm, rmsnorm
+
         self.eps = eps
         self.zero_centered = zero_centered
         self.weight = torch.zeros(size) if zero_centered else torch.empty(size)
-        if zero_centered:
-            from flashinfer import gemma_rmsnorm
-
-            self.rmsnorm = gemma_rmsnorm
-        else:
-            from flashinfer import rmsnorm
-
-            self.rmsnorm = rmsnorm
+        self.rmsnorm = gemma_rmsnorm if zero_centered else rmsnorm
 
     @nvtx_annotate("RMSNorm")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.zero_centered and not x.is_cuda:
-            x_f = x.float()
-            output = x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
-            output = output * (1.0 + self.weight.float())
-            return output.type_as(x)
         if self.zero_centered and x.ndim > 2:
             shape = x.shape
             return self.rmsnorm(
                 x.reshape(-1, shape[-1]), self.weight, self.eps
             ).reshape(shape)
-        return self.rmsnorm(x, self.weight, self.eps)
+        else:
+            return self.rmsnorm(x, self.weight, self.eps)
 
+    @nvtx_annotate("RMSNorm")
     def forward_inplace(self, x: torch.Tensor) -> None:
-        if self.zero_centered and not x.is_cuda:
-            x.copy_(self.forward(x))
-        elif self.zero_centered and x.ndim > 2:
+        if self.zero_centered and x.ndim > 2:
             x_flat = x.reshape(-1, x.shape[-1])
             self.rmsnorm(x_flat, self.weight, self.eps, out=x_flat)
         else:
@@ -60,13 +50,7 @@ class RMSNormGated(BaseOP):
         hidden_states: torch.Tensor,
         gate         : torch.Tensor,
     ) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        hidden_states = hidden_states * self.weight.float()
-        hidden_states = hidden_states * F.silu(gate.float())
-        return hidden_states.to(input_dtype)
+        return rms_norm_gated(hidden_states, gate, self.weight, self.eps)
 
 
 class RMSNormFused(BaseOP):
@@ -78,6 +62,7 @@ class RMSNormFused(BaseOP):
         self.rmsnorm = rmsnorm
         self.fused_add_rmsnorm = fused_add_rmsnorm
 
+    @nvtx_annotate("RMSNormFused")
     def forward(
         self,
         x       : torch.Tensor,

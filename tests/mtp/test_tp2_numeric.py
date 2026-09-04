@@ -29,14 +29,15 @@ import torch.nn.functional as F
 
 from picosgl.distributed import DistributedInfo, set_tp_info
 from picosgl.distributed.impl import DistributedCommunicator, DistributedImpl, NoopDistributedImpl
-from picosgl.models.config import ModelConfig, RotaryConfig
+from picosgl.models.config import RotaryConfig
+from picosgl.models.qwen3_next import Qwen3_5Config
 
 
 # -------------------------------------------------------------------------------------
 # Synthetic hybrid config (shapes mirror Qwen3.5 structure, small enough for one GPU)
 # -------------------------------------------------------------------------------------
-def make_config() -> ModelConfig:
-    return ModelConfig(
+def make_config() -> Qwen3_5Config:
+    return Qwen3_5Config(
         num_layers=2,
         num_qo_heads=8,
         num_kv_heads=2,
@@ -46,15 +47,10 @@ def make_config() -> ModelConfig:
         intermediate_size=1024,
         rms_norm_eps=1e-6,
         rotary_config=RotaryConfig(
-            head_dim=64, rotary_dim=32, max_position=4096, base=10000, scaling=None
+            rotary_dim=32, max_position=4096, base=10000, scaling=None
         ),
         hidden_act="silu",
         tie_word_embeddings=False,
-        num_experts=0,
-        num_experts_per_tok=0,
-        moe_intermediate_size=0,
-        norm_topk_prob=False,
-        model_type="qwen3_5",
         architectures=["Qwen3_5ForCausalLM"],
         layer_types=["linear_attention", "full_attention"],
         linear_num_key_heads=4,
@@ -62,10 +58,14 @@ def make_config() -> ModelConfig:
         linear_key_head_dim=64,
         linear_value_head_dim=64,
         linear_conv_kernel_dim=4,
-        partial_rotary_factor=0.5,
-        attn_output_gate=True,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        norm_topk_prob=False,
+        mlp_only_layers=[0, 1],
+        decoder_sparse_step=1,
         mtp_num_hidden_layers=0,
-        mamba_ssm_dtype="float32",
     )
 
 
@@ -115,13 +115,13 @@ def _load_from(op, sd, prefix, device="cuda:0"):
         _set_tree(op, key, v.to(device))
 
 
-def build_full_sd(config: ModelConfig, seed: int) -> dict:
+def build_full_sd(config: Qwen3_5Config, seed: int) -> dict:
     """Build the tp=1 full model and return its state_dict with REAL values (on cpu)."""
     reset_tp(0, 1)
     torch.manual_seed(seed)
-    from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
+    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
 
-    model = Qwen3_5ForCausalLM(config)
+    model = Qwen3NextForCausalLM(config)
     for name, p in model.state_dict().items():
         _set_tree(model, name, torch.randn_like(p) * 0.02)
     return {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -135,10 +135,41 @@ def shard_sd(full_sd, rank, size, num_kv_heads, config=None):
         qk = config.linear_num_key_heads * config.linear_key_head_dim
         v = config.linear_num_value_heads * config.linear_value_head_dim
         qkv_regions = (qk, qk, v)
-    return {
-        k: _shard_tensor(k, v, rank, size, num_kv_heads, qkv_regions)
-        for k, v in full_sd.items()
-    }
+    result = {}
+    for k, v in full_sd.items():
+        if ".self_attn.qkv_proj" in k and config is not None and config.is_hybrid:
+            q_rows = config.num_qo_heads * config.head_dim * 2
+            kv_rows = config.num_kv_heads * config.head_dim
+            q, key, value = v.split([q_rows, kv_rows, kv_rows], dim=0)
+            result[k] = torch.cat(
+                [
+                    _shard_tensor(
+                        k.replace(".qkv_proj", ".q_proj"),
+                        q,
+                        rank,
+                        size,
+                        num_kv_heads,
+                    ),
+                    _shard_tensor(
+                        k.replace(".qkv_proj", ".k_proj"),
+                        key,
+                        rank,
+                        size,
+                        num_kv_heads,
+                    ),
+                    _shard_tensor(
+                        k.replace(".qkv_proj", ".v_proj"),
+                        value,
+                        rank,
+                        size,
+                        num_kv_heads,
+                    ),
+                ],
+                dim=0,
+            )
+        else:
+            result[k] = _shard_tensor(k, v, rank, size, num_kv_heads, qkv_regions)
+    return result
 
 
 def check(name, full, p0, p1, combine="sum", tol=1e-3):
@@ -252,7 +283,7 @@ def run():
     _load_from(attn_full, full_sd, "model.layers.1.self_attn.")
 
     def attention_forward(module):
-        query, gate, key, value = module.project_for_cache(x, positions)
+        query, gate, key, value = module.proj(x, positions)
         num_repeats = module.num_qo_heads // module.num_kv_heads
         key = key.repeat_interleave(num_repeats, dim=1).transpose(0, 1)
         value = value.repeat_interleave(num_repeats, dim=1).transpose(0, 1)

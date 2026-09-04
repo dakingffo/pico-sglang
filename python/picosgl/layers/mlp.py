@@ -28,10 +28,11 @@ class GatedMLP(BaseOP):
         )
 
         fn_map = {"silu": silu_and_mul, "gelu": gelu_and_mul}
-        act_fn = fn_map.get(hidden_act)
-        if act_fn is None:
+        if act_fn := fn_map.get(hidden_act, None):
+            self.act_fn = act_fn
+        else:
             raise ValueError(f"Unsupported activation function: {hidden_act}")
-        self.act_fn = act_fn
+
         self.down_proj = LinearRowParallel(
             intermediate_size,
             hidden_size,
@@ -56,6 +57,11 @@ class MoEMLP(BaseOP):
         intermediate_size: int,
         renormalize      : bool,
     ):
+        self.router = LinearReplicated(
+            hidden_size,
+            num_experts,
+            has_bias=False,
+        )
         self.experts = MoELayer(
             num_experts=num_experts,
             top_k=top_k,
@@ -63,21 +69,14 @@ class MoEMLP(BaseOP):
             intermediate_size=intermediate_size,
             renormalize=renormalize,
         )
-        self.gate = LinearReplicated(
-            hidden_size,
-            num_experts,
-            has_bias=False,
-        )
+
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate.forward(hidden_states)
+        router_logits = self.router.forward(hidden_states)
         final_hidden_states = self.experts.forward(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
         return final_hidden_states.view(num_tokens, hidden_dim)
-
-
-__all__ = ["GatedMLP", "MoEMLP"]

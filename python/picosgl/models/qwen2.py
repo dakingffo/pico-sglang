@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from dataclasses import dataclass
+from typing import Tuple
 
 import torch
+from transformers import PretrainedConfig
 from picosgl.core import get_global_ctx
 from picosgl.layers import (
     BaseOP,
@@ -16,13 +18,26 @@ from picosgl.layers import (
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
+from .config import ModelConfig, make_common_config_kwargs, unwrap_text_config
 
-if TYPE_CHECKING:
-    from .config import ModelConfig
+
+@dataclass(frozen=True)
+class Qwen2Config(ModelConfig):
+    intermediate_size: int
+    hidden_act       : str
+
+    @classmethod
+    def from_pretrained(cls, config: PretrainedConfig) -> Qwen2Config:
+        top, text = unwrap_text_config(config)
+        return cls(
+            **make_common_config_kwargs(top, text),
+            intermediate_size=text.intermediate_size,
+            hidden_act=text.hidden_act,
+        )
 
 
 class Qwen2DecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: Qwen2Config, layer_id: int):
         rotary_config = config.rotary_config
         self.self_attn = RotaryAttention(
             hidden_size=config.hidden_size,
@@ -66,7 +81,7 @@ class Qwen2DecoderLayer(BaseOP):
 
 
 class Qwen2Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: Qwen2Config):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -88,7 +103,7 @@ class Qwen2Model(BaseOP):
 
 
 class Qwen2ForCausalLM(BaseLLMModel):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: Qwen2Config):
         self.model = Qwen2Model(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -96,7 +111,6 @@ class Qwen2ForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
-        super().__init__()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
@@ -104,4 +118,4 @@ class Qwen2ForCausalLM(BaseLLMModel):
         return logits
 
 
-__all__ = ["Qwen2ForCausalLM"]
+__all__ = ["Qwen2Config", "Qwen2ForCausalLM"]

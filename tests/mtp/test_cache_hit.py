@@ -44,7 +44,7 @@ from picosgl.message import UserMsg
 from test_mtp_e2e import OfflineScheduler, make_config
 from transformers import AutoTokenizer
 
-MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
+MODEL = os.environ.get("QWEN3_NEXT_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 LEN_P, LEN_P2, LEN_P6 = 150, 170, 175
 MAX_TOKENS = 16
 

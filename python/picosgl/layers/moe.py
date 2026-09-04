@@ -10,20 +10,15 @@ from .base import BaseOP
 class MoELayer(BaseOP):
     def __init__(
         self,
-        num_experts      : int,
-        top_k            : int,
-        hidden_size      : int,
-        intermediate_size: int,
-        renormalize      : bool = True,
-        activation       : str = "silu",
+        num_experts                 : int,
+        top_k                       : int,
+        hidden_size                 : int,
+        intermediate_size           : int,
+        renormalize                 : bool = True,
+        activation                  : str = "silu",
         apply_router_weight_on_input: bool = False,
     ):
-        super().__init__()
-
-        self.num_experts = num_experts
         self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
         self._comm = DistributedCommunicator()
 
         tp_info = get_tp_info()

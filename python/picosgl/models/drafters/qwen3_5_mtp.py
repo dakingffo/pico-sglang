@@ -12,13 +12,14 @@ from picosgl.layers import (
     RMSNorm,
     VocabParallelEmbedding,
 )
+from picosgl.kernel import sigmoid_and_mul
 from picosgl.models import load_weight
-from picosgl.models.qwen3_5 import Qwen3_5DecoderLayer
+from picosgl.models.qwen3_next import Qwen3NextDecoderLayer
 
 from .base import BaseDrafterModel
 
 if TYPE_CHECKING:
-    from picosgl.models.config import ModelConfig
+    from picosgl.models.qwen3_next import Qwen3_5Config
 
 
 class Qwen3_5MTPDrafter(BaseDrafterModel):
@@ -33,19 +34,20 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
     batched MTP engine.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: Qwen3_5Config):
+        self._hidden_size = config.hidden_size
         self.pre_fc_norm_embedding = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
         )
         self.pre_fc_norm_hidden = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
         )
-        # Input is the cat([embedding; hidden]) — full width on every rank — so the fc
-        # must be output-split (LinearColumnParallel). tp=1 drafter, kept as-is.
-        self.fc = LinearColumnParallel(config.hidden_size * 2, config.hidden_size, has_bias=False)
+        self.fc = LinearColumnParallel(
+            config.hidden_size * 2, config.hidden_size, has_bias=False
+        )
         self.layers = OPList(
             [
-                Qwen3_5DecoderLayer(
+                Qwen3NextDecoderLayer(
                     config, 0, block_type="full_attention"
                 )
             ]
@@ -116,7 +118,7 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare arbitrary canonical or speculative rows for pooled MTP attention."""
         assert input_ids.ndim == positions.ndim == 1
-        assert hidden_states.shape == (input_ids.shape[0], self.fc.full_output_size)
+        assert hidden_states.shape == (input_ids.shape[0], self._hidden_size)
         emb = self._embed_tokens.forward(input_ids)
         emb = self.pre_fc_norm_embedding.forward(emb)
         h = self.pre_fc_norm_hidden.forward(hidden_states)
@@ -125,7 +127,7 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
 
         layer = self.layers.op_list[0]
         h = layer.input_layernorm.forward(residual)
-        query, gate, key, value = layer.self_attn.project_for_cache(h, positions)
+        query, gate, key, value = layer.self_attn.proj(h, positions)
         return residual, query, gate, key, value
 
     def finish_cache_rows(
@@ -136,7 +138,7 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Finish one predicting row per request after its K/V has entered the pool."""
         layer = self.layers.op_list[0]
-        h = attention_output * torch.sigmoid(gate)
+        h = sigmoid_and_mul(attention_output, gate, out=attention_output)
         h = layer.self_attn.o_proj.forward(
             h.reshape(-1, layer.self_attn.num_qo_heads * layer.self_attn.head_dim)
         )

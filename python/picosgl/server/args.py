@@ -295,7 +295,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         from picosgl.utils import load_model_config
 
         # `dtype` is the transformers alias of `torch_dtype`. The raw-config fallback
-        # (unregistered architectures like Qwen3.5) mirrors only fields present in
+        # (unregistered architectures like Qwen3Next) mirrors only fields present in
         # config.json, where torch_dtype may be null -> default to bf16.
         pretrained_config = load_model_config(kwargs["model_path"])
         dtype_str = (

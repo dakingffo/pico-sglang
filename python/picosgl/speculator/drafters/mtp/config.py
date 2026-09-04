@@ -34,11 +34,16 @@ class MTPSpeculatorConfig(BaseSpeculatorConfig):
         return MTPHiddenFeature(full_hidden)
 
     def validate(self, config: EngineConfig) -> None:
+        from picosgl.models.qwen3_next import Qwen3_5Config
+
         assert config.speculative_draft_model_path == config.model_path, (
             "--speculative-draft-model-path must equal --model-path under MTP "
             f"(got {config.speculative_draft_model_path!r} vs {config.model_path!r})."
         )
-        assert config.model_config.mtp_num_hidden_layers > 0, (
+        assert (
+            isinstance(config.model_config, Qwen3_5Config)
+            and config.model_config.mtp_num_hidden_layers > 0
+        ), (
             "MTP speculative decoding requires a model with an MTP head "
             "(mtp_num_hidden_layers > 0)."
         )

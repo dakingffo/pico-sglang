@@ -96,6 +96,3 @@ class GatedDeltaNet(BaseOP):
             core_output.reshape(-1, config.head_v_dim), z
         ).reshape(x.shape[0], -1)
         return self.out_proj.forward(output)
-
-
-__all__ = ["GatedDeltaNet"]
