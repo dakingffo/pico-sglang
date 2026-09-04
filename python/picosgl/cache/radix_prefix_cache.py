@@ -4,7 +4,7 @@ import heapq
 import time
 from itertools import count
 from dataclasses import dataclass
-from typing import Any, Callable, TypeAlias
+from typing import Any, Callable, TypeAlias, Generic, TypeVar
 
 import torch
 
@@ -33,7 +33,7 @@ def _get_key_fn(page_size: int) -> KEY_FN:
 class RadixTreeNode:
     counter = count(0)
 
-    def __init__(self, key_fn: KEY_FN, page_size: int = 1, tic: int | None = None) -> None:
+    def __init__(self, key_fn: KEY_FN, page_size: int = 1, tic: int | None = None):
         self.uuid = next(RadixTreeNode.counter)
         self.key_fn = key_fn
         self.page_size = page_size
@@ -44,27 +44,20 @@ class RadixTreeNode:
 
         # these fields should be updated later
         self._key: torch.Tensor
-        self._value: torch.Tensor
+        self._kv: torch.Tensor
         self._length: int
-        # one linear-state pool slot per cached page (only for hybrid_radix)
-        self._state_value: torch.Tensor | None = None
 
-    def set_key_value(
+    def set(
         self,
-        key        : torch.Tensor,
-        value      : torch.Tensor,
-        state_value: torch.Tensor | None = None,
+        begin     : int,
+        end       : int,
+        input_ids : torch.Tensor,
+        kv_indices: torch.Tensor,
     ) -> None:
-        assert len(key) == len(value)
-        self._key = key
-        self._value = value
-        self._length = len(key)
-        if state_value is not None:
-            assert len(state_value) == len(value) // self.page_size, (
-                f"state_value ({len(state_value)}) must be one entry per page "
-                f"({len(value)} // {self.page_size})"
-            )
-            self._state_value = state_value
+        assert len(input_ids) == len(kv_indices)
+        self._key = input_ids[begin:end]
+        self._kv = kv_indices[begin:end].clone()
+        self._length = len(self._key)
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         assert isinstance(parent, RadixTreeNode)
@@ -80,8 +73,12 @@ class RadixTreeNode:
         return self._parent
 
     @property
-    def value(self) -> torch.Tensor:
-        return self._value
+    def kv(self) -> torch.Tensor:
+        return self._kv
+
+    @property
+    def value(self) -> tuple[torch.Tensor]:
+        return self._kv,
 
     def is_root(self) -> bool:
         return self._parent is None
@@ -92,7 +89,6 @@ class RadixTreeNode:
     def get_match_len(self, input_ids: torch.Tensor) -> int:
         from picosgl.kernel import fast_compare_key
 
-        # compare key and input_ids, find the first diff
         return fast_compare_key(self._key, input_ids)
 
     def split_at(self, pos: int) -> RadixTreeNode:
@@ -100,72 +96,94 @@ class RadixTreeNode:
         parent = self.parent
 
         new_node = RadixTreeNode(self.key_fn, self.page_size, self.timestamp)
-        if self._state_value is not None:
-            split = pos // self.page_size
-            new_node.set_key_value(
-                self._key[:pos], self._value[:pos], self._state_value[:split]
-            )
-        else:
-            new_node.set_key_value(self._key[:pos], self._value[:pos])
+        new_node.set(0, pos, self._key, self._kv)
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
 
-        if self._state_value is not None:
-            split = pos // self.page_size
-            self.set_key_value(
-                self._key[pos:], self._value[pos:], self._state_value[split:]
-            )
-        else:
-            self.set_key_value(self._key[pos:], self._value[pos:])
+        self.set(pos, len(self._key), self._key, self._kv)
         self.set_parent(new_node)
 
         return new_node
 
     def __lt__(self, other: RadixTreeNode) -> bool:
         return self.timestamp < other.timestamp
-    
+
+
+class HybridRadixTreeNode(RadixTreeNode):
+    def __init__(self, key_fn: KEY_FN, page_size: int = 1, tic: int | None = None):
+        super().__init__(key_fn, page_size, tic)
+        self._st: torch.Tensor
+
+    def set(
+        self,
+        begin     : int,
+        end       : int,
+        inputy_ids: torch.Tensor,
+        kv_indices: torch.Tensor,
+        st_indices: torch.Tensor,
+    ) -> None:
+        assert len(st_indices) == len(kv_indices) // self.page_size
+        super().set(begin, end, inputy_ids, kv_indices)
+        begin //= self.page_size
+        end //= self.page_size
+        self._st = st_indices[begin: end].clone()
+
+    def split_at(self, pos: int) -> RadixTreeNode:
+        assert 0 < pos < self.length
+        parent = self.parent
+
+        new_node = HybridRadixTreeNode(self.key_fn, self.page_size, self.timestamp)
+        new_node.set(0, pos, self._key, self._kv, self._st)
+        new_node.set_parent(parent)
+        new_node.ref_count = self.ref_count
+
+        self.set(pos, len(self._key), self._key, self._kv, self._st)
+        self.set_parent(new_node)
+
+        return new_node
+
+    @property
+    def st(self) -> torch.Tensor:
+        return self._st
+
+    @property
+    def value(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.kv, self._st
+
 
 @dataclass(frozen=True)
 class RadixCacheHandle(BaseCacheHandle):
-    node: RadixTreeNode
+    node        : RadixTreeNode
+    empty_tensor: torch.Tensor
 
-    def get_matched_indices(self) -> torch.Tensor:
+    def get_matched_indices(self) -> tuple[torch.Tensor, ...] | torch.Tensor:
         node = self.node
-        value_list: list[torch.Tensor] = []
+        if node.is_root():
+            if isinstance(node, HybridRadixTreeNode):
+                return self.empty_tensor, self.empty_tensor
+            return self.empty_tensor
+        num_values = len(node.value)
+        value_list: list[list[torch.Tensor]] = [[] for _ in range(num_values)]
         while not node.is_root():
-            value_list.append(node.value)
+            for i, value in enumerate(node.value):
+                value_list[i].append(value)
             node = node.parent
-        value_list.reverse()
-        if not value_list:
-            return torch.empty(0, dtype=torch.int32, device=self.node._key.device)
-        return torch.cat(value_list)
-
-    def get_matched_state_slots(self) -> torch.Tensor | None:
-        """Pool slot ids of the matched pages, in page order. None if the cache holds
-        no state info (non-hybrid radix) or nothing was matched."""
-        node = self.node
-        state_list: list[torch.Tensor] = []
-        while not node.is_root():
-            if node._state_value is None:
-                return None
-            state_list.append(node._state_value)
-            node = node.parent
-        state_list.reverse()
-        if not state_list:
-            return None
-        return torch.cat(state_list)
+        matched = tuple(torch.cat(list(reversed(values))) for values in value_list)
+        return matched if len(matched) > 1 else matched[0]
 
 
-class RadixPrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device):
+NodeT = TypeVar("NodeT", bound=RadixTreeNode)
+class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
+    def __init__(self, device: torch.device, node_type: type[NodeT]):
         super().__init__()
+        self.NodeType: type[NodeT] = node_type
         self.device = device
         self.page_size = get_global_ctx().page_size
         self.key_fn = _get_key_fn(self.page_size)
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
         self.protected_size = 0
-        self.root_node = RadixTreeNode(self.key_fn, self.page_size)
+        self.root_node = self.NodeType(self.key_fn, self.page_size)
         self.root_node.ref_count = 1  # root is always protected
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
@@ -189,30 +207,22 @@ class RadixPrefixCache(BasePrefixCache):
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         node, prefix_len = self._tree_walk(input_ids)
-        return MatchResult(RadixCacheHandle(prefix_len, node))
+        return MatchResult(RadixCacheHandle(prefix_len, node, self.empty_tensor))
 
     def insert_prefix(
         self,
-        input_ids   : torch.Tensor,
-        indices     : torch.Tensor,
-        state_slots : torch.Tensor | None = None,
+        input_ids : torch.Tensor,
+        *tensors
     ) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
-        input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         node, prefix_len = self._tree_walk(input_ids)
         if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
-            new_node = RadixTreeNode(self.key_fn, self.page_size)
-            if state_slots is not None:
-                new_node.set_key_value(
-                    input_ids[prefix_len:], indices[prefix_len:].clone(),
-                    state_slots[prefix_len // self.page_size : insert_len // self.page_size].clone(),
-                )
-            else:
-                new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
+            new_node = self.NodeType(self.key_fn, self.page_size)
+            new_node.set(prefix_len, insert_len, input_ids, *tensors)
             new_node.set_parent(node)
             self.evictable_size += new_node.length
             node = new_node
-        return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
+        return InsertResult(prefix_len, RadixCacheHandle(insert_len, node, self.empty_tensor))
 
     def evict(self, size: int) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Evict prefixes. Returns (evicted KV page indices, evicted state slots).
@@ -234,9 +244,10 @@ class RadixPrefixCache(BasePrefixCache):
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
             evicted_size += node.length
-            evicted_indices.append(node.value)
-            if node._state_value is not None:
-                evicted_state.append(node._state_value)
+            values = node.value
+            evicted_indices.append(values[0])
+            if len(values) > 1:
+                evicted_state.append(values[1])
             self.evictable_size -= node.length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
@@ -259,22 +270,76 @@ class RadixPrefixCache(BasePrefixCache):
         )
 
     def check_integrity(self) -> None:
-        pass
+        evictable_size = 0
+        protected_size = 0
+        seen: set[int] = set()
+        stack: list[NodeT] = [self.root_node]
+
+        while stack:
+            node = stack.pop()
+            if node.uuid in seen:
+                raise RuntimeError(f"Radix cache contains a cycle or duplicate node {node.uuid}.")
+            seen.add(node.uuid)
+
+            if node.is_root():
+                if node.ref_count != 1:
+                    raise RuntimeError(
+                        f"Radix root ref_count must be 1, got {node.ref_count}."
+                    )
+            else:
+                if node.parent.children.get(self.key_fn(node._key)) is not node:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} is not indexed by its parent."
+                    )
+                if node.length <= 0 or node.length % self.page_size != 0:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} has invalid length {node.length}."
+                    )
+                if len(node.kv) != node.length:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} has {len(node.kv)} KV indices for"
+                        f" length {node.length}."
+                    )
+                if isinstance(node, HybridRadixTreeNode):
+                    expected_states = node.length // self.page_size
+                    if len(node.st) != expected_states:
+                        raise RuntimeError(
+                            f"Radix node {node.uuid} has {len(node.st)} state slots;"
+                            f" expected {expected_states}."
+                        )
+                if node.ref_count == 0:
+                    evictable_size += node.length
+                elif node.ref_count > 0:
+                    protected_size += node.length
+                else:
+                    raise RuntimeError(
+                        f"Radix node {node.uuid} has negative ref_count {node.ref_count}."
+                    )
+
+            stack.extend(node.children.values())
+
+        if evictable_size != self.evictable_size or protected_size != self.protected_size:
+            raise RuntimeError(
+                "Radix cache size accounting mismatch:"
+                f" recorded=({self.evictable_size} evictable,"
+                f" {self.protected_size} protected),"
+                f" actual=({evictable_size} evictable, {protected_size} protected)."
+            )
 
     def total_state_pages(self) -> int:
         """Total number of linear-state slots owned by the tree (one per cached page)."""
         total = 0
-        stack: list[RadixTreeNode] = [self.root_node]
+        stack: list[NodeT] = [self.root_node]
         while stack:
             node = stack.pop()
-            if node._state_value is not None:
-                total += len(node._state_value)
+            if not node.is_root() and len(node.value) > 1:
+                total += len(node.value[1])
             stack.extend(node.children.values())
         return total
 
-    def _collect_leave_nodes_for_evict(self) -> list[RadixTreeNode]:
-        nodes: list[RadixTreeNode] = [self.root_node]
-        leave_nodes: list[RadixTreeNode] = []
+    def _collect_leave_nodes_for_evict(self) -> list[NodeT]:
+        nodes: list[NodeT] = [self.root_node]
+        leave_nodes: list[NodeT] = []
 
         while len(nodes) > 0:
             node = nodes.pop()
@@ -287,7 +352,7 @@ class RadixPrefixCache(BasePrefixCache):
 
         return leave_nodes
 
-    def _tree_walk(self, input_ids: torch.Tensor) -> tuple[RadixTreeNode, int]:
+    def _tree_walk(self, input_ids: torch.Tensor) -> tuple[NodeT, int]:
         prefix_len = 0
         indice_len = len(input_ids)
         node = self.root_node
@@ -314,16 +379,3 @@ class RadixPrefixCache(BasePrefixCache):
             node.timestamp = tic
 
         return node, prefix_len
-
-
-class HybridRadixPrefixCache(RadixPrefixCache):
-    def insert_prefix(
-        self,
-        input_ids   : torch.Tensor,
-        indices     : torch.Tensor,
-        state_slots : torch.Tensor | None = None,
-    ) -> InsertResult:
-        insert_len = align_down(len(input_ids), self.page_size)
-        if insert_len > 0:
-            assert state_slots is not None, "hybrid_radix requires per-page state slots"
-        return super().insert_prefix(input_ids, indices, state_slots)

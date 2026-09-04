@@ -78,6 +78,9 @@ class ZmqPullQueue(Generic[T]):
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
 
+    def wait(self, timeout_ms: int) -> bool:
+        return self.socket.poll(timeout=timeout_ms, flags=zmq.POLLIN) != 0
+
     def stop(self):
         self.socket.close()
         self.context.term()
@@ -101,6 +104,9 @@ class ZmqAsyncPullQueue(ZmqPullQueue[T]):
     async def get(self) -> T:
         event = await self.get_raw()
         return self.decoder(msgpack.unpackb(event, raw=False))
+
+    async def wait(self, timeout_ms: int) -> bool:
+        return await self.socket.poll(timeout=timeout_ms, flags=zmq.POLLIN) != 0
 
 
 class ZmqPubQueue(Generic[T]):

@@ -32,7 +32,7 @@ from picosgl.distributed import DistributedInfo
 from test_mtp_e2e import OfflineScheduler, make_config
 from transformers import AutoTokenizer
 
-MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
+MODEL = os.environ.get("QWEN3_NEXT_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 PROMPTS = [
     ("q1", "The meaning of life is"),
     ("q2", "一次函数 y = kx + b,其中 k 和 b 分别是"),

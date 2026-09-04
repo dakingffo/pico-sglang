@@ -2,25 +2,25 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable
 
 import torch
 
-from .base import StateLessOP
+from .base import BaseOP
 
 
-class RotaryEmbedding(StateLessOP):
+class RotaryEmbedding(BaseOP):
     def __init__(
         self,
-        head_size: int,
-        rotary_dim: int,
+        head_size              : int,
+        rotary_dim             : int,
         max_position_embeddings: int,
-        base: float,
-        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        base                   : float,
+        post_process           : None | Callable[[torch.Tensor], torch.Tensor] = None,
     ) -> None:
-        super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        assert 0 < rotary_dim <= head_size
+        assert rotary_dim % 2 == 0
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         if post_process is not None:
             inv_freq = post_process(inv_freq)
@@ -30,34 +30,42 @@ class RotaryEmbedding(StateLessOP):
         sin = freqs.sin()
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
-        assert self.head_size in [64, 128, 256, 512]
-
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_shape = query.shape
+        key_shape = key.shape
+        if query.ndim > 2 and query.shape[-1] == self.head_size:
+            query = query.reshape(-1, query.shape[-2] * query.shape[-1])
+        if key.ndim > 2 and key.shape[-1] == self.head_size:
+            key = key.reshape(-1, key.shape[-2] * key.shape[-1])
+        positions = positions.reshape(-1)
+        assert query.shape[0] == key.shape[0] == positions.shape[0]
+        assert query.is_cuda and key.is_cuda and positions.is_cuda
+        assert self.head_size in (64, 128, 256, 512)
+
+        from flashinfer import apply_rope_with_cos_sin_cache_inplace
+
+        apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=query,
             key=key,
             head_size=self.head_size,
             cos_sin_cache=self._cos_sin_cache,
         )
-        return query, key
+        return query.reshape(query_shape), key.reshape(key_shape)
 
 
 def _get_rope(
-    head_dim: int,
-    rotary_dim: int,
+    head_dim    : int,
+    rotary_dim  : int,
     max_position: int,
-    base: float,
-    rope_scaling: Dict[str, Any] | None = None,
+    base        : float,
+    rope_scaling: dict[str, Any] | None = None,
 ) -> RotaryEmbedding:
     if rope_scaling is None:
         return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
@@ -124,11 +132,11 @@ def set_rope_device(device: torch.device):
 
 @functools.cache
 def get_rope(
-    head_dim: int,
-    rotary_dim: int,
+    head_dim    : int,
+    rotary_dim  : int,
     max_position: int,
-    base: float,
-    rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
+    base        : float,
+    rope_scaling: tuple[tuple[str, Any], ...] | None = None,
 ) -> RotaryEmbedding:
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
@@ -141,6 +149,3 @@ def get_rope(
         with torch.device(_ROPE_DEVICE):
             return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
     return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
-
-
-__all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]

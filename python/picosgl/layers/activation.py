@@ -16,6 +16,3 @@ def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     from flashinfer import gelu_and_mul
 
     return gelu_and_mul(x, out=out)
-
-
-__all__ = ["silu_and_mul", "gelu_and_mul"]

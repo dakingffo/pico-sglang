@@ -25,17 +25,19 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
 import torch
+import torch.nn.functional as F
 
 from picosgl.distributed import DistributedInfo, set_tp_info
 from picosgl.distributed.impl import DistributedCommunicator, DistributedImpl, NoopDistributedImpl
-from picosgl.models.config import ModelConfig, RotaryConfig
+from picosgl.models.config import RotaryConfig
+from picosgl.models.qwen3_next import Qwen3_5Config
 
 
 # -------------------------------------------------------------------------------------
 # Synthetic hybrid config (shapes mirror Qwen3.5 structure, small enough for one GPU)
 # -------------------------------------------------------------------------------------
-def make_config() -> ModelConfig:
-    return ModelConfig(
+def make_config() -> Qwen3_5Config:
+    return Qwen3_5Config(
         num_layers=2,
         num_qo_heads=8,
         num_kv_heads=2,
@@ -45,15 +47,10 @@ def make_config() -> ModelConfig:
         intermediate_size=1024,
         rms_norm_eps=1e-6,
         rotary_config=RotaryConfig(
-            head_dim=64, rotary_dim=32, max_position=4096, base=10000, scaling=None
+            rotary_dim=32, max_position=4096, base=10000, scaling=None
         ),
         hidden_act="silu",
         tie_word_embeddings=False,
-        num_experts=0,
-        num_experts_per_tok=0,
-        moe_intermediate_size=0,
-        norm_topk_prob=False,
-        model_type="qwen3_5",
         architectures=["Qwen3_5ForCausalLM"],
         layer_types=["linear_attention", "full_attention"],
         linear_num_key_heads=4,
@@ -61,10 +58,14 @@ def make_config() -> ModelConfig:
         linear_key_head_dim=64,
         linear_value_head_dim=64,
         linear_conv_kernel_dim=4,
-        partial_rotary_factor=0.5,
-        attn_output_gate=True,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        norm_topk_prob=False,
+        mlp_only_layers=[0, 1],
+        decoder_sparse_step=1,
         mtp_num_hidden_layers=0,
-        mamba_ssm_dtype="float32",
     )
 
 
@@ -114,13 +115,13 @@ def _load_from(op, sd, prefix, device="cuda:0"):
         _set_tree(op, key, v.to(device))
 
 
-def build_full_sd(config: ModelConfig, seed: int) -> dict:
+def build_full_sd(config: Qwen3_5Config, seed: int) -> dict:
     """Build the tp=1 full model and return its state_dict with REAL values (on cpu)."""
     reset_tp(0, 1)
     torch.manual_seed(seed)
-    from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
+    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
 
-    model = Qwen3_5ForCausalLM(config, paged=False)
+    model = Qwen3NextForCausalLM(config)
     for name, p in model.state_dict().items():
         _set_tree(model, name, torch.randn_like(p) * 0.02)
     return {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -134,10 +135,41 @@ def shard_sd(full_sd, rank, size, num_kv_heads, config=None):
         qk = config.linear_num_key_heads * config.linear_key_head_dim
         v = config.linear_num_value_heads * config.linear_value_head_dim
         qkv_regions = (qk, qk, v)
-    return {
-        k: _shard_tensor(k, v, rank, size, num_kv_heads, qkv_regions)
-        for k, v in full_sd.items()
-    }
+    result = {}
+    for k, v in full_sd.items():
+        if ".self_attn.qkv_proj" in k and config is not None and config.is_hybrid:
+            q_rows = config.num_qo_heads * config.head_dim * 2
+            kv_rows = config.num_kv_heads * config.head_dim
+            q, key, value = v.split([q_rows, kv_rows, kv_rows], dim=0)
+            result[k] = torch.cat(
+                [
+                    _shard_tensor(
+                        k.replace(".qkv_proj", ".q_proj"),
+                        q,
+                        rank,
+                        size,
+                        num_kv_heads,
+                    ),
+                    _shard_tensor(
+                        k.replace(".qkv_proj", ".k_proj"),
+                        key,
+                        rank,
+                        size,
+                        num_kv_heads,
+                    ),
+                    _shard_tensor(
+                        k.replace(".qkv_proj", ".v_proj"),
+                        value,
+                        rank,
+                        size,
+                        num_kv_heads,
+                    ),
+                ],
+                dim=0,
+            )
+        else:
+            result[k] = _shard_tensor(k, v, rank, size, num_kv_heads, qkv_regions)
+    return result
 
 
 def check(name, full, p0, p1, combine="sum", tol=1e-3):
@@ -201,48 +233,99 @@ def run():
         "sum",
     )
 
-    # ---------------- Qwen3_5MLP ----------------
+    # ---------------- GatedMLP ----------------
     print("=" * 60)
-    print("Qwen3_5MLP (down_proj all_reduce)")
-    from picosgl.layers.qwen3_5.mlp import Qwen3_5MLP
+    print("GatedMLP (down_proj all_reduce)")
+    from picosgl.layers import GatedMLP
 
     reset_tp(0, 1)
-    mlp_full = Qwen3_5MLP(config)
+    mlp_kwargs = dict(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        hidden_act=config.hidden_act,
+    )
+    mlp_full = GatedMLP(**mlp_kwargs)
     _load_from(mlp_full, full_sd, "model.layers.1.mlp.")
     x = torch.randn(T, config.hidden_size, device=device)
     run_tp2(
-        Qwen3_5MLP,
-        dict(config=config),
+        GatedMLP,
+        mlp_kwargs,
         "model.layers.1.mlp.",
         mlp_full,
         lambda m: m.forward(x),
         "sum",
     )
 
-    # ---------------- Qwen3_5Attention (dense, paged=False) ----------------
+    # ---------------- GatedRotaryAttention (local reference attention) ----------------
     print("=" * 60)
-    print("Qwen3_5Attention eager (o_proj all_reduce)")
-    from picosgl.layers.qwen3_5.attention import Qwen3_5Attention
+    print("GatedRotaryAttention projection + o_proj all_reduce")
+    from picosgl.layers import GatedRotaryAttention
 
     positions = torch.arange(T, dtype=torch.int64, device=device)
+    rotary_config = config.rotary_config
+    attention_kwargs = dict(
+        hidden_size=config.hidden_size,
+        head_dim=config.head_dim,
+        num_qo_heads=config.num_qo_heads,
+        num_kv_heads=config.num_kv_heads,
+        layer_id=1,
+        rotary_dim=rotary_config.rotary_dim,
+        max_position=rotary_config.max_position,
+        rope_base=rotary_config.base,
+        rope_scaling=(
+            tuple(rotary_config.scaling.items()) if rotary_config.scaling else None
+        ),
+        qk_norm_eps=config.rms_norm_eps,
+        zero_centered_norm=True,
+    )
     reset_tp(0, 1)
-    attn_full = Qwen3_5Attention(config, layer_id=1, paged=False)
+    attn_full = GatedRotaryAttention(**attention_kwargs)
     _load_from(attn_full, full_sd, "model.layers.1.self_attn.")
+
+    def attention_forward(module):
+        query, gate, key, value = module.proj(x, positions)
+        num_repeats = module.num_qo_heads // module.num_kv_heads
+        key = key.repeat_interleave(num_repeats, dim=1).transpose(0, 1)
+        value = value.repeat_interleave(num_repeats, dim=1).transpose(0, 1)
+        query = query.transpose(0, 1)
+        score = torch.matmul(query, key.transpose(-1, -2)) * module.head_dim**-0.5
+        mask = torch.triu(
+            torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
+        )
+        score = F.softmax(
+            score.masked_fill(mask, float("-inf")), dim=-1, dtype=torch.float32
+        )
+        output = torch.matmul(score.to(value.dtype), value).transpose(0, 1)
+        output *= torch.sigmoid(gate)
+        return module.o_proj.forward(output.flatten(-2))
+
     run_tp2(
-        Qwen3_5Attention,
-        dict(config=config, layer_id=1, paged=False),
+        GatedRotaryAttention,
+        attention_kwargs,
         "model.layers.1.self_attn.",
         attn_full,
-        lambda m: m.forward(x, positions),
+        attention_forward,
         "sum",
     )
 
-    # ---------------- Qwen3_5GatedDeltaNet (out_proj all_reduce) ----------------
+    # ---------------- GatedDeltaNet (out_proj all_reduce) ----------------
     print("=" * 60)
-    print("Qwen3_5GatedDeltaNet prefill (out_proj all_reduce)")
+    print("GatedDeltaNet prefill (out_proj all_reduce)")
     from picosgl.cache.linear.state_pool import LinearStatePool
     from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-    from picosgl.layers.qwen3_5.gated_delta_net import Qwen3_5GatedDeltaNet
+    from picosgl.layers import GatedDeltaNet
+
+    def make_gated_delta_net():
+        return GatedDeltaNet(
+            hidden_size=config.hidden_size,
+            num_key_heads=config.linear_num_key_heads,
+            num_value_heads=config.linear_num_value_heads,
+            head_k_dim=config.linear_key_head_dim,
+            head_v_dim=config.linear_value_head_dim,
+            conv_kernel_size=config.linear_conv_kernel_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            layer_idx=0,
+        )
 
     conv_dim_full = (
         config.linear_num_key_heads * config.linear_key_head_dim * 2
@@ -257,6 +340,7 @@ def run():
             input_ids=torch.tensor([0] * device_len, dtype=torch.int32),
             table_idx=table_idx, cached_len=cached_len, output_len=4,
             uid=table_idx, sampling_params=None, cache_handle=None,
+            max_device_len=device_len + 4,
         )
 
     def make_batch(req):
@@ -285,22 +369,26 @@ def run():
     req = make_req(0, 0, L)
 
     reset_tp(0, 1)
-    gdn_full = Qwen3_5GatedDeltaNet(config, linear_layer_idx=0)
+    gdn_full = make_gated_delta_net()
     _load_from(gdn_full, full_sd, "model.layers.0.linear_attn.")
     ctx = setup_ctx(conv_dim_full, config.linear_num_value_heads)
-    with ctx.forward_batch(make_batch(req)):
+    batch = make_batch(req)
+    ctx.linear_attn_backend.prepare_metadata(batch)
+    with ctx.forward_batch(batch):
         gdn_out_full = gdn_full.forward(xg).detach()
     clear_global_ctx()
 
     gdn_parts = []
     for r in range(n):
         reset_tp(r, n)
-        gdn = Qwen3_5GatedDeltaNet(config, linear_layer_idx=0)
+        gdn = make_gated_delta_net()
         _load_from(gdn, shard_sd(full_sd, r, n, num_kv_heads, config), "model.layers.0.linear_attn.")
         ctx = setup_ctx(conv_dim_local, config.linear_num_value_heads // n)
         recs = []
         DistributedCommunicator.impl = RecordingImpl(recs, n)
-        with ctx.forward_batch(make_batch(req)):
+        batch = make_batch(req)
+        ctx.linear_attn_backend.prepare_metadata(batch)
+        with ctx.forward_batch(batch):
             gdn_parts.append(gdn.forward(xg).detach())
         clear_global_ctx()
         assert len(recs) == 1

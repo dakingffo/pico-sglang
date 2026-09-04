@@ -26,7 +26,7 @@ import sys
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
-MODEL_PATH = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
+MODEL_PATH = os.environ.get("QWEN3_5_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
 import torch
@@ -38,9 +38,9 @@ def setup():
     from picosgl.distributed import DistributedInfo, set_tp_info
 
     set_tp_info(DistributedInfo(rank=0, size=1))
-    from picosgl.models.config import ModelConfig
+    from picosgl.models import make_model_config
 
-    return ModelConfig.from_pretrained(load_model_config(MODEL_PATH))
+    return make_model_config(load_model_config(MODEL_PATH))
 
 
 def to_device(module, device):
@@ -71,16 +71,16 @@ def main():
     torch.cuda.set_device(device)
 
     from picosgl.core import Batch, Context, Request, set_global_ctx
-    from picosgl.cache import create_kvcache_pool
+    from picosgl.cache import make_kvcache_pool
     from picosgl.cache.linear.state_pool import LinearStatePool
-    from picosgl.layers.attention_backend import create_attention_backend
-    from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
+    from picosgl.layers.attention_backend import make_attention_backend
+    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
     from picosgl.models.weight import load_target_weight
     from picosgl.scheduler.cache import CacheManager
 
     loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
-        model = Qwen3_5ForCausalLM(mcfg, paged=True)
+        model = Qwen3NextForCausalLM(mcfg)
     model.load_state_dict(dict(loaded))
     del loaded
     to_device(model, device)
@@ -97,7 +97,7 @@ def main():
     # KV cache is per-token pages (page_size=1); the 64-granular pages below are STATE
     # pages (state_table columns), indexed by the layer, not by the attention backend.
     kv_pages = 4096
-    ctx.kv_cache = create_kvcache_pool(
+    ctx.kv_cache = make_kvcache_pool(
         model_config=mcfg, num_pages=kv_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
@@ -124,7 +124,7 @@ def main():
     ctx.state_table = st
     ctx.draft_offset = rb
     set_global_ctx(ctx)
-    ctx.attn_backend = create_attention_backend("fi", mcfg)
+    ctx.attn_backend = make_attention_backend("fi", mcfg)
 
     cm = CacheManager(
         num_pages=8, page_size=PS, num_states=64,
@@ -160,6 +160,7 @@ def main():
             input_ids=ids[:n_tokens].cpu(), table_idx=tidx, cached_len=cached_len,
             output_len=16, uid=tidx, sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
+            max_device_len=n_tokens + 16,
         )
 
     def run_prefill(tidx, n):
@@ -171,8 +172,9 @@ def main():
         pb.padded_reqs = [req]
         pb.out_loc = ctx.page_table[tidx, :n]
         ctx.attn_backend.prepare_metadata(pb)
+        ctx.linear_attn_backend.prepare_metadata(pb)
         with ctx.forward_batch(pb):
-            model.forward_verify()
+            model.forward()
         return req
 
     def run_verify(tidx, C, toks):
@@ -187,8 +189,9 @@ def main():
         vb.padded_reqs = [req]
         vb.out_loc = ctx.page_table[tidx, C : C + n]
         ctx.attn_backend.prepare_metadata(vb)
+        ctx.linear_attn_backend.prepare_metadata(vb)
         with ctx.forward_batch(vb):
-            model.forward_verify()
+            model.forward()
         return req, n
 
     def run_decode(tidx, pos, tok):
@@ -200,6 +203,7 @@ def main():
         db.padded_reqs = [req]
         db.out_loc = ctx.page_table[tidx, pos : pos + 1]
         ctx.attn_backend.prepare_metadata(db)
+        ctx.linear_attn_backend.prepare_metadata(db)
         with ctx.forward_batch(db):
             model.model.forward(tok)
 

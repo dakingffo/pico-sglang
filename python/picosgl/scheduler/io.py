@@ -11,7 +11,8 @@ from picosgl.message import (
     BaseTokenizerMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
-    DraftReplyMsg,
+    BaseSpeculatorMsg,
+    SpeculatorReplyMsg,
 )
 from picosgl.message.queue import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue
 from picosgl.utils import init_logger
@@ -26,6 +27,7 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        self._idle = False
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -44,6 +46,10 @@ class SchedulerIOMixin:
             )
 
         if tp_info.size > 1:
+            distributed_timeout_ms = int(config.distributed_timeout * 1000)
+            self._collective_idle_poll_ms: Final = max(
+                1, min(1000, distributed_timeout_ms // 4)
+            )
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
                 send = self._reply_tokenizer_rank0
@@ -79,24 +85,32 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
+    def _enter_idle(self) -> None:
+        if not self._idle:
+            self.run_when_idle()
+            self._idle = True
+
+    def _leave_idle(self, received: bool) -> None:
+        if received:
+            self._idle = False
+
     def _recv_msg_single_rank(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
+            self._enter_idle()
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
+        self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
-        if blocking:
-            self.run_when_idle()
-            raw = self._recv_from_tokenizer.get_raw()
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
-
         pending_raw_msgs: list[bytes] = []
+        if blocking:
+            self._enter_idle()
+            if self._recv_from_tokenizer.wait(self._collective_idle_poll_ms):
+                pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
@@ -107,13 +121,13 @@ class SchedulerIOMixin:
         for raw in pending_raw_msgs:
             self._send_into_ranks.put_raw(raw)
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+        self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
-            pending_msgs.append(self._recv_from_rank0.get())
+            self._enter_idle()
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)
@@ -122,6 +136,7 @@ class SchedulerIOMixin:
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())
+        self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
     def _reply_tokenizer_rank0(self, reply: list[DetokenizeMsg]) -> None:
@@ -137,13 +152,13 @@ class SchedulerIOMixin:
 
     def _send_draft_to_ranks(
         self,
-        reply: DraftReplyMsg,
+        reply: SpeculatorReplyMsg,
         probs: torch.Tensor | None,
     ) -> None:
         """Rank0 broadcasts a step's draft results to the other TP ranks.
 
         Only rank0 talks to the drafter (zmq + NCCL); every rank's VerifyManager schedules
-        the same requests, so rank>0 needs the identical DraftReplyMsg + draft_probs to
+        the same requests, so rank>0 needs the identical SpeculatorReplyMsg + draft_probs to
         backfill its own DraftState. Mirror of ``_recv_msg_multi_rank0/1``: rank0 PUBs the
         raw messages and gloo-broadcasts the count; the probs tensor crosses as raw fp32
         bytes (the drafter side already did the GPU→CPU trip).
@@ -158,15 +173,16 @@ class SchedulerIOMixin:
     def _recv_draft_from_rank0(
         self,
         vocab_size: int,
-    ) -> tuple[DraftReplyMsg, torch.Tensor | None]:
+    ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
         """Non-primary-rank receive side of ``_send_draft_to_ranks``."""
         dst = torch.tensor(-1)
         self.tp_cpu_group.broadcast(dst, root=0).wait()
         n = int(dst.item())
         assert n in (1, 2), f"bad draft broadcast count {n}"
-        reply = DraftReplyMsg.decoder(
+        reply = BaseSpeculatorMsg.decoder(
             msgpack.unpackb(self._recv_from_rank0.get_raw(), raw=False)
         )
+        assert isinstance(reply, SpeculatorReplyMsg)
         probs = None
         if n == 2:
             data = np.frombuffer(self._recv_from_rank0.get_raw(), dtype=np.float32)

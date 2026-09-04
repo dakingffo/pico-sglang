@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List
-
 import torch
 import torch.nn.functional as F
 from picosgl.distributed import DistributedCommunicator, get_tp_info
@@ -10,29 +8,26 @@ from picosgl.utils import div_even
 from .base import BaseOP
 
 
-class _LinearTPImpl(BaseOP):
+class LinearTPImpl(BaseOP):
     """Real implementation of a linear layer with tensor parallelism."""
 
     def __init__(
         self,
-        full_isize: int,
-        full_osize: int,
-        local_isize: int,
-        local_osize: int,
-        has_bias: bool,
+        input_size : int,
+        output_size: int,
+        has_bias   : bool,
     ):
-        self.full_input_size = full_isize
-        self.full_output_size = full_osize
-        self.local_input_size = local_isize
-        self.local_output_size = local_osize
-        self.weight = torch.empty(local_osize, local_isize)
-        self.bias = torch.empty(local_osize) if has_bias else None
+        self.weight = torch.empty(output_size, input_size)
+        self.bias = torch.empty(output_size) if has_bias else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+    def forward(
+        self, 
+        x: torch.Tensor # [N, D]
+    ) -> torch.Tensor: # [N, D']
+        return F.linear(x, self.weight, self.bias) # [N, D] @ [D, D']
 
 
-class LinearReplicated(_LinearTPImpl):
+class LinearReplicated(LinearTPImpl):
     """
     Linear layer where weights are replicated (not sharded) across all TP ranks.
     Each GPU holds the full weight matrix.
@@ -40,122 +35,89 @@ class LinearReplicated(_LinearTPImpl):
 
     def __init__(
         self,
-        input_size: int,
+        input_size : int,
         output_size: int,
-        has_bias: bool,
+        has_bias   : bool,
     ):
-        super().__init__(
-            full_isize=input_size,
-            full_osize=output_size,
-            local_isize=input_size,
-            local_osize=output_size,
-            has_bias=has_bias,
-        )
+        super().__init__(input_size, output_size, has_bias)
 
 
-class LinearColParallelMerged(_LinearTPImpl):
+class LinearColParallelMerged(LinearTPImpl):
     def __init__(
         self,
-        input_size: int,
-        output_sizes: List[int],
-        has_bias: bool,
+        input_size  : int,
+        output_sizes: list[int],
+        has_bias    : bool,
     ):
         # check that all output sizes are divisible by tp_size
         tp_info = get_tp_info()
         tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
-        output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
-        super().__init__(input_size, output_size, input_size, tp_output_size, has_bias)
+        super().__init__(input_size, tp_output_size, has_bias)
 
 
-class LinearQKVMerged(_LinearTPImpl):
+class LinearColParallelPartitioned(LinearTPImpl):
     def __init__(
         self,
-        hidden_size: int,
-        head_dim: int,
-        num_qo_heads: int,
-        num_kv_heads: int,
-        has_bias: bool,
+        input_size    : int,
+        partition_size: int,
+        partitions    : list[tuple[int, bool]],
+        has_bias      : bool,
     ):
         tp_info = get_tp_info()
-
-        local_num_qo = div_even(num_qo_heads, tp_info.size)
-        local_num_kv = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
-        full_isize = hidden_size
-        full_osize = (num_qo_heads + 2 * num_kv_heads) * head_dim
-        local_isize = hidden_size
-        local_osize = (local_num_qo + 2 * local_num_kv) * head_dim
-        super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
+        tp_partitions = [
+            div_even(partition, tp_info.size, allow_replicate)
+            for partition, allow_replicate in partitions
+        ]
+        tp_output_size = sum(tp_partitions) * partition_size
+        super().__init__(input_size, tp_output_size, has_bias)
 
 
-class LinearOProj(_LinearTPImpl):
-    def __init__(self, input_size: int, output_size: int, has_bias: bool):
+class LinearRowParallel(LinearTPImpl):
+    def __init__(
+        self,
+        input_size : int,
+        output_size: int,
+        has_bias   : bool,
+    ):
         tp_info = get_tp_info()
-        full_isize = input_size
-        full_osize = output_size
-        local_isize = div_even(input_size, tp_info.size)
-        local_osize = output_size
+        tp_input_size = div_even(input_size, tp_info.size)
+        tp_output_size = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
-        super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
+        super().__init__(tp_input_size, tp_output_size, has_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
 
 
-class LinearRowParallel(_LinearTPImpl):
+class LinearColumnParallel(LinearTPImpl):
     def __init__(
         self,
-        input_size: int,
+        input_size : int,
         output_size: int,
-        has_bias: bool,
+        has_bias   : bool,
     ):
         tp_info = get_tp_info()
-        local_input_size = div_even(input_size, tp_info.size)
-        local_output_size = output_size
+        tp_output_size = div_even(output_size, tp_info.size)
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
-        super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
+        super().__init__(input_size, tp_output_size, has_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
-        if self._tp_size > 1:
-            y = self._comm.all_reduce(y)
-        return y
-
-
-class LinearColumnParallel(_LinearTPImpl):
-    """Column-parallel (output-split) linear with an all-gather on the output.
-
-    Takes the FULL input width (LinearRowParallel instead expects the per-rank input
-    shard) and emits the FULL output. Each rank computes a DISJOINT out/tp slice of
-    the output rows, so the full output is the all-gathered concatenation (not an
-    all-reduce sum). Used where the input is a concatenation of full-width tensors
-    that cannot be sharded per-rank, e.g. the MTP fusion fc over [embedding; hidden]."""
-
-    def __init__(
+    def forward(
         self,
-        input_size: int,
-        output_size: int,
-        has_bias: bool,
-    ):
-        tp_info = get_tp_info()
-        local_input_size = input_size
-        local_output_size = div_even(output_size, tp_info.size)
-        self._comm = DistributedCommunicator()
-        self._tp_size = tp_info.size
-        super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x: torch.Tensor
+    ) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
-            # all_gather concatenates the per-rank output slices along dim 0
-            # (rank-contiguous): (T*tp, out/tp) -> view(tp, T, out/tp) -> (T, out).
             gathered = self._comm.all_gather(y)
             gathered = gathered.view((self._tp_size,) + y.shape)
             gathered = gathered.permute(1, 0, 2).contiguous()
-            y = gathered.reshape(y.shape[:1] + (self._tp_size * y.shape[1],))
+            y = gathered.reshape((y.shape[0], self._tp_size * y.shape[1]))
         return y

@@ -12,7 +12,7 @@ from picosgl.core import (
     Batch, 
     Context 
 )
-from picosgl.utils import init_logger
+from picosgl.utils import init_logger, align_ceil
 
 from .ar import ForwardInput, ForwardOutput
 
@@ -58,7 +58,7 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_len = align_ceil(extend_len + req.output_len, self.cache_manager.page_size)
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -71,13 +71,15 @@ class PrefillAdder:
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            page_entry.copy_(handle.get_matched_indices())
+            matched = handle.get_matched_indices()
             # borrow the matched pages' linear-state slots (per page) instead of allocating
             if (state_table := self.cache_manager.state_table) is not None:
-                matched_state = handle.get_matched_state_slots()
-                if matched_state is not None:
-                    ps = self.cache_manager.page_size
-                    state_table[table_idx, : cached_len // ps] = matched_state
+                matched_indices, matched_state = matched
+                ps = self.cache_manager.page_size
+                state_table[table_idx, : cached_len // ps] = matched_state
+            else:
+                matched_indices = matched
+            page_entry.copy_(matched_indices)
 
         return handle, table_idx
 
@@ -93,7 +95,7 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        self.reserved_size += align_ceil(remain_len + pending_req.output_len, self.cache_manager.page_size)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         device_ids = self.table_manager.token_pool[table_idx, cached_len: cached_len + chunk_size]
         device_ids.copy_(
@@ -108,6 +110,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            max_device_len=len(pending_req.input_ids) + pending_req.output_len,
         )
 
     def try_add_one(self, pending_req: PendingRequest) -> Request | ChunkedRequest | None:
@@ -137,15 +140,24 @@ class PrefillAdder:
 class PrefillManager:
     def __init__(
         self,
-        token_pool   : torch.Tensor,
+        token_pool : torch.Tensor,
+        page_size  : int
     ):
         self.token_pool = token_pool
         self.pending_list: list[PendingRequest] = []
         self.inflight_reqs: dict[int, Request] = dict()
+        self.page_size = page_size
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingRequest(req.uid, req.input_ids, req.sampling_params))
 
+    @property
+    def need_tokens(self) -> int:
+        return sum(
+            align_ceil(req.remain_len, self.page_size)
+            for req in self.inflight_reqs.values()
+        )
+        
     def schedule_next_batch(self, adder: PrefillAdder) -> Batch | None:
         self.inflight_reqs.clear()
         if len(self.pending_list) == 0:

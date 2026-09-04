@@ -8,6 +8,8 @@ throughput (input-tok/s), TTFT and req/s. Server flags are parsed by the library
 Examples:
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
       --input-len 2048 --num-prompts 64
+  python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
+      --dataset spec_bench --num-prompts 64 --output-len 8
 """
 import asyncio
 import os
@@ -15,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from bench_common import (
+    input_label,
     launch_server,
     make_prompts,
     parse_full,
@@ -22,6 +25,8 @@ from bench_common import (
     print_stats,
     resolve_port,
     run_online_bench,
+    save_json,
+    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -36,12 +41,25 @@ def main() -> int:
         },
     )
     port = resolve_port(server_argv, server_args)
-    proc = launch_server(server_argv, port=port, enable_mtp=False, num_spec_tokens=0)
+    proc = launch_server(
+        server_argv, port=port,
+        enable_specualtive_decoding=False, num_spec_tokens=0,
+    )
     try:
         base = wait_server_ready(port)
-        for c in parse_int_list(bench.num_prompts, 32):
+        results: dict[str, dict] = {}
+        for point_idx, c in enumerate(parse_int_list(bench.num_prompts, 32)):
+            warmup = not bench.no_warmup
             prompts, in_lens = make_prompts(
-                server_args.model_path, bench.input_len, c, bench.seed
+                server_args.model_path,
+                bench.input_len,
+                c + int(warmup),
+                bench.seed + point_idx,
+                dataset=bench.dataset,
+                dataset_categories=bench.dataset_category,
+            )
+            warmup_prompt, prompts, in_lens = split_warmup_prompt(
+                prompts, in_lens, warmup
             )
             out_lens = [bench.output_len] * c
             stats = asyncio.run(
@@ -52,16 +70,19 @@ def main() -> int:
                     in_lens,
                     out_lens,
                     mtp=False,
-                    warmup=not bench.no_warmup,
+                    warmup_prompt=warmup_prompt,
                     pbar=not bench.no_pbar,
                 )
             )
             assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
             print_stats(
                 f"bench_prefill tp={server_args.tp_info.size} "
-                f"in={bench.input_len} out={bench.output_len} conc={c}",
+                f"in={input_label(bench.dataset, in_lens, bench.input_len)} "
+                f"out={bench.output_len} conc={c}",
                 stats,
             )
+            results[str(c)] = stats
+            save_json(bench.out, results)
         return 0
     finally:
         kill_server(proc)

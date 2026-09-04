@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 import torch
 
@@ -12,7 +12,7 @@ from picosgl.message import (
     ExitMsg,
     UserMsg,
 )
-from picosgl.speculator import make_drafter_client
+from picosgl.speculator import make_speculator_client
 from picosgl.utils import init_logger, load_tokenizer, div_ceil
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
@@ -22,15 +22,26 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import PrefillAdder, PrefillManager
+from .profile import SchedulerProfiler
 from .table import TableManager
 from .verify import VerifyManager
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    import multiprocessing as mp
+    from picosgl.speculator.data_plane import DataPlane
+
 
 class Scheduler(SchedulerIOMixin):
-    def __init__(self, config: SchedulerConfig):
-        self.engine = Engine(config)
+    def __init__(
+        self,
+        config                : SchedulerConfig,
+        speculator_start_event: mp.synchronize.Event | None = None,
+        speculator_ready_event: mp.synchronize.Event | None = None,
+        speculator_data_plane : DataPlane | None = None,
+    ):
+        self.engine = Engine(config, speculator_start_event, speculator_ready_event)
         super().__init__(config, self.engine.tp_cpu_group)
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -40,6 +51,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.config = config
+        self.speculator_data_plane = speculator_data_plane
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
@@ -52,13 +64,16 @@ class Scheduler(SchedulerIOMixin):
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
-        self.drafter_client = make_drafter_client(self, config) if config.enable_mtp else None
+        self.speculator_client = (
+            make_speculator_client(self, config)
+            if config.enable_specualtive_decoding else None
+        )
 
-        if config.enable_mtp:
+        if config.enable_specualtive_decoding:
             self.ar_manager = VerifyManager(
                 config, self.device,
                 self.cache_manager, self.table_manager,
-                self.eos_token_id, self.drafter_client,
+                self.eos_token_id, self.speculator_client,
                 config.model_config.vocab_size,
             )
         else:
@@ -70,14 +85,16 @@ class Scheduler(SchedulerIOMixin):
 
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
-        self.prefill_manager = PrefillManager(self.token_pool)
+        self.prefill_manager = PrefillManager(self.token_pool, config.page_size)
         self.prefill_budget = config.max_prefill_tokens
+        self.profiler = SchedulerProfiler(self.device)
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
+        self.profiler.poll()
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -91,7 +108,11 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                batch = forward_input.batch
+                with self.profiler.record_submit(batch.phase):
+                    ongoing_data = (forward_input, self._forward(forward_input))
+                    if not batch.is_prefill:
+                        self.ar_manager.advance_for_overlap(batch)
 
         self._process_last_data(last_data)
         return ongoing_data
@@ -105,8 +126,9 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
-        if self.drafter_client is not None:
-            self.drafter_client.destroy()
+        self.profiler.dump()
+        if self.speculator_client is not None:
+            self.speculator_client.destroy()
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -114,11 +136,16 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
         last_input, last_output = last_data
-        last_output.copy_done_event.synchronize()
-        reply, finished_reqs = self.ar_manager.process(self.engine.ctx, last_input, last_output)
-        self.send_result(reply)
-        for req in finished_reqs:
-            self._free_req_resources(req)
+        with self.profiler.record_wait(last_input.batch.phase):
+            last_output.copy_done_event.synchronize()
+
+        with self.profiler.record_process(last_input.batch.phase):
+            reply, finished_reqs = self.ar_manager.process(
+                self.engine.ctx, last_input, last_output
+            )
+            self.send_result(reply)
+            for req in finished_reqs:
+                self._free_req_resources(req)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -168,18 +195,27 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        batch = (
-            self.prefill_manager.schedule_next_batch(
-                PrefillAdder(
-                    token_budget=self.prefill_budget,
-                    reserved_size=self.ar_manager.need_tokens,
-                    cache_manager=self.cache_manager,
-                    table_manager=self.table_manager,
-                )
-            ) or
-            self.ar_manager.schedule_next_batch()
-        )
-        return self.engine.prepare_batch(batch, self.cache_manager) if batch else None
+        with self.profiler.record_schedule():
+            batch = (
+                self.prefill_manager.schedule_next_batch(
+                    PrefillAdder(
+                        token_budget=self.prefill_budget,
+                        reserved_size=self.ar_manager.need_tokens + self.prefill_manager.need_tokens,
+                        cache_manager=self.cache_manager,
+                        table_manager=self.table_manager,
+                    )
+                ) or
+                self.ar_manager.schedule_next_batch()
+            )
+        if batch is None:
+            if self.ar_manager.runnable and not self.prefill_manager.runnable:
+                self.profiler.record_ar_no_batch()
+            return None
+
+        graph_used = batch.is_decode and self.engine.graph_runner.can_use_cuda_graph(batch)
+        with self.profiler.record_prepare(batch, graph_used=graph_used):
+            forward_input = self.engine.prepare_batch(batch, self.cache_manager)
+        return forward_input
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, _ = forward_input

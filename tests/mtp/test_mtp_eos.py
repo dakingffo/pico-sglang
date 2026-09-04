@@ -33,7 +33,7 @@ from picosgl.message import UserMsg
 from test_mtp_e2e import OfflineScheduler, make_config
 from transformers import AutoTokenizer
 
-MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
+MODEL = os.environ.get("QWEN3_NEXT_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 PROMPT = "1+1="
 
 

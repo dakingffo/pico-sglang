@@ -14,10 +14,14 @@ class DecodeManager(ARManagerBase):
 
         scheduled_token = 0
         reqs = []
-        for uid, req in self.running_reqs.items():
+        for uid, req in sorted(
+            self.running_reqs.items(), 
+            key=lambda x: x[0] in self.inflight_uids[0]
+            # prioritize the requests that have not been scheduled in the last iteration
+        ):
             if scheduled_token >= self.token_budget:
                 break
-            elif uid not in self.inflight_uids[0]:
+            if req.can_decode:
                 self.inflight_uids[1].add(uid)
                 reqs.append(req)
                 scheduled_token += 1
@@ -26,3 +30,7 @@ class DecodeManager(ARManagerBase):
             return Batch(reqs=reqs, phase="decode")
         else:
             return None
+
+    def advance_for_overlap(self, batch: Batch) -> None:
+        for req in batch.reqs:
+            req.complete_n(1)

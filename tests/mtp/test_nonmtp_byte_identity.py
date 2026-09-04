@@ -37,7 +37,7 @@ MAX_TOKENS = 24
 def main() -> None:
     src = sys.argv[1] if len(sys.argv) > 1 else "/tmp/non_mtp_17b.json"
     result = json.load(open(src))
-    assert result["enable_mtp"] is False, "this is a non-MTP regression"
+    assert result["enable_specualtive_decoding"] is False, "this is a non-MTP regression"
     assert not result["missing"], f"unfinished reqs: {result['missing']}"
     assert result["integrity_ok"], f"integrity failed: {result['integrity_msg']}"
 

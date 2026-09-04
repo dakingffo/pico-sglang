@@ -13,6 +13,7 @@ Usage:
 """
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
 
@@ -27,11 +28,13 @@ from picosgl.distributed import DistributedInfo
 from picosgl.message import UserMsg
 from picosgl.scheduler.config import SchedulerConfig
 from picosgl.scheduler.scheduler import Scheduler
+from picosgl.speculator import make_local_data_plane_pair, speculator_worker
+from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
 
-MODEL = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
+MODEL = os.environ.get("QWEN3_NEXT_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 
-if os.environ.get("QWEN35_PROMPT"):
-    PROMPTS = [("single", os.environ["QWEN35_PROMPT"])]
+if os.environ.get("QWEN3_NEXT_PROMPT"):
+    PROMPTS = [("single", os.environ["QWEN3_NEXT_PROMPT"])]
 else:
     PROMPTS = [
     ("q1", "The meaning of life is"),
@@ -58,16 +61,49 @@ TIE_MARGIN = 0.2
 class OfflineScheduler(Scheduler):
     """Scheduler with an in-process message queue instead of ZMQ.
 
-    DT separation is off locally (single GPU), so the drafter runs in-process: the
-    scheduler builds the standalone ``Qwen3_5MTPDrafter`` + ``MTPEngine`` directly
-    (``scheduler._make_inprocess_client``), with no separate drafter process, no zmq
-    control plane, and no data plane. This is the non-DT production path.
+    Requests and replies bypass the tokenizer-side ZMQ queues. In speculative mode the
+    drafter still follows the production architecture: a separate same-device worker,
+    a ZMQ control plane, and the configured tensor data plane.
     """
 
     def __init__(self, config, msgs):
         self._pending = list(msgs)
         self.results: list = []
-        super().__init__(config)
+        self.speculator_process: mp.Process | None = None
+        self._speculator_queues: list = []
+        if config.enable_specualtive_decoding:
+            ctx = mp.get_context("spawn")
+            start_event = ctx.Event()
+            ready_event = ctx.Event()
+            ack_queue = ctx.Queue(maxsize=1)
+            target_data_plane, speculator_data_plane = make_local_data_plane_pair(
+                config, ctx
+            )
+            self._speculator_queues = [ack_queue]
+            self.speculator_process = ctx.Process(
+                target=speculator_worker,
+                kwargs={
+                    "args": config,
+                    "speculator_start_event": start_event,
+                    "speculator_ready_event": ready_event,
+                    "speculator_data_plane": speculator_data_plane,
+                    "ack_queue": ack_queue,
+                },
+                daemon=False,
+                name="picosgl-test-speculator",
+            )
+            self.speculator_process.start()
+            try:
+                super().__init__(
+                    config, start_event, ready_event, target_data_plane
+                )
+            except BaseException:
+                self.speculator_process.terminate()
+                self.speculator_process.join()
+                raise
+            assert ack_queue.get() == "Speculator is ready"
+        else:
+            super().__init__(config)
 
     def offline_receive_msg(self, blocking: bool = False) -> list:
         out, self._pending = self._pending, []
@@ -76,8 +112,17 @@ class OfflineScheduler(Scheduler):
     def offline_send_result(self, reply) -> None:
         self.results.extend(reply)
 
+    def shutdown(self) -> None:
+        super().shutdown()
+        if self.speculator_process is not None:
+            self.speculator_process.terminate()
+            self.speculator_process.join()
+        for queue in self._speculator_queues:
+            queue.close()
+            queue.join_thread()
 
-def make_config(enable_mtp: bool, num_pages: int = 256) -> SchedulerConfig:
+
+def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> SchedulerConfig:
     # page_size stays 1 here: the engine overrides it to 64 for hybrid models (must be a
     # multiple of 64), and dense models (the non-MTP byte-identity regression) keep 1.
     # num_pages is small because a hybrid page also owns one ~9.6MB linear-state slot, so
@@ -91,14 +136,17 @@ def make_config(enable_mtp: bool, num_pages: int = 256) -> SchedulerConfig:
         num_page_override=num_pages,
         cache_type="naive",  # hybrid is force-upgraded to hybrid_radix by the engine
         cuda_graph_max_bs=0,
-        speculative_algorithm="MTP" if enable_mtp else None,
-        speculative_draft_model_path=MODEL if enable_mtp else None,
-        speculative_num_draft_tokens=K,
+        speculative_algorithm="MTP" if enable_specualtive_decoding else None,
+        speculative_draft_model_path=MODEL if enable_specualtive_decoding else None,
+        speculator_config=(
+            MTPSpeculatorConfig(num_draft_tokens=K)
+            if enable_specualtive_decoding else None
+        ),
         offline_mode=True,
     )
 
 
-def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) -> dict:
+def run(enable_specualtive_decoding: bool, debug_logits: bool = False, temperature: float = 0.0) -> dict:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
@@ -112,7 +160,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
                 sampling_params=SamplingParams(temperature=temperature, max_tokens=MAX_TOKENS),
             )
         )
-    sched = OfflineScheduler(make_config(enable_mtp), msgs)
+    sched = OfflineScheduler(make_config(enable_specualtive_decoding), msgs)
     uid_map = {uid: name for uid, (name, _) in enumerate(PROMPTS)}
 
     # top-2 logit margin at every position, recorded from the DECODE path's forward
@@ -138,7 +186,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
     # the verify forward), and each non-aborted req emits one list-typed DetokenizeMsg per
     # round whose length is num_sampled -- read it from the reply.
     hist: list[tuple[int, int]] = []
-    if enable_mtp:
+    if enable_specualtive_decoding:
         orig_process = sched.verify_manager.process
 
         def rec_process(ctx, batch, output):
@@ -150,11 +198,11 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
 
         sched.verify_manager.process = rec_process
 
-    if debug_logits or enable_mtp:
+    if debug_logits or enable_specualtive_decoding:
         rs = sched.engine.sampler.reject_sample
 
-        def dump_rs(logits, batch, args):
-            out = rs(logits, batch, args)
+        def dump_rs(logits, batch):
+            out = rs(logits, batch)
             if batch.is_verify:
                 off = 0
                 for req in batch.reqs:
@@ -254,7 +302,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
     sched.shutdown()
 
     result = {
-        "enable_mtp": enable_mtp,
+        "enable_specualtive_decoding": enable_specualtive_decoding,
         "tokens": {uid_map[u]: t for u, t in tokens.items()},
         "prompt_len": {uid_map[u]: len(m.input_ids) for u, m in enumerate(msgs)},
         "missing": missing,
@@ -270,7 +318,7 @@ def run(enable_mtp: bool, debug_logits: bool = False, temperature: float = 0.0) 
     result["verify_margins"] = [
         [u, p, round(m, 4)] for (u, p), m in verify_margins.items()
     ]
-    if enable_mtp:
+    if enable_specualtive_decoding:
         n = len(hist)
         result["accept_hist"] = hist
         if n:
@@ -304,7 +352,7 @@ def main() -> None:
         # reported but do not fail the check. A single non-tie root = real bug.
         verdict: dict[str, str] = {}  # name -> "identical" | "near-tie" | "fail"
         for name in a["tokens"]:
-            # QWEN35_PROMPT override emits a single prompt named "single" (uid 0);
+            # QWEN3_NEXT_PROMPT override emits a single prompt named "single" (uid 0);
             # the standard suite names q1..q5. Match by name, else fall back to 0.
             uid = next((u for u, n in enumerate(PROMPTS) if n[0] == name), 0)
             ta, tb = a["tokens"][name], b["tokens"][name]

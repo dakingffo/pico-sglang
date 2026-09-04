@@ -9,7 +9,18 @@ import torch
 if TYPE_CHECKING:
     from picosgl.cache import BaseCacheHandle, BaseKVCachePool, LinearStatePool
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
+    from picosgl.layers.linear_attention_backend import (
+        BaseLinearAttentionBackend,
+        LinearAttentionMetadata,
+    )
     from picosgl.layers.moe_backend import BaseMoeBackend
+    from picosgl.speculator.hidden_captor import HiddenCaptorBase
+
+
+def _make_default_linear_attention_backend():
+    from picosgl.layers.linear_attention_backend import make_linear_attention_backend
+
+    return make_linear_attention_backend("native")
 
 
 @dataclass
@@ -34,15 +45,14 @@ class Request:
     uid            : int
     sampling_params: SamplingParams
     cache_handle   : BaseCacheHandle
-    device_len     : int = field(init=False)
-    max_device_len : int = field(init=False)
-    baseline_slot  : int = field(default=-1, init=False)  # for verify
+    max_device_len : int
+    device_len     : int  = field(init=False)
+    baseline_slot  : int  = field(default=-1, init=False)  # for verify
     aborted        : bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
-        self.max_device_len = self.device_len + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
     def __lt__(self, other: Request) -> bool:
@@ -77,6 +87,7 @@ class Request:
             f"max_device_len={self.max_device_len})"
         )
 
+@dataclass(eq=False)
 class ChunkedRequest(Request):
     def append_host(self, next_token: torch.Tensor) -> None:
         raise NotImplementedError("ChunkedRequest should not be sampled")
@@ -102,7 +113,8 @@ class Batch:
     # step, used for the residual rejection sampling (needs the full distribution).
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
-    full_hidden : torch.Tensor | None = field(init=False, default=None)
+    hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
+    linear_attn_metadata: LinearAttentionMetadata = field(init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -128,11 +140,15 @@ class Batch:
 @dataclass
 class Context:
     page_size: int
-    page_table  : torch.Tensor    = field(init=False)
-    attn_backend: BaseAttnBackend = field(init=False)
-    moe_backend : BaseMoeBackend  = field(init=False)
-    kv_cache    : BaseKVCachePool = field(init=False)   # full attention
-    linear_state: LinearStatePool = field(init=False)   # linear attention
+    page_table         : torch.Tensor               = field(init=False)
+    attn_backend       : BaseAttnBackend            = field(init=False)
+    linear_attn_backend: BaseLinearAttentionBackend = field(
+        default_factory=_make_default_linear_attention_backend,
+        init=False,
+    )
+    moe_backend        : BaseMoeBackend             = field(init=False)
+    kv_cache           : BaseKVCachePool            = field(init=False)   # full attention
+    linear_state       : LinearStatePool            = field(init=False)   # linear attention
 
     state_table : torch.Tensor | None = field(default=None, init=False)
     draft_offset : int | None         = field(default=None, init=False)

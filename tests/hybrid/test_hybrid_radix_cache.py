@@ -1,8 +1,8 @@
-"""HybridRadixPrefixCache / flat LinearStatePool / CacheManager state wiring.
+"""Hybrid RadixTreeNode / flat LinearStatePool / CacheManager state wiring.
 
 CPU-only. Verifies the per-page linear-state caching design end to end:
 
-  1. HybridRadixPrefixCache: nodes carry one state slot per page; split preserves
+  1. HybridRadixTreeNode: nodes carry one state slot per page; split preserves
      state; evict returns both KV pages and state slots.
   2. CacheManager.allocate_state: allocates a slot exactly for each page the batch
      will write (skip already-allocated), never the never-written baseline page.
@@ -26,7 +26,7 @@ from picosgl.core import Context, Request, SamplingParams, set_global_ctx
 from picosgl.scheduler.cache import CacheManager
 from picosgl.scheduler.prefill import PendingRequest
 from picosgl.cache.linear.state_pool import LinearStatePool
-from picosgl.cache.radix_prefix_cache import HybridRadixPrefixCache
+from picosgl.cache.radix_prefix_cache import HybridRadixTreeNode, RadixPrefixCache
 
 
 def make_req(input_len, table_idx, output_len=10):
@@ -38,6 +38,7 @@ def make_req(input_len, table_idx, output_len=10):
         uid=table_idx,
         sampling_params=SamplingParams(),
         cache_handle=None,
+        max_device_len=input_len + output_len,
     )
 
 
@@ -69,30 +70,31 @@ def alloc_pages(cm, pt, tidx, lo, hi):
 
 
 # =====================================================================================
-# 1. HybridRadixPrefixCache: state-carrying nodes, split, evict
+# 1. HybridRadixTreeNode: state-carrying nodes, split, evict
 # =====================================================================================
 def test1_hybrid_radix():
-    hc = HybridRadixPrefixCache(device=torch.device("cpu"))
+    hc = RadixPrefixCache(device=torch.device("cpu"), node_type=HybridRadixTreeNode)
     ids = torch.arange(192, dtype=torch.int32)       # 3 pages
     state = torch.tensor([10, 11, 12], dtype=torch.int32)
     res = hc.insert_prefix(ids, ids.clone(), state)
     assert res.handle.cached_len == 192
-    assert res.handle.get_matched_indices().tolist() == list(range(192))
-    assert res.handle.get_matched_state_slots().tolist() == [10, 11, 12]
+    matched_indices, matched_state = res.handle.get_matched_indices()
+    assert matched_indices.tolist() == list(range(192))
+    assert matched_state.tolist() == [10, 11, 12]
     assert hc.size_info.evictable_size == 192
     # partial match -> split at page 2 (128 tokens): matched state = pages [0,2)
     m = hc.match_prefix(torch.arange(128, dtype=torch.int32))
     assert m.cuda_handle.cached_len == 128
-    assert m.cuda_handle.get_matched_state_slots().tolist() == [10, 11]
+    assert m.cuda_handle.get_matched_indices()[1].tolist() == [10, 11]
     # extending with a new suffix creates a sibling node; state preserved through split
     ids2 = torch.arange(256, dtype=torch.int32)
     hc.insert_prefix(ids2, ids2.clone(), torch.tensor([10, 11, 12, 13], dtype=torch.int32))
     m2 = hc.match_prefix(ids2)
-    assert m2.cuda_handle.get_matched_state_slots().tolist() == [10, 11, 12, 13]
+    assert m2.cuda_handle.get_matched_indices()[1].tolist() == [10, 11, 12, 13]
     # evict 2 pages -> returns 2 state slots
     ev_idx, ev_state = hc.evict(128)
     assert ev_state is not None and len(ev_state) == 2, (ev_idx, ev_state)
-    print("[1] HybridRadixPrefixCache OK")
+    print("[1] Hybrid RadixPrefixCache OK")
 
 
 # =====================================================================================
@@ -166,7 +168,7 @@ def test3_cache_req_lifecycle():
     r2.cache_handle = match2.cuda_handle
     cm.lock(r2.cache_handle)
     pt[1, 0:64] = 0                         # borrow page 0's KV
-    st[1, 0] = match2.cuda_handle.get_matched_state_slots()[0]   # borrow page 0's state
+    st[1, 0] = match2.cuda_handle.get_matched_indices()[1][0]   # borrow page 0's state
     alloc_pages(cm, pt, 1, 64, 100)         # fresh KV page for [64,100)
     r2.cached_len, r2.device_len = 0, 100
     cm.allocate_state([r2])

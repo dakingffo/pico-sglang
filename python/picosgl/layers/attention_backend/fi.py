@@ -9,7 +9,7 @@ import torch
 from picosgl.core import Batch, get_global_ctx
 from picosgl.distributed import get_tp_info
 from picosgl.env import ENV
-from picosgl.utils import div_even, init_logger
+from picosgl.utils import div_even, init_logger, nvtx_annotate
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -120,6 +120,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
+    @nvtx_annotate("FlashInfer::plan")
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
         if metadata.initialized:
             return
@@ -187,6 +188,7 @@ class FlashInferBackend(BaseAttnBackend):
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
+    @nvtx_annotate("FlashInfer::metadata")
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
 
@@ -227,7 +229,7 @@ class FlashInferBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        capture = FICaptureData.make(max_bs, max_seq_len, self.kvcache.device)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
         self.max_graph_bs = max_bs
         self.capture = capture
@@ -263,6 +265,7 @@ class FlashInferBackend(BaseAttnBackend):
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
 
+    @nvtx_annotate("FlashInfer::prepare_replay")
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized

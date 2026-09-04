@@ -11,13 +11,11 @@ from picosgl.utils import div_ceil, load_model_config, resolve_model_path
 from tqdm import tqdm
 
 _SPLIT_DIM_0 = [
-    ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj",
-    # Qwen3.5 linear attention / MTP
+    ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".gate_up_proj",
+    # Hybrid gated-delta attention / MTP
     ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
     ".conv1d.weight",
     ".A_log", ".dt_bias",  # per-value-head vectors, column-parallel like in_proj_b/a
-    # MTP fusion fc takes the FULL cat([embedding; hidden]) input, so it is
-    # column-parallel (output-split) — see LinearColumnParallel.
     ".fc",
 ]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj", ".out_proj"]
@@ -108,10 +106,10 @@ def load_weight(
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
-    from .config import ModelConfig
+    from .register import make_model_config
 
     model_folder = resolve_model_path(model_path)
-    config = ModelConfig.from_pretrained(load_model_config(model_folder))
+    config = make_model_config(load_model_config(model_folder))
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
@@ -131,14 +129,14 @@ def load_weight(
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for checkpoint_name in f.keys():
-                # Skip vision/projector weights (multimodal wrapper or Qwen3.5 vision tower)
+                # Skip vision/projector weights from multimodal wrappers.
                 if checkpoint_name.startswith(
                     ("vision_tower.", "multi_modal_projector.", "model.visual.")
                 ):
                     continue
                 name = checkpoint_name
                 name = name.removeprefix("language_model.")
-                # Qwen3.5: text weights live under model.language_model.*, strip the middle prefix
+                # Qwen3.5: text weights live under model.language_model.*.
                 name = name.replace("model.language_model.", "model.", 1)
                 if name.startswith(skip_prefixes):
                     continue
@@ -148,7 +146,8 @@ def load_weight(
                 )
                 del raw
 
-                if config.is_hybrid or (info := _get_merge_info(name)) is None:
+                info = _get_merge_info(name)
+                if info is None:
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info

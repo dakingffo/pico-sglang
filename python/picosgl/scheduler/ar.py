@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from itertools import chain
 
 import torch
 
-from picosgl.core import Request, ChunkedRequest, Context
+from picosgl.core import Request, ChunkedRequest, Batch, Context
 from picosgl.engine import ForwardInput, ForwardOutput
 from picosgl.message import DetokenizeMsg
 from picosgl.utils import align_ceil
 
 if TYPE_CHECKING:
+    from picosgl.speculator import HiddenCaptorBase
+
     from .cache import CacheManager
     from .config import SchedulerConfig
     from .table import TableManager
@@ -46,9 +47,12 @@ class ARManagerBase:
     @property
     def need_tokens(self) -> int:
         return sum(
-            align_ceil(req.remain_len, self.page_size)
+            align_ceil(self._reserve_remain_len(req), self.page_size)
             for req in self.running_reqs.values()
         )
+
+    def _reserve_remain_len(self, req: Request) -> int:
+        return req.remain_len
 
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
         inflight: bool = uid in self.inflight_uids[1]
@@ -60,8 +64,16 @@ class ARManagerBase:
             req.aborted = True
             return req, inflight
 
-    def on_prefill_done(self, req: Request, full_hidden, mapping) -> None:
-        """Prefill -> AR handoff hook. decode: no-op; verify (MTP): seed the carry."""
+    def on_prefill_done(
+        self,
+        req       : Request,
+        req_captor: HiddenCaptorBase,
+    ) -> None:
+        """Prefill -> AR handoff hook. Decode does not need speculator features."""
+        return None
+
+    def advance_for_overlap(self, batch: Batch) -> None:
+        """Decode -> decode overlap hook. Verify can not advance for overlap."""
         return None
 
     def process(
@@ -77,30 +89,37 @@ class ARManagerBase:
 
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedRequest):
-                    continue
-                if req.aborted:
+                if isinstance(req, ChunkedRequest) or req.aborted:
                     continue
                 if not batch.is_prefill and req.uid not in self.running_reqs:
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                req.complete_n(1)
+                if batch.is_prefill:
+                    req.complete_n(1)
 
-                finished = not req.can_decode
+                finished = req.max_device_len - (req.device_len - (req.uid in self.inflight_uids[1])) <= 0
+                                                # real device len = devel_len - 1 if inflight
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 if finished and req not in self.finished_reqs:
-                    self._finish_req(req)
+                    if req not in self.inflight_uids[1]:
+                        self._finish_req(req)
+                    else:
+                        self.abort_req(req.uid)
                     new_finished.add(req)
                 elif batch.is_prefill:
                     if req.can_decode:
                         self.running_reqs[req.uid] = req
-                        if batch.full_hidden is not None:
-                            self.on_prefill_done(req, batch.full_hidden, forward_input.input_tuple[0])
+                        if batch.hidden_captor is not None:
+                            mapping = forward_input.input_tuple[0]
+                            self.on_prefill_done(
+                                req,
+                                batch.hidden_captor.select(mapping == req.table_idx)
+                            )
                     self.cache_manager.cache_req(req, finished=False)
 
         self.inflight_uids[0] = set()

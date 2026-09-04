@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -24,14 +25,23 @@ def nvtx_annotate(name: str, layer_id_field: str | None = None):
     import torch.cuda.nvtx as nvtx
 
     def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(self, *args, **kwargs):
-            display_name = name
-            if layer_id_field and hasattr(self, layer_id_field):
-                display_name = name.format(getattr(self, layer_id_field))
-            with nvtx.range(display_name):
-                return fn(self, *args, **kwargs)
-
-        return wrapper
+        if inspect.isgeneratorfunction(fn):
+            @functools.wraps(fn)
+            def generator_wrapper(self, *args, **kwargs):
+                display_name = name
+                if layer_id_field and hasattr(self, layer_id_field):
+                    display_name = name.format(getattr(self, layer_id_field))
+                with nvtx.range(display_name):
+                    yield from fn(self, *args, **kwargs)
+            return generator_wrapper
+        else:
+            @functools.wraps(fn)
+            def wrapper(self, *args, **kwargs):
+                display_name = name
+                if layer_id_field and hasattr(self, layer_id_field):
+                    display_name = name.format(getattr(self, layer_id_field))
+                with nvtx.range(display_name):
+                    return fn(self, *args, **kwargs)
+            return wrapper
 
     return decorator

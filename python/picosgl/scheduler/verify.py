@@ -5,16 +5,21 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from picosgl.engine import VerifyOutput
+from picosgl.engine import ForwardOutput
 from picosgl.core import Batch, Request, Context
-from picosgl.message import DetokenizeMsg, DraftReplyMsg, DraftStepReq
-from picosgl.speculator import DraftState
+from picosgl.message import (
+    DetokenizeMsg,
+    SpeculatorStepMsg,
+    SpeculatorStepReq,
+    make_init_message,
+)
+from picosgl.speculator import DraftState, HiddenCaptorBase
 from picosgl.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
 
 if TYPE_CHECKING:
-    from picosgl.speculator import DrafterClientBase
+    from picosgl.speculator import SpeculatorClientBase
 
     from .cache import CacheManager
     from .config import SchedulerConfig
@@ -48,16 +53,28 @@ class VerifyManager(ARManagerBase):
         cache_manager : CacheManager,
         table_manager : TableManager,
         eos_token_id  : int,
-        client        : DrafterClientBase,
+        client        : SpeculatorClientBase,
         vocab_size    : int,
     ) -> None:
         super().__init__(config, device, cache_manager, table_manager, eos_token_id)
+        speculator_config = config.speculator_config
+        assert speculator_config is not None
+        speculative_algorithm = config.speculative_algorithm
+        assert speculative_algorithm is not None
+
         self.page_table = table_manager.page_table
-        self.num_spec_tokens = config.speculative_num_draft_tokens
-        self.window_size = config.speculator_window_size
+        self.speculative_algorithm = speculative_algorithm
+        self.speculator_config = speculator_config
+        self.num_spec_tokens = speculator_config.num_draft_tokens
         self.client = client
         self.vocab_size = vocab_size
         self._state_table: dict[int, VerifyState] = {}
+
+    def _reserve_remain_len(self, req: Request) -> int:
+        if req.uid in self.inflight_uids[1]:
+            return req.max_device_len - (req.cached_len + 1)
+        else:
+            return req.remain_len
 
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
         inflight: bool = uid in self.inflight_uids[1]
@@ -71,24 +88,36 @@ class VerifyManager(ARManagerBase):
             self.client.remove(uid)
             return req, inflight
 
-    def on_prefill_done(self, req: Request, full_hidden: torch.Tensor, mapping) -> None:
-        req_hidden = full_hidden[mapping == req.table_idx]
-        C = req.cached_len
-        window_len = min(self.window_size, req_hidden.shape[0])
-        # window ends at the bonus position C (token_pool[C] = bonus)
-        positions = list(range(C + 1 - window_len, C + 1))
-        tokens = self.token_pool[req.table_idx, positions].tolist()
-        hidden = req_hidden[-window_len:].contiguous()
-        self.client.init(req.uid, req.table_idx, positions, tokens, hidden, req.sampling_params)
+    def on_prefill_done(
+        self,
+        req       : Request,
+        req_captor: HiddenCaptorBase,
+    ) -> None:
+        msg, hidden = make_init_message(
+            self.speculative_algorithm,
+            self.speculator_config,
+            req.uid,
+            req.table_idx,
+            req.cached_len,
+            self.token_pool[req.table_idx],
+            req_captor,
+            req.sampling_params,
+        )
+        self.client.init(msg, hidden)
         self.running_reqs[req.uid] = req
         self._state_table[req.table_idx] = VerifyState()
 
     def schedule_next_batch(self) -> Batch | None:
-        K = self.num_spec_tokens
-
         self.inflight_uids[0] = self.inflight_uids[1]
         self.inflight_uids[1] = set()
 
+        K = self.num_spec_tokens       
+        if (0 < len(self.inflight_uids[0]) * K < self.token_budget 
+            and len(self.running_reqs) > len(self.inflight_uids[0])):
+            # skip one iteration to try achieving a larger batch size
+            return None
+
+        
         scheduled_token = 0
         reqs = []
         step_reqs = []
@@ -106,7 +135,7 @@ class VerifyManager(ARManagerBase):
                 req.device_len = C + n_drafts + 1
                 toks, pos, hids = self._state_table[req.table_idx].get_carry()
                 step_reqs.append(
-                    DraftStepReq(
+                    SpeculatorStepReq(
                         uid=uid,
                         n_drafts=n_drafts,
                         append_positions=pos,
@@ -121,9 +150,14 @@ class VerifyManager(ARManagerBase):
             return None
 
         appended_hidden = torch.cat(hidden_rows, dim=0) if hidden_rows else None
-        has_sampling = any(sr.sampling for sr in step_reqs)
-
-        reply, probs = self.client.step(step_reqs, appended_hidden, has_sampling)
+        input_rows = sum(len(sr.append_positions) for sr in step_reqs)
+        output_rows = sum(sr.n_drafts for sr in step_reqs if sr.sampling)
+        step_msg = SpeculatorStepMsg(
+            reqs=step_reqs,
+            input_rows=input_rows,
+            output_rows=output_rows,
+        )
+        reply, probs = self.client.step(step_msg, appended_hidden)
 
         reply_by_uid = {r.uid: r for r in reply.reqs}
         probs_by_uid: dict[int, torch.Tensor] = {}
@@ -166,19 +200,20 @@ class VerifyManager(ARManagerBase):
         self,
         ctx          : Context,
         forward_input: ForwardInput,
-        output       : VerifyOutput
+        output       : ForwardOutput,
     ) -> tuple[list[DetokenizeMsg], list[Request]]:
         batch = forward_input.batch
         if not batch.is_verify:
             return super().process(ctx, forward_input, output)  # prefill commit
 
         extend_token = output.next_tokens_gpu  # (bs, K+1) int32
-        full_hidden = output.full_hidden       # (sum of num_sampled, hidden)
+        hidden_captor = batch.hidden_captor
+        assert hidden_captor is not None
         offset = 0
         committed: list[tuple[int, int, list[int], int]] = [tuple()] * len(batch.reqs)
 
         for i, (req, extend_token) in enumerate(zip(forward_input.batch.reqs, extend_token)):
-            num_sampled = req.extend_len  # = n_drafts + 1 (this req's rows in logits/full_hidden)
+            num_sampled = req.extend_len
             row_start = offset
             offset += num_sampled
             if req.uid not in self.running_reqs:
@@ -206,7 +241,9 @@ class VerifyManager(ARManagerBase):
             st.set_carry(
                 sampled_token,
                 list(range(C + 1, C + 1 + num_sampled)),
-                full_hidden[row_start: row_start + num_sampled],
+                hidden_captor.get_carry_hidden(
+                    slice(row_start, row_start + num_sampled)
+                ),
             )
             committed[i] = (C, num_sampled, sampled_token, n_drafts)
 

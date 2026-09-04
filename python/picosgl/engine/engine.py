@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import torch
 
-from picosgl.layers.attention_backend import create_attention_backend
-from picosgl.layers.moe_backend import create_moe_backend
+from picosgl.layers.attention_backend import make_attention_backend
+from picosgl.layers.linear_attention_backend import make_linear_attention_backend
+from picosgl.layers.moe_backend import make_moe_backend
 from picosgl.core import Batch, Context, Request, set_global_ctx
-from picosgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from picosgl.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_tp_info,
+)
 from picosgl.cache import (
-    create_kvcache_pool,
-    create_linear_state_pool,
+    make_kvcache_pool,
+    make_linear_state_pool,
     linear_state_slot_bytes_for_config,
 )
 from picosgl.layers import set_rope_device
-from picosgl.models import create_model, load_target_weight
+from picosgl.models import make_model, load_target_weight
 from picosgl.utils import (
     align_ceil, div_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 )
@@ -23,6 +28,9 @@ from picosgl.utils import (
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
+
+if TYPE_CHECKING:
+    import multiprocessing as mp
 
 logger = init_logger(__name__)
 
@@ -44,16 +52,16 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
-class VerifyOutput(NamedTuple):
-    next_tokens_gpu: torch.Tensor
-    next_tokens_cpu: torch.Tensor
-    copy_done_event: torch.cuda.Event
-    full_hidden    : torch.Tensor
-
 ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
+
 class Engine:
-    def __init__(self, config: EngineConfig):
+    def __init__(
+        self,
+        config                : EngineConfig,
+        speculator_start_event: mp.synchronize.Event | None = None,
+        speculator_ready_event: mp.synchronize.Event | None = None,
+    ):
         assert not torch.cuda.is_initialized()
         set_tp_info(config.tp_info)
         _adjust_config(config)
@@ -72,24 +80,38 @@ class Engine:
         init_free_memory = self._sync_get_memory()[0]  # min across ranks (tightest rank anchors budget)
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
+        if (
+            config.enable_specualtive_decoding
+            and not config.dt_separation
+            and config.tp_info.is_primary()
+        ):
+            assert speculator_start_event is not None
+            speculator_start_event.set()
+
         # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(config.model_config)
+            self.model = make_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        self.drafter = None
-        if (
-            self.config.enable_mtp
-            and not self.config.enable_dt_separation
-            and self.config.tp_info.is_primary()
-        ):
-            from picosgl.speculator import make_local_drafter  # lazy: speculator imports picosgl.engine
 
-            self.drafter = make_local_drafter(self.device, self.config)
+        if (
+            config.enable_specualtive_decoding
+            and not config.dt_separation
+            and config.tp_info.is_primary()
+        ):
+            assert speculator_ready_event is not None
+            speculator_ready_event.wait()
+
+        if config.speculator_config is not None:
+            self.speculator_reserve = config.speculator_config.make_reserve(
+                config.max_running_req
+            )
+        else:
+            self.speculator_reserve = None
 
         self.num_pages, num_tokens, self.num_draft_states = self._determine_num_pages(init_free_memory, config)
         # ======================= KV cache initialization ========================
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+        self.ctx.kv_cache = self.kv_cache = make_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
@@ -101,7 +123,7 @@ class Engine:
         self.num_states = 0
         if config.model_config.is_hybrid:
             self.num_states = self.num_pages
-            self.ctx.linear_state = self.linear_state = create_linear_state_pool(
+            self.ctx.linear_state = self.linear_state = make_linear_state_pool(
                 model_config=config.model_config,
                 num_slots=self.num_states + self.num_draft_states,
                 device=self.device,
@@ -121,7 +143,10 @@ class Engine:
         # ======================= Linear state table ========================
         if config.model_config.is_hybrid:
             page_cols = div_ceil(self.max_seq_len, config.page_size)
-            reserve_cols = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
+            reserve_cols = (
+                self.speculator_reserve.state_slots_per_request
+                if self.speculator_reserve is not None else 0
+            )
             self.ctx.state_table = self.state_table = torch.full(
                 (config.max_running_req + 1, page_cols + reserve_cols),
                 -1,
@@ -131,13 +156,28 @@ class Engine:
             self.ctx.draft_offset = self.draft_offset = (
                 page_cols if reserve_cols !=0 else None
             )
+            if reserve_cols != 0:
+                # Every table row permanently owns one K+1 verify reserve.  Slot ids
+                # evolve through commit-time swaps with page checkpoints, so this must
+                # be initialized once rather than rebuilt for each scheduled batch.
+                reserve = torch.arange(
+                    self.num_states,
+                    self.num_states + self.num_draft_states,
+                    dtype=torch.int32,
+                    device=self.device,
+                ).view(config.max_running_req, reserve_cols)
+                self.state_table[:config.max_running_req, page_cols:].copy_(reserve)
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+        self.ctx.attn_backend = self.attn_backend = make_attention_backend(
             config.attention_backend, config.model_config
         )
+        if config.model_config.is_hybrid:
+            self.ctx.linear_attn_backend = self.linear_attn_backend = (
+                make_linear_attention_backend(config.linear_attention_backend)
+            )
         if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+            self.ctx.moe_backend = self.moe_backend = make_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -154,17 +194,18 @@ class Engine:
             uid=-1,
             sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
+            max_device_len=2,
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
 
-        mtp_skip_graphs = getattr(config, "enable_mtp", False)
+        speculative_skip_graphs = config.enable_specualtive_decoding
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=[] if mtp_skip_graphs else config.cuda_graph_bs,
-            cuda_graph_max_bs=0 if mtp_skip_graphs else config.cuda_graph_max_bs,
+            cuda_graph_bs=[] if speculative_skip_graphs else config.cuda_graph_bs,
+            cuda_graph_max_bs=0 if speculative_skip_graphs else config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -204,7 +245,7 @@ class Engine:
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int, int | None]:
-        # min free across ranks: the non-DT in-process drafter lives only on rank0, so
+        # min free across ranks: the non-DT speculator worker shares rank0's device, so
         # its bytes must shrink the budget (max would ignore the tightest rank).
         new_free_memory = self._sync_get_memory()[0]
         cache_per_page = (
@@ -215,25 +256,27 @@ class Engine:
             * self.dtype.itemsize
             * config.model_config.num_attention_layers
         )
-        # For hybrid models every KV page also owns one linear-state slot, and each MTP
-        # request additionally owns a K+1 slot reserve. Both are inside the memory budget.
+        # For hybrid models every KV page also owns one linear-state slot. Target-side
+        # verify states are reserved according to the selected speculator configuration.
         cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
-        num_draft_per_req = config.speculative_num_draft_tokens + 1 if config.enable_mtp else 0
-        num_draft_states = min(
-            config.max_running_req,
-            config.decode_batch_budget // config.speculative_num_draft_tokens, # real concurrency
-        ) * num_draft_per_req if config.enable_mtp else 0
+        num_draft_states = (
+            self.speculator_reserve.num_state_slots
+            if self.speculator_reserve is not None else 0
+        )
         draft_bytes = num_draft_states * cache_per_state
 
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            available_memory = (
+                int(config.memory_ratio * old_free_memory)
+                - model_memory
+            )
             if config.model_config.is_hybrid:
                 min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
                 available_states = (available_memory - min_pages_bytes) // cache_per_state
                 assert num_draft_states <= available_states, (
-                    f"Not enough memory for {num_draft_states} MTP draft states: "
+                    f"Not enough memory for {num_draft_states} speculator states: "
                     f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum KV pages. "
                     f"Raise --memory-ratio / --max-running-req, or pin --num-pages."
                 )
@@ -289,6 +332,8 @@ class Engine:
         write_mapping = self._make_write_tuple(batch, self.device)
         batch.out_loc = self.page_table[input_mapping]
         self.attn_backend.prepare_metadata(batch)
+        if self.config.model_config.is_hybrid:
+            self.linear_attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.sampler.prepare(batch),
@@ -298,23 +343,30 @@ class Engine:
 
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs
-    ) -> ForwardOutput | VerifyOutput:
+    ) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.config.enable_specualtive_decoding and (
+            batch.is_prefill or batch.is_verify
+        ):
+            from picosgl.speculator.drafters import make_hidden_captor
+
+            algorithm = self.config.speculative_algorithm
+            speculator_config = self.config.speculator_config
+            assert algorithm is not None and speculator_config is not None
+            batch.hidden_captor = make_hidden_captor(algorithm, speculator_config)
+
         with self.ctx.forward_batch(batch):
-            if batch.is_verify or (self.config.enable_mtp and batch.is_prefill):
-                hidden, logits = self.model.forward_verify()
-                batch.full_hidden = hidden
-            elif self.graph_runner.can_use_cuda_graph(batch):
+            if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
 
         if batch.is_verify:
-            next_tokens_gpu = self.sampler.reject_sample(logits, batch, args).to(torch.int32)
+            next_tokens_gpu = self.sampler.reject_sample(logits, batch).to(torch.int32)
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
             copy_done_event = torch.cuda.Event()
             copy_done_event.record(self.stream)
-            return VerifyOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, hidden)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
         else: # prefill / decode
             next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
@@ -376,6 +428,14 @@ def _adjust_config(config: EngineConfig):
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
+    if config.linear_attention_backend == "auto":
+        backend = "fla" if config.model_config.is_hybrid else "native"
+        override("linear_attention_backend", backend)
+        if config.model_config.is_hybrid:
+            logger.info_rank0(
+                f"Auto-selected linear attention backend: {config.linear_attention_backend}"
+            )
+
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64, 128]:
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
@@ -398,39 +458,26 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")
 
-    if config.enable_mtp:
-        assert config.speculative_algorithm == "MTP", (
-            "only the MTP algorithm is implemented (got --speculative-algorithm "
-            f"{config.speculative_algorithm!r})"
+    if config.enable_specualtive_decoding:
+        speculator_config = config.speculator_config
+        assert speculator_config is not None, (
+            "speculator_config is required when speculative decoding is enabled"
         )
-        assert config.speculative_draft_model_path == config.model_path, (
-            "--speculative-draft-model-path must equal --model-path under MTP "
-            f"(got {config.speculative_draft_model_path!r} vs {config.model_path!r})."
+        assert speculator_config.algorithm == config.speculative_algorithm, (
+            f"Speculator config {type(speculator_config).__name__} belongs to "
+            f"{speculator_config.algorithm}, not {config.speculative_algorithm}."
         )
-        assert config.model_config.mtp_num_hidden_layers > 0, (
-            "MTP speculative decoding requires a model with an MTP head "
-            "(mtp_num_hidden_layers > 0)."
-        )
-        assert config.speculative_num_draft_tokens >= 1, (
-            "--speculative-num-draft-tokens must be >= 1"
-        )
-        assert config.decode_batch_budget >= config.speculative_num_draft_tokens, (
-            "--max-decode-tokens must be >= --speculative-num-draft-tokens, "
-            "or the draft-state region is empty"
-        )
-        if config.enable_dt_separation:
+        speculator_config.validate(config)
+        if config.dt_separation:
             import torch as _torch
 
             assert _torch.cuda.device_count() > config.tp_info.size, (
                 "--enable-dt-separation requires at least tp_size + 1 GPUs "
                 f"(tp_size={config.tp_info.size})."
             )
-    elif config.speculative_algorithm == "DFLASH":
-        raise NotImplementedError(
-            "DFLASH speculative decoding is not implemented yet; "
-            "only --speculative-algorithm MTP is supported."
-        )
-    elif config.enable_dt_separation:
+    elif config.speculator_config is not None:
+        raise ValueError("speculator_config requires --speculative-algorithm.")
+    elif config.dt_separation:
         raise ValueError(
             "--enable-dt-separation requires --speculative-algorithm."
         )

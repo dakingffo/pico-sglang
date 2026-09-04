@@ -1,6 +1,6 @@
-"""Qwen3.5-2B verification for the pico-sglang qwen3_5 implementation.
+"""Qwen3.5 verification using a Qwen3.5-2B checkpoint.
 
-Run with: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_qwen35_model.py
+Run with: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_qwen3_5_model.py
 
 Tests:
   1. Weight loading: model.state_dict() keys vs checkpoint keys (no missing/unexpected).
@@ -16,9 +16,9 @@ os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
 import torch
 
-# Overridable so the same script verifies any Qwen3.5 size (e.g. 0.8B / 4B):
-#   QWEN35_MODEL=/path/to/Qwen3.5-0.8B python tests/mtp/test_qwen35_model.py
-MODEL_PATH = os.environ.get("QWEN35_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
+# Qwen3.6 checkpoints use the same Hugging Face architecture implementation.
+#   QWEN3_5_MODEL=/path/to/model python tests/mtp/test_qwen3_5_model.py
+MODEL_PATH = os.environ.get("QWEN3_5_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
 
 sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
 
@@ -29,20 +29,20 @@ def setup():
     from picosgl.distributed import DistributedInfo, set_tp_info
 
     set_tp_info(DistributedInfo(rank=0, size=1))
-    from picosgl.models.config import ModelConfig
+    from picosgl.models import make_model_config
 
-    mcfg = ModelConfig.from_pretrained(load_model_config(MODEL_PATH))
+    mcfg = make_model_config(load_model_config(MODEL_PATH))
     return mcfg
 
 
-def load_model(mcfg, paged=True, loaded=None):
-    from picosgl.models.qwen3_5 import Qwen3_5ForCausalLM
+def load_model(mcfg, loaded=None):
+    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
     from picosgl.models.weight import load_target_weight
 
     if loaded is None:
         loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
-        model = Qwen3_5ForCausalLM(mcfg, paged=paged)
+        model = Qwen3NextForCausalLM(mcfg)
     # load_state_dict pops keys from the passed dict; pass a copy to keep `loaded` intact
     model.load_state_dict(dict(loaded))
     return model, loaded
@@ -63,7 +63,7 @@ def test1_weight_loading(mcfg, model, loaded):
     # spot-check shapes on representative target-model layers
     lt = "model.layers.0.linear_attn"
     at = "model.layers.3.self_attn"
-    for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkv.weight", f"{at}.q_proj.weight",
+    for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkv.weight", f"{at}.qkv_proj.weight",
               f"{at}.q_norm.weight", "model.norm.weight"):
         assert k in sd, f"missing {k}"
         print(f"  {k}: {tuple(sd[k].shape)} {sd[k].dtype}")
@@ -82,6 +82,7 @@ def make_req(table_idx, cached_len, device_len, output_len=4):
         uid=table_idx,
         sampling_params=None,  # type: ignore
         cache_handle=None,  # type: ignore
+        max_device_len=device_len + output_len,
     )
 
 
@@ -137,7 +138,7 @@ def test2_gated_delta_net_math(mcfg):
     print("Test 2: GatedDeltaNet prefill vs decode math (random weights)")
     from picosgl.core import Context, get_global_ctx, set_global_ctx
     from picosgl.cache import LinearStatePool
-    from picosgl.layers.qwen3_5 import Qwen3_5GatedDeltaNet
+    from picosgl.layers import GatedDeltaNet
 
     hidden = mcfg.hidden_size
     conv_dim = (
@@ -164,7 +165,16 @@ def test2_gated_delta_net_math(mcfg):
     set_global_ctx(ctx)
 
     torch.manual_seed(0)
-    layer = Qwen3_5GatedDeltaNet(mcfg, linear_layer_idx=0)
+    layer = GatedDeltaNet(
+        hidden_size=mcfg.hidden_size,
+        num_key_heads=mcfg.linear_num_key_heads,
+        num_value_heads=mcfg.linear_num_value_heads,
+        head_k_dim=mcfg.linear_key_head_dim,
+        head_v_dim=mcfg.linear_value_head_dim,
+        conv_kernel_size=mcfg.linear_conv_kernel_dim,
+        rms_norm_eps=mcfg.rms_norm_eps,
+        layer_idx=0,
+    )
     # random fp32 weights (nested params via _set_tree)
     for name, p in layer.state_dict().items():
         _set_tree(layer, name, torch.randn_like(p) * 0.02)
@@ -174,6 +184,7 @@ def test2_gated_delta_net_math(mcfg):
 
     def prefill_run(seq, req):
         batch = make_batch([req], "prefill", None, None)
+        ctx.linear_attn_backend.prepare_metadata(batch)
         with ctx.forward_batch(batch):
             return layer.forward(seq)
 
@@ -189,6 +200,7 @@ def test2_gated_delta_net_math(mcfg):
     for i in range(1, L):
         req = make_req(1, i, i + 1)
         batch = make_batch([req], "decode", None, None)
+        ctx.linear_attn_backend.prepare_metadata(batch)
         with ctx.forward_batch(batch):
             out_i = layer.forward(x[i : i + 1])
         err = (out_i - out_ref[i : i + 1]).abs().max().item()
@@ -214,13 +226,13 @@ def test3_full_model(mcfg, loaded=None):
     print("=" * 60)
     print("Test 3: full model prefill vs decode logits (paged flashinfer)")
     from picosgl.core import Context, get_global_ctx, set_global_ctx, Request
-    from picosgl.cache import create_kvcache_pool, LinearStatePool
-    from picosgl.layers.attention_backend import create_attention_backend
+    from picosgl.cache import make_kvcache_pool, LinearStatePool
+    from picosgl.layers.attention_backend import make_attention_backend
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    model, loaded = load_model(mcfg, paged=True, loaded=loaded)
+    model, loaded = load_model(mcfg, loaded=loaded)
     # move weights cpu->device in place (double-copy load_state_dict peaks at 2x model = OOM)
     to_device(model, device)
 
@@ -230,7 +242,7 @@ def test3_full_model(mcfg, loaded=None):
     )
     ctx = Context(page_size=64)
     num_pages = 4096
-    ctx.kv_cache = create_kvcache_pool(
+    ctx.kv_cache = make_kvcache_pool(
         model_config=mcfg, num_pages=num_pages, page_size=1,
         dtype=torch.bfloat16, device=device,
     )
@@ -256,7 +268,7 @@ def test3_full_model(mcfg, loaded=None):
     ctx.page_table[:, : num_pages] = base  # req r token i -> page r*num_pages + i
     set_global_ctx(ctx)  # backend reads ctx.kv_cache via get_global_ctx()
     ctx._debug_attn = True
-    ctx.attn_backend = create_attention_backend("fi", mcfg)
+    ctx.attn_backend = make_attention_backend("fi", mcfg)
 
     tokenizer = __import__("transformers").AutoTokenizer.from_pretrained(MODEL_PATH)
     tokens = tokenizer("The quick brown fox jumps over the lazy dog and the", return_tensors="pt")
@@ -276,6 +288,7 @@ def test3_full_model(mcfg, loaded=None):
             input_ids=id_t[:n_tokens].cpu(), table_idx=table_idx, cached_len=cached_len,
             output_len=64, uid=uid, sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
+            max_device_len=n_tokens + 64,
         )
 
     # reference per-position logits via fresh prefill 0..i

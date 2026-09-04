@@ -16,6 +16,11 @@ zipped (a length-1 list broadcasts), so the common sweeps are:
   python benchmarks/latency/bench_latency.py --model-path <model> \
       --input-lens 32 --output-lens 16,64,256
 
+  # Natural prompts from Spec-Bench (the first turn of multi-turn records)
+  python benchmarks/latency/bench_latency.py --model-path <model> \
+      --dataset spec_bench --dataset-category coding,math_reasoning \
+      --num-prompts 8 --output-lens 64
+
 Server flags are parsed by the library's ``picosgl.server.args.parse_args`` --
 nothing is redefined here.
 """
@@ -33,6 +38,8 @@ from bench_common import (
     print_stats,
     resolve_port,
     run_online_bench,
+    save_json,
+    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -81,15 +88,31 @@ def main() -> int:
     )
     concs = parse_int_list(bench.num_prompts, 8)
     port = resolve_port(server_argv, server_args)
-    proc = launch_server(server_argv, port=port, enable_mtp=False, num_spec_tokens=0)
+    proc = launch_server(
+        server_argv, port=port,
+        enable_specualtive_decoding=False, num_spec_tokens=0,
+    )
     try:
         base = wait_server_ready(port)
         rows: list[tuple[int, int, int, dict]] = []
+        results: dict[str, dict] = {}
+        point_idx = 0
         for c in concs:
-            for i, (in_len, out_len) in enumerate(configs):
-                # fresh seed per config so the prefix cache can't serve later configs
+            for in_len, out_len in configs:
+                warmup = not bench.no_warmup
                 prompts, in_lens = make_prompts(
-                    server_args.model_path, in_len, c, bench.seed + i
+                    server_args.model_path,
+                    in_len,
+                    c + int(warmup),
+                    bench.seed + point_idx,
+                    dataset=bench.dataset,
+                    dataset_categories=bench.dataset_category,
+                )
+                warmup_prompt, prompts, in_lens = split_warmup_prompt(
+                    prompts, in_lens, warmup
+                )
+                display_in_len = (
+                    round(sum(in_lens) / len(in_lens)) if bench.dataset else in_len
                 )
                 out_lens = [out_len] * c
                 stats = asyncio.run(
@@ -100,17 +123,20 @@ def main() -> int:
                         in_lens,
                         out_lens,
                         mtp=False,
-                        warmup=not bench.no_warmup,
+                        warmup_prompt=warmup_prompt,
                         pbar=not bench.no_pbar,
                     )
                 )
                 assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
                 print_stats(
                     f"bench_latency tp={server_args.tp_info.size} "
-                    f"in={in_len} out={out_len} conc={c}",
+                    f"in={display_in_len} out={out_len} conc={c}",
                     stats,
                 )
-                rows.append((c, in_len, out_len, stats))
+                rows.append((c, display_in_len, out_len, stats))
+                results[f"{c}:{display_in_len}:{out_len}"] = stats
+                save_json(bench.out, results)
+                point_idx += 1
         print_latency_summary(rows)
         return 0
     finally:

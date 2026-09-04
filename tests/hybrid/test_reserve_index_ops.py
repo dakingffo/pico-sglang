@@ -42,6 +42,7 @@ def make_req(table_idx, cached_len):
         input_ids=torch.arange(200, dtype=torch.int32),
         table_idx=table_idx, cached_len=cached_len, output_len=10, uid=table_idx,
         sampling_params=SamplingParams(), cache_handle=None,
+        max_device_len=210,
     )
 
 
@@ -142,8 +143,50 @@ def test_cross_boundary_last():
     print("[4c] commit boundary-last pin+baseline OK")
 
 
+def test_stable_reserve_across_overlapping_batches():
+    """Different in-flight cohorts keep disjoint table-owned reserve rows."""
+    setup_ctx()
+    page_cols, reserve_width, max_running_req = 8, 5, 4
+    num_states = 100
+    st = torch.full(
+        (max_running_req + 1, page_cols + reserve_width), -1, dtype=torch.int32
+    )
+    st[:max_running_req, page_cols:] = torch.arange(
+        num_states, num_states + max_running_req * reserve_width, dtype=torch.int32
+    ).view(max_running_req, reserve_width)
+    for uid in range(max_running_req):
+        st[uid, 0] = uid
+
+    pool = LinearStatePool(
+        num_slots=num_states + max_running_req * reserve_width,
+        num_linear_layers=1, conv_dim=8, kernel_size=4,
+        num_v_heads=4, head_k_dim=4, head_v_dim=4,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    cm = CacheManager(
+        num_pages=10, page_size=64,
+        page_table=torch.zeros((max_running_req + 1, 512), dtype=torch.int32),
+        type="hybrid_radix", num_states=num_states,
+        num_draft_states=max_running_req * reserve_width,
+        state_table=st, state_pool=pool, draft_offset=page_cols,
+    )
+    original = st[:, page_cols:].clone()
+    cohort_a = [make_req(0, 32), make_req(2, 32)]
+    cohort_b = [make_req(1, 32), make_req(3, 32)]
+    for req in cohort_a + cohort_b:
+        req.device_len = req.cached_len + reserve_width
+
+    cm.allocate_draft_state(cohort_a)
+    cm.allocate_draft_state(cohort_b)
+    assert torch.equal(st[:, page_cols:], original)
+    assert all(req.baseline_slot == req.table_idx for req in cohort_a + cohort_b)
+    assert len(torch.unique(st[:max_running_req, page_cols:])) == max_running_req * reserve_width
+    print("[4d] stable overlapping-batch reserve OK")
+
+
 if __name__ == "__main__":
     test_no_cross_swap()
     test_cross_pin_refill_swap()
     test_cross_boundary_last()
+    test_stable_reserve_across_overlapping_batches()
     print("\nALL RESERVE INDEX OP TESTS PASSED")

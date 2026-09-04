@@ -4,23 +4,23 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from picosgl.utils import torch_dtype
 from picosgl.engine import Sampler
+from picosgl.models.drafters import BaseDrafterModel, Qwen3_5MTPDrafter
 
 from ...base import EngineBase
+from ..attention import DraftAttentionBackend
+from ..pool import DraftKVPool
+from .config import MTPSpeculatorConfig
 from .state import MTPState
 
 if TYPE_CHECKING:
-    from picosgl.models.drafters import Qwen3_5MTPDrafter
+    from picosgl.engine.config import EngineConfig
+    from picosgl.scheduler.config import SchedulerConfig
 
 
 class MTPEngine(EngineBase):
-    """Eager batched MTP draft engine.
-
-    Carry windows are left-padded and recomputed together at depth zero. Later draft depths
-    reuse that round's dense batched KV. ``draft_sequential`` retains the original per-request
-    implementation as a numerical oracle. Sampling uses each request's own parameters and
-    the same target distribution consumed by rejection sampling.
-    """
+    """Batched MTP engine with persistent canonical KV and round-local scratch KV."""
 
     def __init__(
         self,
@@ -28,6 +28,10 @@ class MTPEngine(EngineBase):
         device           : torch.device,
         vocab_size       : int,
         num_spec_tokens  : int,
+        max_running_req  : int,
+        window_size      : int,
+        max_batch_size   : int,
+        attention_backend: str,
     ) -> None:
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
@@ -36,23 +40,69 @@ class MTPEngine(EngineBase):
         self.drafter = drafter
         self.sampler = Sampler(device, vocab_size)
 
+        attention = self.drafter.layers.op_list[0].self_attn
+        self.pool = DraftKVPool(
+            max_running_req=max_running_req,
+            window_size=window_size,
+            max_batch_size=max_batch_size,
+            num_spec_tokens=num_spec_tokens,
+            num_kv_heads=attention.num_kv_heads,
+            head_dim=attention.head_dim,
+            dtype=attention.qkv_proj.weight.dtype,
+            device=device,
+        )
+        self.attention_backend = DraftAttentionBackend(
+            backend_name=attention_backend,
+            num_qo_heads=attention.num_qo_heads,
+            num_kv_heads=attention.num_kv_heads,
+            head_dim=attention.head_dim,
+            dtype=attention.qkv_proj.weight.dtype,
+            device=device,
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        device: torch.device,
+        config: SchedulerConfig,
+    ) -> MTPEngine:
+        drafter = cls.load_drafter(device, config)
+        speculator_config = config.speculator_config
+        assert isinstance(speculator_config, MTPSpeculatorConfig)
+        K = speculator_config.num_draft_tokens
+        return cls(
+            drafter,
+            device,
+            config.model_config.vocab_size,
+            K,
+            config.max_running_req,
+            speculator_config.window_size,
+            min(config.max_running_req, config.decode_batch_budget // K),
+            config.attention_backend,
+        )
+
+    @staticmethod
+    def load_drafter(
+        device: torch.device, config: EngineConfig
+    ) -> Qwen3_5MTPDrafter:
+        from picosgl.layers import set_rope_device
+        from picosgl.models.qwen3_next import Qwen3_5Config
+
+        mc = config.model_config
+        assert isinstance(mc, Qwen3_5Config)
+        set_rope_device(device)
+        with torch.device("meta"), torch_dtype(config.dtype):
+            drafter = Qwen3_5MTPDrafter(mc)
+        model_path = config.speculative_draft_model_path
+        assert model_path is not None
+        drafter.load_weights(model_path, device)
+        return drafter
+
     def draft(self, states: list[MTPState]) -> None:
-        self._draft_batch(states)
-
-    def draft_sequential(self, states: list[MTPState]) -> None:
-        """Correctness oracle for tests and numerical debugging."""
-        for st in states:
-            self._draft_request(st)
-
-    def _draft_batch(self, states: list[MTPState]) -> None:
-        """Draft all requests depth-by-depth with a dense, left-padded carry window."""
         K = self.num_spec_tokens
         for st in states:
             assert 0 <= st.n_drafts <= K
             st.draft_tokens = []
-            # The batched path recomputes the bounded carry window each round. Drop a
-            # sequential-oracle cache if callers switch paths while debugging.
-            st.mtp_kv = None
             st.draft_probs = (
                 torch.zeros(K, self.vocab_size, dtype=torch.float32, device=self.device)
                 if not st.sampling_params.is_greedy else None
@@ -63,71 +113,107 @@ class MTPEngine(EngineBase):
             return
 
         batch_size = len(active_states)
-        max_window = max(len(st.window_tokens) for st in active_states)
-        assert max_window > 0
-        hidden_size = active_states[0].window_hidden.shape[-1]
-        input_ids = torch.zeros(
-            batch_size, max_window, dtype=torch.int32, device=self.device
+        assert batch_size <= self.pool.max_batch_size, (
+            f"MTP draft batch {batch_size} exceeds scratch capacity "
+            f"{self.pool.max_batch_size}"
         )
-        positions = torch.zeros(
-            batch_size, max_window, dtype=torch.int64, device=self.device
-        )
-        hidden = torch.zeros(
-            batch_size,
-            max_window,
-            hidden_size,
-            dtype=active_states[0].window_hidden.dtype,
+        table_indices = [st.table_idx for st in active_states]
+        assert len(set(table_indices)) == batch_size
+        batch_rows = torch.arange(batch_size, dtype=torch.int64, device=self.device)
+
+        pending_counts = []
+        for st in active_states:
+            if not st.cache_initialized:
+                self.pool.reset(st.table_idx)
+                st.cache_initialized = True
+            count = len(st.pending_tokens)
+            assert count > 0, "every MTP round must carry at least one Target-hidden row"
+            assert count == len(st.pending_positions) == st.pending_hidden.shape[0]
+            pending_counts.append(count)
+
+        input_ids = torch.tensor(
+            [token for st in active_states for token in st.pending_tokens],
+            dtype=torch.int32,
             device=self.device,
         )
-        valid = torch.zeros(
-            batch_size, max_window, dtype=torch.bool, device=self.device
+        positions = torch.tensor(
+            [position for st in active_states for position in st.pending_positions],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        hidden = torch.cat([st.pending_hidden for st in active_states], dim=0)
+        residual, query, gate, key, value = self.drafter.prepare_cache_rows(
+            input_ids, positions, hidden
         )
 
-        for i, st in enumerate(active_states):
-            length = len(st.window_tokens)
-            assert length == len(st.window_positions) == st.window_hidden.shape[0]
-            start = max_window - length
-            input_ids[i, start:] = torch.as_tensor(
-                st.window_tokens, dtype=torch.int32, device=self.device
-            )
-            positions[i, start:] = torch.as_tensor(
-                st.window_positions, dtype=torch.int64, device=self.device
-            )
-            hidden[i, start:] = st.window_hidden
-            valid[i, start:] = True
+        slots = self.pool.append_persistent_batch(table_indices, pending_counts)
+        self.pool.store(slots, key, value)
 
-        logits, mtp_hidden, kv, kv_valid = self.drafter.draft_batch(
-            input_ids, positions, hidden, valid
+        last_rows = []
+        offset = 0
+        for st, count in zip(active_states, pending_counts):
+            last_rows.append(offset + count - 1)
+            offset += count
+            st.clear_pending()
+
+        last_rows = torch.tensor(last_rows, dtype=torch.int64, device=self.device)
+        cache_indices, cache_valid = self.pool.batch_indices(
+            table_indices, batch_rows, scratch_depth=0
+        )
+        attention_output = self.attention_backend.forward(
+            query.index_select(0, last_rows),
+            self.pool,
+            cache_indices,
+            cache_valid,
+            self.pool.cache_lengths(table_indices),
+        )
+        logits, mtp_hidden = self.drafter.finish_cache_rows(
+            residual.index_select(0, last_rows),
+            gate.index_select(0, last_rows),
+            attention_output,
         )
         next_tokens = self._sample_batch(logits, active_states, 0)
         token_matrix = torch.full(
             (batch_size, K), -1, dtype=torch.int32, device=self.device
         )
         token_matrix[:, 0] = next_tokens
-        mtp_hidden = mtp_hidden[:, -1:, :]
 
-        n_drafts = torch.tensor(
-            [st.n_drafts for st in active_states], dtype=torch.int64, device=self.device
-        )
         first_positions = torch.tensor(
             [st.window_positions[-1] for st in active_states],
             dtype=torch.int64,
             device=self.device,
         )
         for j in range(1, max(st.n_drafts for st in active_states)):
-            step_valid = n_drafts > j
-            step_ids = torch.where(step_valid, next_tokens, torch.zeros_like(next_tokens))[:, None]
-            step_positions = (first_positions + j)[:, None]
-            logits, mtp_hidden, kv, kv_valid = self.drafter.draft_batch(
-                step_ids,
-                step_positions,
-                mtp_hidden,
-                step_valid[:, None],
-                kv,
-                kv_valid,
+            active_indices = [i for i, st in enumerate(active_states) if st.n_drafts > j]
+            active_rows = torch.tensor(active_indices, dtype=torch.int64, device=self.device)
+            step_states = [active_states[i] for i in active_indices]
+            step_batch_rows = batch_rows.index_select(0, active_rows)
+            step_ids = token_matrix[active_rows, j - 1]
+            step_positions = first_positions.index_select(0, active_rows) + j
+            step_hidden = mtp_hidden.index_select(0, active_rows)
+
+            residual, query, gate, key, value = self.drafter.prepare_cache_rows(
+                step_ids, step_positions, step_hidden
             )
-            next_tokens = self._sample_batch(logits, active_states, j)
-            token_matrix[:, j] = torch.where(step_valid, next_tokens, token_matrix[:, j])
+            slots = self.pool.scratch_slots(step_batch_rows, j - 1)
+            self.pool.store(slots, key, value)
+            step_table_indices = [st.table_idx for st in step_states]
+            cache_indices, cache_valid = self.pool.batch_indices(
+                step_table_indices, step_batch_rows, scratch_depth=j
+            )
+            attention_output = self.attention_backend.forward(
+                query,
+                self.pool,
+                cache_indices,
+                cache_valid,
+                self.pool.cache_lengths(step_table_indices, scratch_depth=j),
+            )
+            logits, step_hidden = self.drafter.finish_cache_rows(
+                residual, gate, attention_output
+            )
+            next_tokens = self._sample_batch(logits, step_states, j)
+            token_matrix[active_rows, j] = next_tokens
+            mtp_hidden[active_rows] = step_hidden
 
         token_rows = token_matrix.tolist()  # one synchronization for the whole draft batch
         for st, row in zip(active_states, token_rows):
@@ -139,53 +225,26 @@ class MTPEngine(EngineBase):
         states: list[MTPState],
         step: int,
     ) -> torch.Tensor:
-        """Vectorize greedy rows; preserve each sampling request's exact distribution."""
+        """Sample active rows and retain the exact distribution used for each draft."""
         tokens = logits.argmax(dim=-1).to(torch.int32)
-        for i, st in enumerate(states):
-            if step >= st.n_drafts or st.sampling_params.is_greedy:
-                continue
-            dist = self.sampler._target_dist(logits[i], st.sampling_params)
+        sampling_rows = [
+            i for i, st in enumerate(states)
+            if step < st.n_drafts and not st.sampling_params.is_greedy
+        ]
+        if not sampling_rows:
+            return tokens
+
+        rows = torch.tensor(sampling_rows, dtype=torch.int64, device=self.device)
+        params = [states[i].sampling_params for i in sampling_rows]
+        args = self.sampler.prepare_params(params)
+        probs = self.sampler.probabilities(logits.index_select(0, rows), args)
+
+        import flashinfer.sampling as sampling
+
+        sampled = sampling.sampling_from_probs(probs).to(torch.int32)
+        tokens.index_copy_(0, rows, sampled)
+        for prob, i in zip(probs, sampling_rows):
+            st = states[i]
             assert st.draft_probs is not None
-            st.draft_probs[step] = dist
-            tokens[i] = torch.multinomial(dist, 1)[0].to(torch.int32)
+            st.draft_probs[step].copy_(prob)
         return tokens
-
-    def _draft_request(self, st: MTPState) -> None:
-        K = self.num_spec_tokens
-        n_drafts = st.n_drafts
-        sampling = not st.sampling_params.is_greedy
-        st.draft_tokens = []
-        st.draft_probs = (
-            torch.zeros(K, self.vocab_size, dtype=torch.float32, device=self.device)
-            if sampling else None
-        )
-        if n_drafts == 0:
-            return
-
-        params = st.sampling_params
-        start = 0 if st.mtp_kv is None else st.mtp_kv[0].shape[1]  # carried KV rows
-
-        window_tok = torch.tensor(st.window_tokens[start:], dtype=torch.int32, device=self.device)
-        window_pos = torch.tensor(
-            st.window_positions[start:], dtype=torch.int64, device=self.device
-        )
-        _, logits, h, st.mtp_kv = self.drafter.draft(
-            window_tok, window_pos, st.window_hidden[start:], st.mtp_kv
-        )
-        st.draft_tokens.append(self.sampler.draft_token(logits[-1], params))
-        if sampling:
-            st.draft_probs[0] = self.sampler._target_dist(logits[-1], params)
-        mtp_hidden = h[-1]
-        mtp_kv = st.mtp_kv
-
-        first_pos = st.window_positions[-1]
-        for j in range(1, n_drafts):
-            draft_tok = torch.tensor([st.draft_tokens[-1]], dtype=torch.int32, device=self.device)
-            draft_pos = torch.tensor([first_pos + j], dtype=torch.int64, device=self.device)
-            _, logits, h, mtp_kv = self.drafter.draft(
-                draft_tok, draft_pos, mtp_hidden.unsqueeze(0), mtp_kv
-            )
-            st.draft_tokens.append(self.sampler.draft_token(logits[-1], params))
-            if sampling:
-                st.draft_probs[j] = self.sampler._target_dist(logits[-1], params)
-            mtp_hidden = h[-1]

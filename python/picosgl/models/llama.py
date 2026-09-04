@@ -1,24 +1,63 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from dataclasses import dataclass
+from typing import Tuple
 
 import torch
+from transformers import PretrainedConfig
 from picosgl.core import get_global_ctx
-from picosgl.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
+from picosgl.layers import (
+    BaseOP,
+    GatedMLP as LlamaMLP,
+    OPList,
+    ParallelLMHead,
+    RMSNormFused,
+    RotaryAttention,
+    VocabParallelEmbedding,
+)
+from picosgl.speculator.hidden_captor import HiddenCapturePoint, with_speculator
 from picosgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
-from .utils import GatedMLP as LlamaMLP
-from .utils import RopeAttn as LlamaAttn
+from .config import ModelConfig, make_common_config_kwargs, unwrap_text_config
 
-if TYPE_CHECKING:
-    from .config import ModelConfig
+
+@dataclass(frozen=True)
+class LlamaConfig(ModelConfig):
+    intermediate_size: int
+    hidden_act       : str
+
+    @classmethod
+    def from_pretrained(cls, config: PretrainedConfig) -> LlamaConfig:
+        top, text = unwrap_text_config(config)
+        return cls(
+            **make_common_config_kwargs(top, text),
+            intermediate_size=text.intermediate_size,
+            hidden_act=text.hidden_act,
+        )
 
 
 class LlamaDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = LlamaAttn(config, layer_id)
-        self.mlp = LlamaMLP(config)
+    def __init__(self, config: LlamaConfig, layer_id: int):
+        rotary_config = config.rotary_config
+        self.self_attn = RotaryAttention(
+            hidden_size=config.hidden_size,
+            head_dim=config.head_dim,
+            num_qo_heads=config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            layer_id=layer_id,
+            rotary_dim=rotary_config.rotary_dim,
+            max_position=rotary_config.max_position,
+            rope_base=rotary_config.base,
+            rope_scaling=(
+                tuple(rotary_config.scaling.items()) if rotary_config.scaling else None
+            ),
+        )
+        self.mlp = LlamaMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+        )
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -31,6 +70,10 @@ class LlamaDecoderLayer(BaseOP):
         self._layer_id = layer_id
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    @with_speculator(
+        HiddenCapturePoint.DECODER_INPUT,
+        layer_id_field="_layer_id",
+    )
     def forward(
         self,
         x: torch.Tensor,
@@ -44,7 +87,7 @@ class LlamaDecoderLayer(BaseOP):
 
 
 class LlamaModel(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: LlamaConfig):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -66,7 +109,7 @@ class LlamaModel(BaseOP):
 
 
 class LlamaForCausalLM(BaseLLMModel):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: LlamaConfig):
         self.model = LlamaModel(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -74,7 +117,6 @@ class LlamaForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
-        super().__init__()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
@@ -82,4 +124,4 @@ class LlamaForCausalLM(BaseLLMModel):
         return logits
 
 
-__all__ = ["LlamaForCausalLM"]
+__all__ = ["LlamaConfig", "LlamaForCausalLM"]

@@ -33,10 +33,29 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         EngineConfig instance with parsed arguments
     """
     from picosgl.layers.attention_backend import validate_attn_backend
+    from picosgl.layers.linear_attention_backend import SUPPORTED_LINEAR_ATTENTION_BACKENDS
     from picosgl.cache import SUPPORTED_CACHE_MANAGER
     from picosgl.layers.moe_backend import SUPPORTED_MOE_BACKENDS
+    from picosgl.speculator.drafters import (
+        SUPPORTED_SPECULATOR_ARGUMENT_PARSERS,
+        make_speculator_argument_parser,
+    )
 
-    parser = argparse.ArgumentParser(description="picosgl Server Arguments")
+    algorithm_parser = argparse.ArgumentParser(add_help=False)
+    algorithm_parser.add_argument(
+        "--speculative-algorithm",
+        choices=SUPPORTED_SPECULATOR_ARGUMENT_PARSERS.supported_names(),
+        default=None,
+    )
+    known_args, _ = algorithm_parser.parse_known_args(args)
+    speculator_parser = (
+        make_speculator_argument_parser(known_args.speculative_algorithm)
+        if known_args.speculative_algorithm is not None else None
+    )
+    parser = argparse.ArgumentParser(
+        description="picosgl Server Arguments",
+        parents=[speculator_parser.parser] if speculator_parser is not None else [],
+    )
 
     parser.add_argument(
         "--model-path",
@@ -139,8 +158,8 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         default=None,
         help=(
             "Max total tokens (positions) in a single decode/verify batch. "
-            "Default: max_running_req // 2, scaled by --speculative-num-draft-tokens when "
-            "--speculative-algorithm is set (each verify req occupies K+1 positions)."
+            "Default: max_running_req // 2, scaled by the selected speculator's "
+            "number of draft tokens."
         ),
     )
 
@@ -166,6 +185,13 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         default=ServerArgs.attention_backend,
         help="The attention backend to use. If two backends are specified,"
         " the first one is used for prefill and the second one for decode.",
+    )
+
+    parser.add_argument(
+        "--linear-attention-backend",
+        default=ServerArgs.linear_attention_backend,
+        choices=["auto"] + SUPPORTED_LINEAR_ATTENTION_BACKENDS.supported_names(),
+        help="The linear attention backend used by hybrid models.",
     )
 
     parser.add_argument(
@@ -202,8 +228,8 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         type=str,
         dest="speculative_algorithm",
         default=None,
-        choices=["MTP", "DFLASH"],
-        help="The speculative decoding algorithm. Only MTP is implemented; DFLASH is reserved.",
+        choices=SUPPORTED_SPECULATOR_ARGUMENT_PARSERS.supported_names(),
+        help="The speculative decoding algorithm.",
     )
 
     parser.add_argument(
@@ -211,21 +237,13 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         type=str,
         dest="speculative_draft_model_path",
         default=ServerArgs.speculative_draft_model_path,
-        help="Path of the drafter weights. Under MTP this must equal --model-path.",
-    )
-
-    parser.add_argument(
-        "--speculative-num-draft-tokens",
-        type=int,
-        dest="speculative_num_draft_tokens",
-        default=ServerArgs.speculative_num_draft_tokens,
-        help="Number of speculative draft tokens (K) per verify round.",
+        help="Path of the drafter weights.",
     )
 
     parser.add_argument(
         "--enable-dt-separation",
         action="store_true",
-        dest="enable_dt_separation",
+        dest="dt_separation",
         help="Run the drafter on a separate device (requires tp_size + 1 GPUs).",
     )
 
@@ -241,12 +259,16 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
+    if speculator_parser is not None:
+        kwargs["speculator_config"] = speculator_parser.make_config(kwargs)
+
     # resolve the auto --max-decode-tokens default (token budget, not a req count)
     if kwargs["max_decode_tokens"] is None:
         base = max(1, kwargs["max_running_req"] // 2)
+        speculator_config = kwargs.get("speculator_config")
         kwargs["max_decode_tokens"] = (
-            base * kwargs["speculative_num_draft_tokens"]
-            if kwargs["speculative_algorithm"] is not None else base
+            base * speculator_config.num_draft_tokens
+            if speculator_config is not None else base
         )
 
     from picosgl.utils import resolve_model_path
@@ -273,7 +295,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         from picosgl.utils import load_model_config
 
         # `dtype` is the transformers alias of `torch_dtype`. The raw-config fallback
-        # (unregistered architectures like Qwen3.5) mirrors only fields present in
+        # (unregistered architectures like Qwen3Next) mirrors only fields present in
         # config.json, where torch_dtype may be null -> default to bf16.
         pretrained_config = load_model_config(kwargs["model_path"])
         dtype_str = (
