@@ -372,7 +372,9 @@ def run():
     gdn_full = make_gated_delta_net()
     _load_from(gdn_full, full_sd, "model.layers.0.linear_attn.")
     ctx = setup_ctx(conv_dim_full, config.linear_num_value_heads)
-    with ctx.forward_batch(make_batch(req)):
+    batch = make_batch(req)
+    ctx.linear_attn_backend.prepare_metadata(batch)
+    with ctx.forward_batch(batch):
         gdn_out_full = gdn_full.forward(xg).detach()
     clear_global_ctx()
 
@@ -384,7 +386,9 @@ def run():
         ctx = setup_ctx(conv_dim_local, config.linear_num_value_heads // n)
         recs = []
         DistributedCommunicator.impl = RecordingImpl(recs, n)
-        with ctx.forward_batch(make_batch(req)):
+        batch = make_batch(req)
+        ctx.linear_attn_backend.prepare_metadata(batch)
+        with ctx.forward_batch(batch):
             gdn_parts.append(gdn.forward(xg).detach())
         clear_global_ctx()
         assert len(recs) == 1

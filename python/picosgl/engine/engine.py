@@ -332,6 +332,8 @@ class Engine:
         write_mapping = self._make_write_tuple(batch, self.device)
         batch.out_loc = self.page_table[input_mapping]
         self.attn_backend.prepare_metadata(batch)
+        if self.config.model_config.is_hybrid:
+            self.linear_attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.sampler.prepare(batch),

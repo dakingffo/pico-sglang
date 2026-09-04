@@ -184,6 +184,7 @@ def test2_gated_delta_net_math(mcfg):
 
     def prefill_run(seq, req):
         batch = make_batch([req], "prefill", None, None)
+        ctx.linear_attn_backend.prepare_metadata(batch)
         with ctx.forward_batch(batch):
             return layer.forward(seq)
 
@@ -199,6 +200,7 @@ def test2_gated_delta_net_math(mcfg):
     for i in range(1, L):
         req = make_req(1, i, i + 1)
         batch = make_batch([req], "decode", None, None)
+        ctx.linear_attn_backend.prepare_metadata(batch)
         with ctx.forward_batch(batch):
             out_i = layer.forward(x[i : i + 1])
         err = (out_i - out_ref[i : i + 1]).abs().max().item()

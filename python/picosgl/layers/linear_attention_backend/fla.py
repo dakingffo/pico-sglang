@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 
-from .base import GatedDeltaInput
 from .native import NativeLinearAttentionBackend
 
 
@@ -16,19 +15,26 @@ class FlashLinearAttentionBackend(NativeLinearAttentionBackend):
         self._chunk = chunk_gated_delta_rule
         self._recurrent = fused_recurrent_gated_delta_rule
 
-    def prefill(
+    def _prefill(
         self,
-        inputs: GatedDeltaInput,
+        query        : torch.Tensor,
+        key          : torch.Tensor,
+        value        : torch.Tensor,
+        gate         : torch.Tensor,
+        beta         : torch.Tensor,
+        A_log        : torch.Tensor,
+        dt_bias      : torch.Tensor,
+        initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         output, final_state = self._chunk(
-            q=inputs.query,
-            k=inputs.key,
-            v=inputs.value,
-            g=inputs.gate,
-            beta=inputs.beta,
-            A_log=inputs.A_log,
-            dt_bias=inputs.dt_bias,
-            initial_state=inputs.initial_state,
+            q=query,
+            k=key,
+            v=value,
+            g=gate,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
@@ -38,19 +44,26 @@ class FlashLinearAttentionBackend(NativeLinearAttentionBackend):
         assert final_state is not None
         return output, final_state
 
-    def decode(
+    def _decode(
         self,
-        inputs: GatedDeltaInput,
+        query        : torch.Tensor,
+        key          : torch.Tensor,
+        value        : torch.Tensor,
+        gate         : torch.Tensor,
+        beta         : torch.Tensor,
+        A_log        : torch.Tensor,
+        dt_bias      : torch.Tensor,
+        initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         output, final_state = self._recurrent(
-            q=inputs.query,
-            k=inputs.key,
-            v=inputs.value,
-            g=inputs.gate,
-            beta=inputs.beta,
-            A_log=inputs.A_log,
-            dt_bias=inputs.dt_bias,
-            initial_state=inputs.initial_state,
+            q=query,
+            k=key,
+            v=value,
+            g=gate,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,

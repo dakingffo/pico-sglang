@@ -6,7 +6,7 @@ from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_c
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
 from picosgl.layers import GatedDeltaNet
-from picosgl.layers.linear_attention_backend.reference import _l2norm
+from picosgl.layers.linear_attention_backend.native import _l2norm
 from picosgl.models.config import RotaryConfig
 from picosgl.models.qwen3_next import Qwen3_5Config
 from picosgl.utils import torch_dtype
@@ -202,6 +202,7 @@ def test_variable_length_layer_batch_matches_per_request():
     ctx.draft_offset = reserve_offset
     set_global_ctx(ctx)
     try:
+        ctx.linear_attn_backend.prepare_metadata(batch)
         with ctx.forward_batch(batch):
             output = layer.forward(x)
     finally:
@@ -217,6 +218,7 @@ def test_variable_length_layer_batch_matches_per_request():
         offset = 0
         for req, seq_len in zip(reqs, lengths):
             one_batch = Batch(reqs=[req], phase="verify")
+            reference_ctx.linear_attn_backend.prepare_metadata(one_batch)
             with reference_ctx.forward_batch(one_batch):
                 reference_output[offset : offset + seq_len] = layer.forward(
                     x[offset : offset + seq_len]

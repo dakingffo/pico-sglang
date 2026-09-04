@@ -2,53 +2,24 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn.functional as F
 
-from picosgl.core import Request, get_global_ctx
+from picosgl.core import get_global_ctx
 
-
-@dataclass(frozen=True)
-class GatedDeltaConfig:
-    num_k_heads: int
-    num_v_heads: int
-    head_k_dim : int
-    head_v_dim : int
-    conv_dim   : int
-    state_len  : int
-    layer_idx  : int
-
-    @property
-    def key_dim(self) -> int:
-        return self.num_k_heads * self.head_k_dim
-
-    @property
-    def value_dim(self) -> int:
-        return self.num_v_heads * self.head_v_dim
+if TYPE_CHECKING:
+    from picosgl.core import Batch
+    from picosgl.layers.gated_delta import GatedDeltaConfig
 
 
 @dataclass
-class GatedDeltaForwardInput:
-    mixed_qkv  : torch.Tensor
-    gate       : torch.Tensor
-    beta       : torch.Tensor
-    conv_weight: torch.Tensor
-    A_log      : torch.Tensor
-    dt_bias    : torch.Tensor
-    config     : GatedDeltaConfig
-
-
-@dataclass
-class GatedDeltaInput:
-    query        : torch.Tensor
-    key          : torch.Tensor
-    value        : torch.Tensor
-    gate         : torch.Tensor
-    beta         : torch.Tensor
-    A_log        : torch.Tensor
-    dt_bias      : torch.Tensor
-    initial_state: torch.Tensor | None
+class LinearAttentionMetadata:
+    phase        : Literal["prefill", "decode", "verify"]
+    verify_groups: dict[
+        int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] | None = None
 
 
 def _causal_conv1d_update(
@@ -65,52 +36,113 @@ def _causal_conv1d_update(
 
 
 class BaseLinearAttentionBackend(ABC):
-    def forward(self, inputs: GatedDeltaForwardInput) -> torch.Tensor:
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            return self._forward_prefill(inputs)
-        elif batch.is_verify:
-            return self._forward_verify(inputs)
-        else:
-            return self._forward_decode(inputs)
+    def prepare_metadata(self, batch: Batch) -> None:
+        metadata = LinearAttentionMetadata(phase=batch.phase)
+        if batch.is_verify:
+            ctx = get_global_ctx()
+            state_table = ctx.state_table
+            reserve_offset = ctx.draft_offset
+            assert state_table is not None and reserve_offset is not None
 
-    def _make_input(
+            entries_by_len: dict[int, list[tuple[int, int, int]]] = {}
+            offset = 0
+            for req in batch.reqs:
+                entries_by_len.setdefault(req.extend_len, []).append(
+                    (req.table_idx, req.baseline_slot, offset)
+                )
+                offset += req.extend_len
+
+            groups = {}
+            for seq_len, entries in entries_by_len.items():
+                row_indices = torch.tensor(
+                    [
+                        row
+                        for _table_idx, _baseline_slot, start in entries
+                        for row in range(start, start + seq_len)
+                    ],
+                    dtype=torch.int64,
+                    device=state_table.device,
+                )
+                table_indices = torch.tensor(
+                    [table_idx for table_idx, _baseline_slot, _start in entries],
+                    dtype=torch.int64,
+                    device=state_table.device,
+                )
+                baseline_slots = torch.tensor(
+                    [baseline_slot for _table_idx, baseline_slot, _start in entries],
+                    dtype=torch.int64,
+                    device=state_table.device,
+                )
+                write_slots = state_table[
+                    table_indices, reserve_offset : reserve_offset + seq_len
+                ]
+                groups[seq_len] = row_indices, baseline_slots, write_slots
+            metadata.verify_groups = groups
+
+        batch.linear_attn_metadata = metadata
+
+    def forward(
         self,
-        mixed_qkv    : torch.Tensor,
-        gate         : torch.Tensor,
-        beta         : torch.Tensor,
-        inputs       : GatedDeltaForwardInput,
-        initial_state: torch.Tensor | None,
-    ) -> GatedDeltaInput:
-        config = inputs.config
+        mixed_qkv  : torch.Tensor,
+        gate       : torch.Tensor,
+        beta       : torch.Tensor,
+        conv_weight: torch.Tensor,
+        A_log      : torch.Tensor,
+        dt_bias    : torch.Tensor,
+        config     : GatedDeltaConfig,
+        batch      : Batch,
+    ) -> torch.Tensor:
+        metadata = batch.linear_attn_metadata
+        assert isinstance(metadata, LinearAttentionMetadata)
+        assert metadata.phase == batch.phase
+        if metadata.phase == "prefill":
+            return self._forward_prefill(
+                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, batch
+            )
+        elif metadata.phase == "verify":
+            return self._forward_verify(
+                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, metadata
+            )
+        return self._forward_decode(
+            mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, batch
+        )
+
+    @staticmethod
+    def _split_qkv(
+        mixed_qkv: torch.Tensor,
+        config   : GatedDeltaConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query, key, value = torch.split(
             mixed_qkv,
             [config.key_dim, config.key_dim, config.value_dim],
             dim=-1,
         )
         seq_len = mixed_qkv.shape[1]
-        return GatedDeltaInput(
-            query=query.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_k_dim),
-            key=key.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_k_dim),
-            value=value.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_v_dim),
-            gate=gate,
-            beta=beta,
-            A_log=inputs.A_log,
-            dt_bias=inputs.dt_bias,
-            initial_state=initial_state,
+        return (
+            query.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_k_dim),
+            key.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_k_dim),
+            value.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_v_dim),
         )
 
-    def _forward_prefill(self, inputs: GatedDeltaForwardInput) -> torch.Tensor:
+    def _forward_prefill(
+        self,
+        mixed_qkv  : torch.Tensor,
+        gate       : torch.Tensor,
+        beta       : torch.Tensor,
+        conv_weight: torch.Tensor,
+        A_log      : torch.Tensor,
+        dt_bias    : torch.Tensor,
+        config     : GatedDeltaConfig,
+        batch      : Batch,
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
-        batch = ctx.batch
         pool = ctx.linear_state
         state_table = ctx.state_table
         page_size = ctx.page_size
-        config = inputs.config
         layer_idx = config.layer_idx
         output = torch.empty(
-            inputs.mixed_qkv.shape[0], config.num_v_heads, config.head_v_dim,
-            dtype=inputs.mixed_qkv.dtype, device=inputs.mixed_qkv.device,
+            mixed_qkv.shape[0], config.num_v_heads, config.head_v_dim,
+            dtype=mixed_qkv.dtype, device=mixed_qkv.device,
         )
 
         offset = 0
@@ -124,8 +156,8 @@ class BaseLinearAttentionBackend(ABC):
                     state_table[req.table_idx, (cached_len - 1) // page_size]
                 )
 
-            mixed_qkv = inputs.mixed_qkv[offset:end_offset].transpose(0, 1).unsqueeze(0)
-            conv_input = mixed_qkv
+            req_qkv = mixed_qkv[offset:end_offset].transpose(0, 1).unsqueeze(0)
+            conv_input = req_qkv
             if use_state:
                 conv_input = torch.cat(
                     [pool.conv_state[baseline_slot, layer_idx].unsqueeze(0), conv_input],
@@ -135,14 +167,14 @@ class BaseLinearAttentionBackend(ABC):
             conv_output = F.silu(
                 F.conv1d(
                     conv_input,
-                    inputs.conv_weight,
+                    conv_weight,
                     padding=config.state_len,
                     groups=config.conv_dim,
                 )
             )
-            mixed_qkv = conv_output[:, :, :total_len][:, :, -seq_len:].transpose(1, 2)
-            gate = inputs.gate[offset:end_offset].unsqueeze(0)
-            beta = inputs.beta[offset:end_offset].unsqueeze(0)
+            req_qkv = conv_output[:, :, :total_len][:, :, -seq_len:].transpose(1, 2)
+            req_gate = gate[offset:end_offset].unsqueeze(0)
+            req_beta = beta[offset:end_offset].unsqueeze(0)
             initial_state = (
                 pool.recurrent_state[baseline_slot, layer_idx].unsqueeze(0)
                 if use_state else None
@@ -155,14 +187,17 @@ class BaseLinearAttentionBackend(ABC):
                 global_start = cached_len + start
                 page_end = (global_start // page_size + 1) * page_size
                 end = min(seq_len, start + page_end - global_start)
-                segment_input = self._make_input(
-                    mixed_qkv[:, start:end],
-                    gate[:, start:end],
-                    beta[:, start:end],
-                    inputs,
+                q, k, v = self._split_qkv(req_qkv[:, start:end], config)
+                segment_output, initial_state = self._prefill(
+                    q,
+                    k,
+                    v,
+                    req_gate[:, start:end],
+                    req_beta[:, start:end],
+                    A_log,
+                    dt_bias,
                     initial_state,
                 )
-                segment_output, initial_state = self.prefill(segment_input)
                 segments.append(segment_output)
 
                 page = (cached_len + end - 1) // page_size
@@ -179,61 +214,36 @@ class BaseLinearAttentionBackend(ABC):
 
         return output
 
-    def _forward_verify(self, inputs: GatedDeltaForwardInput) -> torch.Tensor:
+    def _forward_verify(
+        self,
+        mixed_qkv  : torch.Tensor,
+        gate       : torch.Tensor,
+        beta       : torch.Tensor,
+        conv_weight: torch.Tensor,
+        A_log      : torch.Tensor,
+        dt_bias    : torch.Tensor,
+        config     : GatedDeltaConfig,
+        metadata   : LinearAttentionMetadata,
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
-        batch = ctx.batch
         pool = ctx.linear_state
-        state_table = ctx.state_table
-        reserve_offset = ctx.draft_offset
-        config = inputs.config
         layer_idx = config.layer_idx
-        assert inputs.mixed_qkv.is_cuda
-        assert state_table is not None and reserve_offset is not None
-
-        groups = batch.linear_verify_metadata
-        if groups is None:
-            entries_by_len: dict[int, list[tuple[Request, int]]] = {}
-            offset = 0
-            for req in batch.reqs:
-                entries_by_len.setdefault(req.extend_len, []).append((req, offset))
-                offset += req.extend_len
-            assert offset == inputs.mixed_qkv.shape[0]
-
-            groups = {}
-            for seq_len, entries in entries_by_len.items():
-                row_indices = torch.tensor(
-                    [row for _req, start in entries for row in range(start, start + seq_len)],
-                    dtype=torch.int64,
-                    device=inputs.mixed_qkv.device,
-                )
-                table_indices = torch.tensor(
-                    [req.table_idx for req, _start in entries],
-                    dtype=torch.int64,
-                    device=inputs.mixed_qkv.device,
-                )
-                baseline_slots = torch.tensor(
-                    [req.baseline_slot for req, _start in entries],
-                    dtype=torch.int64,
-                    device=inputs.mixed_qkv.device,
-                )
-                write_slots = state_table[
-                    table_indices, reserve_offset : reserve_offset + seq_len
-                ]
-                groups[seq_len] = row_indices, baseline_slots, write_slots
-            batch.linear_verify_metadata = groups
+        assert mixed_qkv.is_cuda and metadata.verify_groups is not None
 
         output = torch.empty(
-            inputs.mixed_qkv.shape[0], config.num_v_heads, config.head_v_dim,
-            dtype=inputs.mixed_qkv.dtype, device=inputs.mixed_qkv.device,
+            mixed_qkv.shape[0], config.num_v_heads, config.head_v_dim,
+            dtype=mixed_qkv.dtype, device=mixed_qkv.device,
         )
-        for seq_len, (row_indices, baseline_slots, write_slots) in groups.items():
+        for seq_len, (row_indices, baseline_slots, write_slots) in (
+            metadata.verify_groups.items()
+        ):
             batch_size = len(baseline_slots)
-            mixed_qkv = inputs.mixed_qkv.index_select(0, row_indices)
-            mixed_qkv = mixed_qkv.view(batch_size, seq_len, config.conv_dim).transpose(1, 2)
+            req_qkv = mixed_qkv.index_select(0, row_indices)
+            req_qkv = req_qkv.view(batch_size, seq_len, config.conv_dim).transpose(1, 2)
             conv_state = pool.conv_state[baseline_slots, layer_idx]
-            conv_input = torch.cat([conv_state, mixed_qkv], dim=-1)
-            mixed_qkv = F.silu(
-                F.conv1d(conv_input, inputs.conv_weight, groups=config.conv_dim)
+            conv_input = torch.cat([conv_state, req_qkv], dim=-1)
+            req_qkv = F.silu(
+                F.conv1d(conv_input, conv_weight, groups=config.conv_dim)
             ).transpose(1, 2)
 
             conv_snapshots = (
@@ -247,19 +257,20 @@ class BaseLinearAttentionBackend(ABC):
                 conv_snapshots.flatten(0, 1),
             )
 
-            group_input = self._make_input(
-                mixed_qkv,
-                inputs.gate.index_select(0, row_indices).view(
+            q, k, v = self._split_qkv(req_qkv, config)
+            group_output = self._verify(
+                q,
+                k,
+                v,
+                gate.index_select(0, row_indices).view(
                     batch_size, seq_len, config.num_v_heads
                 ),
-                inputs.beta.index_select(0, row_indices).view(
+                beta.index_select(0, row_indices).view(
                     batch_size, seq_len, config.num_v_heads
                 ),
-                inputs,
+                A_log,
+                dt_bias,
                 pool.recurrent_state[baseline_slots, layer_idx],
-            )
-            group_output = self.verify(
-                group_input,
                 write_slots,
                 pool.recurrent_state[:, layer_idx],
             )
@@ -267,72 +278,93 @@ class BaseLinearAttentionBackend(ABC):
 
         return output
 
-    def _forward_decode(self, inputs: GatedDeltaForwardInput) -> torch.Tensor:
+    def _forward_decode(
+        self,
+        mixed_qkv  : torch.Tensor,
+        gate       : torch.Tensor,
+        beta       : torch.Tensor,
+        conv_weight: torch.Tensor,
+        A_log      : torch.Tensor,
+        dt_bias    : torch.Tensor,
+        config     : GatedDeltaConfig,
+        batch      : Batch,
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
-        batch = ctx.batch
         pool = ctx.linear_state
         state_table = ctx.state_table
         page_size = ctx.page_size
-        config = inputs.config
         layer_idx = config.layer_idx
         table_indices = torch.tensor(
-            [req.table_idx for req in batch.reqs], device=inputs.mixed_qkv.device
+            [req.table_idx for req in batch.reqs], device=mixed_qkv.device
         )
         read_pages = torch.tensor(
             [(req.cached_len - 1) // page_size for req in batch.reqs],
-            device=inputs.mixed_qkv.device,
+            device=mixed_qkv.device,
         )
         write_pages = torch.tensor(
             [req.cached_len // page_size for req in batch.reqs],
-            device=inputs.mixed_qkv.device,
+            device=mixed_qkv.device,
         )
         read_slots = state_table[table_indices, read_pages]
         write_slots = state_table[table_indices, write_pages]
         conv_state = pool.conv_state[read_slots, layer_idx]
         recurrent_state = pool.recurrent_state[read_slots, layer_idx]
 
-        mixed_qkv = inputs.mixed_qkv.unsqueeze(1).transpose(1, 2)
-        mixed_qkv = _causal_conv1d_update(mixed_qkv, conv_state, inputs.conv_weight)
+        mixed_qkv = mixed_qkv.unsqueeze(1).transpose(1, 2)
+        mixed_qkv = _causal_conv1d_update(mixed_qkv, conv_state, conv_weight)
         write_slots_list = write_slots.tolist()
         for batch_idx, slot in enumerate(write_slots_list):
             pool.conv_state[slot, layer_idx].copy_(conv_state[batch_idx])
 
-        recurrent_input = self._make_input(
-            mixed_qkv.transpose(1, 2),
-            inputs.gate.unsqueeze(1),
-            inputs.beta.unsqueeze(1),
-            inputs,
-            recurrent_state,
+        q, k, v = self._split_qkv(mixed_qkv.transpose(1, 2), config)
+        output, final_state = self._decode(
+            q, k, v, gate.unsqueeze(1), beta.unsqueeze(1),
+            A_log, dt_bias, recurrent_state,
         )
-        output, final_state = self.decode(recurrent_input)
         for batch_idx, slot in enumerate(write_slots_list):
             pool.recurrent_state[slot, layer_idx].copy_(final_state[batch_idx])
         return output.squeeze(1)
 
     @abstractmethod
-    def prefill(
+    def _prefill(
         self,
-        inputs: GatedDeltaInput,
+        query        : torch.Tensor,
+        key          : torch.Tensor,
+        value        : torch.Tensor,
+        gate         : torch.Tensor,
+        beta         : torch.Tensor,
+        A_log        : torch.Tensor,
+        dt_bias      : torch.Tensor,
+        initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
-    def decode(
+    def _decode(
         self,
-        inputs: GatedDeltaInput,
+        query        : torch.Tensor,
+        key          : torch.Tensor,
+        value        : torch.Tensor,
+        gate         : torch.Tensor,
+        beta         : torch.Tensor,
+        A_log        : torch.Tensor,
+        dt_bias      : torch.Tensor,
+        initial_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @abstractmethod
-    def verify(
+    def _verify(
         self,
-        inputs     : GatedDeltaInput,
-        write_slots: torch.Tensor,
-        state_pool : torch.Tensor,
+        query        : torch.Tensor,
+        key          : torch.Tensor,
+        value        : torch.Tensor,
+        gate         : torch.Tensor,
+        beta         : torch.Tensor,
+        A_log        : torch.Tensor,
+        dt_bias      : torch.Tensor,
+        initial_state: torch.Tensor,
+        write_slots  : torch.Tensor,
+        state_pool   : torch.Tensor,
     ) -> torch.Tensor: ...
 
 
-__all__ = [
-    "BaseLinearAttentionBackend",
-    "GatedDeltaConfig",
-    "GatedDeltaForwardInput",
-    "GatedDeltaInput",
-]
+__all__ = ["BaseLinearAttentionBackend", "LinearAttentionMetadata"]

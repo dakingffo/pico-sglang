@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from picosgl.distributed import get_tp_info
@@ -7,11 +9,27 @@ from picosgl.utils import div_even, nvtx_annotate
 
 from .base import BaseOP
 from .linear import LinearColParallelMerged, LinearRowParallel
-from .linear_attention_backend import (
-    GatedDeltaConfig,
-    GatedDeltaForwardInput,
-)
 from .norm import RMSNormGated
+
+
+@dataclass(frozen=True)
+class GatedDeltaConfig:
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim : int
+    head_v_dim : int
+    conv_dim   : int
+    state_len  : int
+    layer_idx  : int
+
+    @property
+    def key_dim(self) -> int:
+        return self.num_k_heads * self.head_k_dim
+
+    @property
+    def value_dim(self) -> int:
+        return self.num_v_heads * self.head_v_dim
+
 
 class _Conv1d(BaseOP):
     def __init__(self, in_channels: int, kernel_size: int):
@@ -79,17 +97,17 @@ class GatedDeltaNet(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from picosgl.core import get_global_ctx
 
+        ctx = get_global_ctx()
         config = self._config
-        core_output = get_global_ctx().linear_attn_backend.forward(
-            GatedDeltaForwardInput(
-                mixed_qkv=self.in_proj_qkv.forward(x),
-                gate=self.in_proj_a.forward(x),
-                beta=self.in_proj_b.forward(x),
-                conv_weight=self.conv1d.weight,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                config=config,
-            )
+        core_output = ctx.linear_attn_backend.forward(
+            mixed_qkv=self.in_proj_qkv.forward(x),
+            gate=self.in_proj_a.forward(x),
+            beta=self.in_proj_b.forward(x),
+            conv_weight=self.conv1d.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            config=config,
+            batch=ctx.batch,
         )
         z = self.in_proj_z.forward(x).reshape(-1, config.head_v_dim)
         output = self.norm.forward(

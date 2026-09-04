@@ -172,6 +172,7 @@ def main():
         pb.padded_reqs = [req]
         pb.out_loc = ctx.page_table[tidx, :n]
         ctx.attn_backend.prepare_metadata(pb)
+        ctx.linear_attn_backend.prepare_metadata(pb)
         with ctx.forward_batch(pb):
             model.forward()
         return req
@@ -188,6 +189,7 @@ def main():
         vb.padded_reqs = [req]
         vb.out_loc = ctx.page_table[tidx, C : C + n]
         ctx.attn_backend.prepare_metadata(vb)
+        ctx.linear_attn_backend.prepare_metadata(vb)
         with ctx.forward_batch(vb):
             model.forward()
         return req, n
@@ -201,6 +203,7 @@ def main():
         db.padded_reqs = [req]
         db.out_loc = ctx.page_table[tidx, pos : pos + 1]
         ctx.attn_backend.prepare_metadata(db)
+        ctx.linear_attn_backend.prepare_metadata(db)
         with ctx.forward_batch(db):
             model.model.forward(tok)
 
