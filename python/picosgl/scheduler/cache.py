@@ -229,10 +229,11 @@ class CacheManager:
             assert torch.all(self.free_pages % self.page_size == 0)
         if self.state_pool is not None and self.state_table is not None:
             # Idle (the only time this runs): page columns have no running-request refs.
-            # Verify reserve columns remain permanently populated.
+            # The last row belongs to CUDA Graph padding; verify reserve columns remain
+            # permanently populated.
             free_state = len(self.free_states)
             page_end = self.draft_offset or self.state_table.shape[1]
-            live_state = int((self.state_table[:, :page_end] >= 0).sum().item())
+            live_state = int((self.state_table[:-1, :page_end] >= 0).sum().item())
             tree_state = self.prefix_cache.total_state_pages()
             if live_state != 0:
                 raise RuntimeError(

@@ -4,7 +4,11 @@ from typing import Protocol
 
 from picosgl.utils import Registry
 
-from .base import BaseLinearAttentionBackend, LinearAttentionMetadata
+from .base import (
+    BaseLinearAttentionBackend,
+    LinearAttentionCaptureData,
+    LinearAttentionMetadata,
+)
 
 
 class LinearAttentionBackendCreator(Protocol):
@@ -36,6 +40,7 @@ def make_linear_attention_backend(backend: str) -> BaseLinearAttentionBackend:
 
 __all__ = [
     "BaseLinearAttentionBackend",
+    "LinearAttentionCaptureData",
     "LinearAttentionMetadata",
     "SUPPORTED_LINEAR_ATTENTION_BACKENDS",
     "make_linear_attention_backend",
