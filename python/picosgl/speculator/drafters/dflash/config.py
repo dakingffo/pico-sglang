@@ -57,7 +57,7 @@ class DFlashSpeculatorConfig(BaseSpeculatorConfig):
         assert draft_config.hidden_size == config.model_config.hidden_size
         assert draft_config.vocab_size == config.model_config.vocab_size
         assert draft_config.num_target_layers == config.model_config.num_layers
-        assert 2 <= self.block_size <= int(dflash_config["block_size"])
+        assert 2 <= self.block_size <= int(draft_config.block_size)
         assert self.window_size >= 1
         assert len(set(self.target_layer_ids)) == len(self.target_layer_ids)
         assert min(self.target_layer_ids) >= 0

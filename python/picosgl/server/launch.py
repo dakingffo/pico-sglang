@@ -23,6 +23,7 @@ def launch_server() -> None:
 
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue[str] = mp.Queue()
+        scheduler_shutdown_event = mp.Event()
         enable_speculator_worker = server_args.speculative_algorithm is not None
         speculator_start_event = (
             mp.Event()
@@ -50,6 +51,7 @@ def launch_server() -> None:
                 "speculator_start_event": speculator_start_event,
                 "speculator_ready_event": speculator_ready_event,
                 "speculator_data_plane": target_data_plane if i == 0 else None,
+                "shutdown_event": scheduler_shutdown_event,
             }
             mp.Process(
                 target=schedule_worker,

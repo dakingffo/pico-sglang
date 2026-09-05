@@ -278,6 +278,17 @@ def parse_args(args: list[str]) -> ServerArgs:
             )
         )
 
+    speculator_config = kwargs.get("speculator_config")
+    if (
+        speculator_config is not None
+        and speculator_config.requires_model_resolution
+    ):
+        from picosgl.models import make_model_config
+        from picosgl.utils import load_model_config
+
+        model_config = make_model_config(load_model_config(kwargs["model_path"]))
+        kwargs["speculator_config"] = speculator_config.resolve(model_config)
+
     if (dtype_str := kwargs["dtype"]) == "auto":
         from picosgl.utils import load_model_config
 

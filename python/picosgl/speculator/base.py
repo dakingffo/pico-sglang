@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         SpeculatorStepMsg,
     )
     from picosgl.scheduler.config import SchedulerConfig
+    from picosgl.models import ModelConfig
     from picosgl.models.drafters import BaseDrafterModel
 
 
@@ -34,8 +35,15 @@ class BaseSpeculatorConfig(ABC):
         return 1
 
     @property
+    def requires_model_resolution(self) -> bool:
+        return False
+
+    @property
     @abstractmethod
     def max_init_hidden_rows(self) -> int: ...
+
+    def resolve(self, model_config: ModelConfig) -> BaseSpeculatorConfig:
+        return self
 
     @abstractmethod
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve: ...

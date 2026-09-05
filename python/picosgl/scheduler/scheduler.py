@@ -40,9 +40,10 @@ class Scheduler(SchedulerIOMixin):
         speculator_start_event: mp.synchronize.Event | None = None,
         speculator_ready_event: mp.synchronize.Event | None = None,
         speculator_data_plane : DataPlane | None = None,
+        shutdown_event         : mp.synchronize.Event | None = None,
     ):
         self.engine = Engine(config, speculator_start_event, speculator_ready_event)
-        super().__init__(config, self.engine.tp_cpu_group)
+        super().__init__(config, self.engine.tp_cpu_group, shutdown_event)
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
