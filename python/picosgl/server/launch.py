@@ -11,11 +11,11 @@ from picosgl.speculator import make_local_data_plane_pair, speculator_worker
 from picosgl.tokenizer import tokenize_worker, detokenize_worker
 
 
-def launch_server(run_shell: bool = False) -> None:
+def launch_server() -> None:
     from .api_server import run_api_server
     from .args import parse_args
 
-    server_args, run_shell = parse_args(sys.argv[1:], run_shell)
+    server_args = parse_args(sys.argv[1:])
     logger = init_logger(__name__, "initializer")
 
     def start_subprocess() -> None:
@@ -106,7 +106,7 @@ def launch_server(run_shell: bool = False) -> None:
         for _ in range(num_workers):
             logger.info(ack_queue.get())
 
-    run_api_server(server_args, start_subprocess, run_shell=run_shell)
+    run_api_server(server_args, start_subprocess)
 
 
 if __name__ == "__main__":

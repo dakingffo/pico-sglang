@@ -63,7 +63,7 @@ def test_mtp_argument_parser_is_independent(tmp_path) -> None:
     assert kwargs == {}
 
     model_path = str(tmp_path)
-    server_args, _ = parse_args([
+    server_args = parse_args([
         "--model-path", model_path,
         "--dtype", "bfloat16",
         "--dummy-weight",

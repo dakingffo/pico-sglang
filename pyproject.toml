@@ -32,8 +32,6 @@ dependencies = [
     "pyzmq",
     "uvicorn",
     "fastapi",
-    "prompt_toolkit",
-    "openai",
     "apache-tvm-ffi>=0.1.4",
     "sgl_kernel>=0.3.17.post1",
     "quack-kernels",
