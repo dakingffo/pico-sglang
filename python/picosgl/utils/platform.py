@@ -81,9 +81,9 @@ def resolve_model_path(
     if os.path.isdir(model_path):
         return model_path
 
-    unsupported_weight_patterns = ["*.bin", "*.pt", "*.ckpt", "*.gguf"]
+    unsupported_weight_patterns = ["*.pt", "*.ckpt", "*.gguf"]
     ignore_patterns = unsupported_weight_patterns + (
-        [] if download_weights else ["*.safetensors"]
+        [] if download_weights else ["*.safetensors", "*.bin"]
     )
 
     try:
