@@ -125,7 +125,7 @@ class Engine:
             self.num_states = self.num_pages
             self.ctx.linear_state = self.linear_state = make_linear_state_pool(
                 model_config=config.model_config,
-                num_slots=self.num_states + self.num_draft_states,
+                num_slots=self.num_states + self.num_draft_states + 1,
                 device=self.device,
                 dtype=self.dtype,
             )
@@ -167,6 +167,8 @@ class Engine:
                     device=self.device,
                 ).view(config.max_running_req, reserve_cols)
                 self.state_table[:config.max_running_req, page_cols:].copy_(reserve)
+            self.dummy_state_slot = self.num_states + self.num_draft_states
+            self.state_table[-1].fill_(self.dummy_state_slot)
 
         # ======================= Attention & MoE backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = make_attention_backend(
@@ -204,6 +206,9 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
+            linear_attn_backend=(
+                self.linear_attn_backend if config.model_config.is_hybrid else None
+            ),
             cuda_graph_bs=[] if speculative_skip_graphs else config.cuda_graph_bs,
             cuda_graph_max_bs=0 if speculative_skip_graphs else config.cuda_graph_max_bs,
             free_memory=init_free_memory,
@@ -263,7 +268,8 @@ class Engine:
             self.speculator_reserve.num_state_slots
             if self.speculator_reserve is not None else 0
         )
-        draft_bytes = num_draft_states * cache_per_state
+        extra_state_slots = num_draft_states + int(config.model_config.is_hybrid)
+        extra_state_bytes = extra_state_slots * cache_per_state
 
         num_pages = config.num_page_override
         if num_pages is None:
@@ -275,13 +281,12 @@ class Engine:
             if config.model_config.is_hybrid:
                 min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
                 available_states = (available_memory - min_pages_bytes) // cache_per_state
-                assert num_draft_states <= available_states, (
-                    f"Not enough memory for {num_draft_states} speculator states: "
+                assert extra_state_slots <= available_states, (
+                    f"Not enough memory for {extra_state_slots} reserved linear states: "
                     f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum KV pages. "
                     f"Raise --memory-ratio / --max-running-req, or pin --num-pages."
                 )
-                draft_bytes = num_draft_states * cache_per_state
-                available_memory -= draft_bytes
+                available_memory -= extra_state_bytes
                 num_pages = max(
                     _MIN_KV_PAGES,
                     available_memory // (cache_per_page + cache_per_state),
@@ -292,15 +297,16 @@ class Engine:
         assert num_pages > 1, (
             "Not enough memory for KV cache, try reducing --num-pages. "
             f"(hybrid: cache_per_page={mem_GB(cache_per_page)}, cache_per_state="
-            f"{mem_GB(cache_per_state)}, reserve_bytes={mem_GB(draft_bytes)})"
+            f"{mem_GB(cache_per_state)}, reserve_bytes={mem_GB(extra_state_bytes)})"
         )
         num_tokens = num_pages * config.page_size
         logger.info(f"Allocating {num_tokens} tokens for KV cache,\
                      K + V = {mem_GB(num_pages * cache_per_page)}")
         if config.model_config.is_hybrid:
             logger.info(
-                f"Allocating {num_pages + num_draft_states}"
-                f" linear state slots = {mem_GB(num_pages * cache_per_state + draft_bytes)}"
+                f"Allocating {num_pages + extra_state_slots}"
+                f" linear state slots = "
+                f"{mem_GB(num_pages * cache_per_state + extra_state_bytes)}"
             )
             return num_pages, num_tokens, num_draft_states
         else:
@@ -454,10 +460,6 @@ def _adjust_config(config: EngineConfig):
             logger.warning_rank0(
                 f"Page size overridden to 64 for hybrid model (must be a multiple of 64, got {original_page_size})."
             )
-        if config.cuda_graph_max_bs is None:
-            override("cuda_graph_max_bs", 0)
-            logger.warning_rank0("CUDA graph disabled for hybrid (linear attention) model.")
-
     if config.enable_specualtive_decoding:
         speculator_config = config.speculator_config
         assert speculator_config is not None, (

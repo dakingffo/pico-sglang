@@ -7,6 +7,7 @@ from .native import NativeLinearAttentionBackend
 
 class FlashLinearAttentionBackend(NativeLinearAttentionBackend):
     def __init__(self) -> None:
+        super().__init__()
         from fla.ops.gated_delta_rule import (
             chunk_gated_delta_rule,
             fused_recurrent_gated_delta_rule,

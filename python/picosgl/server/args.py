@@ -22,7 +22,7 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
-def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bool]:
+def parse_args(args: list[str]) -> ServerArgs:
     """
     Parse command line arguments and return an EngineConfig.
 
@@ -218,12 +218,6 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--shell-mode",
-        action="store_true",
-        help="Run the server in shell mode.",
-    )
-
-    parser.add_argument(
         "--speculative-algorithm",
         type=str,
         dest="speculative_algorithm",
@@ -251,13 +245,6 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     kwargs = parser.parse_args(args).__dict__.copy()
 
     assert kwargs["num_tokenizer"] >= 1, "--num-tokenizer must be >= 1"
-
-    # resolve some arguments
-    run_shell |= kwargs.pop("shell_mode")
-    if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
-        kwargs["max_running_req"] = 1
-        kwargs["silent_output"] = True
 
     if speculator_parser is not None:
         kwargs["speculator_config"] = speculator_parser.make_config(kwargs)
@@ -316,4 +303,4 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
-    return result, run_shell
+    return result
